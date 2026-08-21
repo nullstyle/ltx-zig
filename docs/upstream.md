@@ -1,0 +1,169 @@
+# Upstream audit
+
+## Pinned revisions
+
+The implementation and compatibility fixtures were developed against these
+exact revisions:
+
+- [`superfly/ltx`](https://github.com/superfly/ltx/tree/8cb8f8ebaf8f57c9b0e1041a27d5444032ea0643):
+  `8cb8f8ebaf8f57c9b0e1041a27d5444032ea0643`
+- [TigerBeetle repository containing `docs/TIGER_STYLE.md`](https://github.com/tigerbeetle/tigerbeetle/blob/97c7a8ef385270ebe0e1b75959d3d21d134629df/docs/TIGER_STYLE.md):
+  `97c7a8ef385270ebe0e1b75959d3d21d134629df`
+- [`superfly/ltx-rs`](https://github.com/superfly/ltx-rs/tree/ceabe1fe1b3076094805244ee6a3acff4d43d1e8):
+  `ceabe1fe1b3076094805244ee6a3acff4d43d1e8`
+- [`denoland/celld` LTX crate](https://github.com/denoland/celld/tree/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx):
+  `89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9`
+
+At the pinned TigerBeetle tree, `docs/TIGER_STYLE.md` has blob
+`d4cefaa6249483357a41b786d7e042f1d94a3ea5`; its last modifying commit is
+`1e40c4c876216b4e27d70fa2c45adb47124e2a7b`.
+
+## Files inspected
+
+For Go: `README.md`, `CLAUDE.md`, `ltx.go`, `checksum.go`, `encoder.go`,
+`decoder.go`, `file_spec.go`, all core tests, and relevant `cmd/ltx` apply,
+encode, dump, and verify code. The pinned repository passed `go test ./...`.
+
+For TigerStyle: `docs/TIGER_STYLE.md` at the pinned tree.
+
+For Rust: `README.md`, `Cargo.toml`, every file under `src/`, and
+`tests/compat.rs` plus its test support. Rust is a secondary design reference
+only: it implements an obsolete pre-v3 layout with four-byte page headers,
+whole-block LZ4 framing, and no page index.
+
+For `denoland/celld`: `crates/ltx/README.md`, `Cargo.toml`,
+`reference/ltx-format.md`, `src/codec.rs`, `src/ltx.rs`, `src/lz4_block.rs`,
+and `tests/differential_xtool.rs`. Celld is a secondary interoperability and
+deployment reference, not the valid-output oracle. Its crate pins Go LTX
+v0.5.2 and provides a byte-exact port of Go's block compressor plus a dual
+reader for current flagged raw blocks and legacy unflagged LZ4 frames. It also
+validates exact decompressed length, the declared index size, and the trailer.
+Its `Vec`, `BTreeMap`, and read-to-end design is intentionally not a memory
+model for this allocation-free Zig core, and it does not perform Zig's exact
+one-to-one index/frame cross-check.
+
+## Compatibility decisions and disagreements
+
+The current Go encoder and its tests are the valid-output oracle. The Zig
+decoder deliberately rejects malformed files that the Go decoder happens to
+accept. These are hardening differences, not silent reinterpretations.
+
+1. **Version selection.** The Go README correctly says v2 and v3 both use
+   `LTX1` and need out-of-band version selection. `NewDecoder`, however, takes
+   no version and `Header.UnmarshalBinary()` assigns v3 from magic alone. Every
+   Zig entry point requires `FormatVersion`; only `.v3` is supported.
+
+2. **Section count.** Current Go README and code have header, page block, page
+   index, and trailer. `CLAUDE.md` still describes three sections and omits the
+   index. Zig implements the four-section format.
+
+3. **Decompressed length.** README requires exactly `Header.PageSize`. Go calls
+   `UncompressBlock` but ignores its returned length. Zig rejects short or long
+   output.
+
+4. **Index validation.** README describes sorted, one-to-one entries with exact
+   offsets, frame sizes, and an index byte-size field. Go's decoder stores
+   entries in a map, accepts duplicates/order problems and integer truncation,
+   ignores the declared byte size, and never compares entries with frames. Zig
+   requires canonical varints and exact correspondence with observed frames.
+
+5. **Snapshot completeness.** Documentation says snapshots contain every page
+   through `Commit`, excluding SQLite's lock page. The Go encoder checks start
+   and adjacency but not the final page; the decoder has an explicit TODO. Zig
+   verifies the complete range before accepting the page sentinel.
+
+6. **Trailer validation.** Go has `Trailer.Validate()` and unit tests for
+   checksum formatting, but normal decoder close does not call it. Zig always
+   validates it before producing `VerifiedLTX`.
+
+7. **Reserved header bytes.** The Go decoder ignores bytes 80 through 99 and
+   the canonical encoder zeros them. Zig follows that compatibility behavior:
+   accept and hash any values, expose no semantics, and always emit zero.
+
+8. **Timestamp signedness.** README does not specify signedness. Go uses `int64`
+   and accepts negative timestamps; Rust rejects pre-epoch values. Zig uses
+   `i64`, matching Go.
+
+9. **Empty database checksum.** `ChecksumReader` returns zero for empty input,
+   but current encoder behavior and decoder tests use `ChecksumFlag` alone.
+   Zig selects the wire-tested value `0x8000000000000000` and has a pinned Go
+   fixture for it.
+
+10. **Truncation and trailing bytes.** Go's decoder reads the remainder without
+    a bound, can panic when fewer than eight bytes remain after the page block,
+    and does not require exact physical EOF. Zig bounds every read, reports
+    truncation, and rejects trailing bytes.
+
+11. **Page validation.** The Go encoder rejects pages above `Commit`, lock-page
+    frames, duplicates, and out-of-order pages. The decoder does not. Zig uses
+    the canonical encoder behavior in both directions.
+
+12. **Contiguity.** Go's range-oriented `IsContiguous()` permits overlaps and
+    does not compare checksums. Zig's transition check requires the exact
+    pre-apply TXID and, when enabled, the exact pre-apply checksum.
+
+13. **No-checksum empty files.** The current Go encoder's validations make this
+    combination impossible to emit: post zero passes no-checksum validation but
+    fails its later deletion check, while the checksum flag fails no-checksum
+    validation. Zig permits the internally consistent representation with both
+    database checksums zero. This is an intentional, documented divergence.
+
+14. **Legacy rollout evidence.** Celld retains both flagged raw-block and
+    unflagged frame decoders under v3 and documents reader-first deployment.
+    This independently confirms that the unchanged version marker created a
+    real rollout constraint. Zig keeps the legacy fixture and an explicit
+    `UnsupportedPageEncoding` result until that decoder is implemented.
+
+The unflagged v3 LZ4-frame encoding was introduced with v3 and later replaced
+without a version bump. A fixture from Go commit
+`133c1b1dba55dfb8033affedb3d400aaa3d8b807` is retained in the test suite, but
+Zig currently returns `error.UnsupportedPageEncoding` for it.
+
+## Fixture provenance
+
+The per-fixture generation command, semantic header/trailer values, and hashes
+are catalogued in [`tests/fixtures/README.md`](../tests/fixtures/README.md).
+
+The current Go fixtures in `tests/fixtures/` were generated with the pinned Go
+`NewEncoder`, directly or through `FileSpec.WriteTo`. The SHA-256 values of the
+binary artifacts are:
+
+- `go_v3_snapshot_zero_page`: `7ab2cbb91c15c977abcb7256ac471ee1f4f78343d16b1bacd55edd3d2d930e4a`
+- `go_v3_empty_snapshot`: `b270619913b21cecb628827c679749ae6277159391ac0223762f408f57ff7287`
+- `go_v3_incremental`: `3a5f87b53d70343c7e19d760b7ff2536b61b229673ae832af15bcf8d18966956`
+- `go_v3_no_checksum`: `3c27d6dbb89142fd4054f80d3c4a84027346e71b6dd2d7a87e096359aade7f89`
+- `go_v3_near_lock_page`: `e72968228256e29ecb024f0e29a056fbf0ee2c872f7c2589f8bb96901c3f246e`
+- legacy unflagged fixture: `cebdc979fea5b00f51eacdcdeef579f6b87a5b5fb901f4fb952d857eef19da1`
+- `celld_v052_two_page_snapshot`: `b7c4c3d21a1c009c297934723f737199cbe392164a95f05a2a3763dda059eecb`
+
+The 211-byte Celld vector is copied from the pinned crate's byte-exact
+compressor test, where it is asserted equal to Go LTX v0.5.2
+`FileSpec.WriteTo` output. The test originated in Celld commit
+`ae8fac053d79f971bfcb996054bb43eb2f9b05da` and remains present at the pinned
+tree. It covers two distinct normal match-compressed 1024-byte pages, a
+multi-entry page index, post-apply checksum `a09639bc718d9c58`, and file
+checksum `dc2f8726a386540e`.
+
+The pinned Go generator in `tools/upstream_verify/fixturegen` reproduces three
+additional vectors: a two-page incremental with a negative timestamp, a
+4096-byte-page no-checksum incremental, and a maximum-65536-byte-page
+incremental whose page numbers straddle the SQLite lock page. Their file
+checksums are respectively `d1f8ea546c262bd3`, `c231c44dd37c4fc6`, and
+`e2f9b76966a755f5`. The generated base fixtures are mutated hermetically in Zig
+tests to cover bad checksums, structural truncation, and invalid indexes.
+
+Known answers include:
+
+- `CRC64-ISO("123456789") = b90956c775a41001`
+- `ChecksumPage(1, 512 zero bytes) = efb1f44fecd99000`
+- flagged fixture file checksum `eb5121d56d33a656`
+- empty snapshot file checksum `ef752d544ac8c48f`
+
+`mise exec -- zig build fixturegen` emits a deterministic 660-byte
+literal-only LZ4 file. The pinned Go command
+`go run ./cmd/ltx verify <file>` reports `ok`; its file checksum is
+`f9b895f23744f218`.
+
+`mise exec -- zig build interop` performs that Go verification from the build
+graph. Its Go module pins the pseudo-version resolving exactly to the recorded
+Go commit; unlike the normal test suite, it may download modules.
