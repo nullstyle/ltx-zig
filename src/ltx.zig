@@ -44,6 +44,7 @@ test {
     _ = @import("transport.zig");
     _ = @import("checksum.zig");
     _ = @import("lz4_block.zig");
+    _ = @import("lz4_frame.zig");
     _ = @import("page_index.zig");
     _ = @import("decoder.zig");
     _ = @import("encoder.zig");

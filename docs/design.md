@@ -73,6 +73,11 @@ Initialization rejects undersized buffers before consuming or emitting bytes.
 The encoder rejects a page slice that aliases its workspaces or a reported
 output backing range.
 
+Legacy frame decoding reuses the compressed workspace for only the declared
+block payload. Its fixed descriptor, block word, and footer stay inline, so no
+extra frame-sized allocation or read-ahead is needed. The configured compressed
+page bound is checked before the payload is read.
+
 The index workspace is essential rather than incidental. The encoder must
 retain the physical offset and encoded size of every frame until it emits the
 trailing index. The decoder retains the same observed values until it can
@@ -121,9 +126,11 @@ checksummed empty database value is the flag alone,
 `0x8000000000000000`, matching the current encoder and wire tests.
 
 The file checksum is logical rather than physical. It covers the header; each
-page header and size prefix; decompressed page bytes instead of compressed
-payload; the page sentinel; index entries, terminator, and index-size field;
-and the post-apply checksum. It excludes the stored file-checksum field.
+page header; each current-format size prefix; decompressed page bytes instead
+of compressed payload; the page sentinel; index entries, terminator, and
+index-size field; and the post-apply checksum. Legacy LZ4 descriptor, block,
+end-marker, and XXH32 bytes are physical framing and are excluded. The stored
+file-checksum field is also excluded.
 
 ## Error taxonomy
 
@@ -137,7 +144,8 @@ Errors remain distinguishable by cause:
   or trailing bytes;
 - unsupported features: `UnsupportedFormatVersion`,
   `UnsupportedPageEncoding`;
-- integrity: `ChecksumMismatch`, `SnapshotChecksumMismatch`;
+- integrity: `ChecksumMismatch`, `SnapshotChecksumMismatch`,
+  `LZ4ContentChecksumMismatch`;
 - transition semantics: `NonContiguousTransition`, `DivergentHistory`;
 - API misuse or poisoned terminal state: `InvalidState`.
 

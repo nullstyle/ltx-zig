@@ -174,7 +174,10 @@ test "decode current Go incremental fixture" {
         },
         else => return error.UnexpectedDecoderEvent,
     }
-    _ = try decoder.next();
+    switch (try decoder.next()) {
+        .page_block_complete => {},
+        else => return error.UnexpectedDecoderEvent,
+    }
     switch (try decoder.next()) {
         .verified => |verified| {
             try std.testing.expectEqual(@as(u32, 2), verified.page_count);
@@ -378,7 +381,7 @@ test "Zig literal-only output verifies through the Zig decoder" {
     }
 }
 
-test "legacy unflagged v3 fixture is explicitly unsupported" {
+test "decode historical Go legacy unflagged v3 fixture" {
     var fixture: [183]u8 = undefined;
     try load_fixture("fixtures/go_v3_legacy_unflagged.ltx", &fixture);
     var source = ltx.SliceReader.init(&fixture);
@@ -393,9 +396,96 @@ test "legacy unflagged v3 fixture is explicitly unsupported" {
         &compressed_workspace,
         &index_workspace,
     );
+    switch (try decoder.next()) {
+        .header => |header| {
+            try std.testing.expectEqual(@as(u32, 512), header.page_size);
+            try std.testing.expectEqual(@as(u32, 1), header.commit);
+        },
+        else => return error.UnexpectedDecoderEvent,
+    }
+    switch (try decoder.next()) {
+        .unverified_page => |page| {
+            try std.testing.expectEqual(@as(u32, 1), page.header.page_number);
+            try std.testing.expectEqual(@as(u16, 0), page.header.flags);
+            try std.testing.expectEqualSlices(u8, &(@as([512]u8, @splat(0))), page.data);
+        },
+        else => return error.UnexpectedDecoderEvent,
+    }
+    switch (try decoder.next()) {
+        .page_block_complete => {},
+        else => return error.UnexpectedDecoderEvent,
+    }
+    switch (try decoder.next()) {
+        .verified => |verified| {
+            try std.testing.expectEqual(@as(u32, 1), verified.page_count);
+            try std.testing.expectEqual(@as(u64, fixture.len), verified.byte_count);
+            try std.testing.expectEqual(
+                @as(u64, 0xefb1_f44f_ecd9_9000),
+                verified.trailer.post_apply_checksum.value,
+            );
+            try std.testing.expectEqual(
+                @as(u64, 0xae80_e106_9c9b_c795),
+                verified.trailer.file_checksum.value,
+            );
+        },
+        else => return error.UnexpectedDecoderEvent,
+    }
+    try std.testing.expectError(error.InvalidState, decoder.next());
+}
+
+test "decode historical Go mixed compressed and stored legacy pages" {
+    var fixture: [725]u8 = undefined;
+    try load_fixture("fixtures/go_v3_legacy_mixed.ltx", &fixture);
+    var source = ltx.SliceReader.init(&fixture);
+    var page_workspace: [65_536]u8 = undefined;
+    var compressed_workspace: [66_000]u8 = undefined;
+    var index_workspace: [8]ltx.PageIndexEntry = undefined;
+    var decoder = try ltx.Decoder.init(
+        .v3,
+        limits,
+        source.reader(),
+        &page_workspace,
+        &compressed_workspace,
+        &index_workspace,
+    );
+
     _ = try decoder.next();
-    try std.testing.expectError(error.UnsupportedPageEncoding, decoder.next());
-    try std.testing.expectEqual(ltx.DecoderState.failed, decoder.current_state());
+    switch (try decoder.next()) {
+        .unverified_page => |page| {
+            try std.testing.expectEqual(@as(u32, 1), page.header.page_number);
+            try std.testing.expectEqualSlices(u8, &(@as([512]u8, @splat(0))), page.data);
+        },
+        else => return error.UnexpectedDecoderEvent,
+    }
+    switch (try decoder.next()) {
+        .unverified_page => |page| {
+            var expected: [512]u8 = undefined;
+            fill_xorshift_page(&expected);
+            try std.testing.expectEqual(@as(u32, 2), page.header.page_number);
+            try std.testing.expectEqual(@as(u16, 0), page.header.flags);
+            try std.testing.expectEqualSlices(u8, &expected, page.data);
+        },
+        else => return error.UnexpectedDecoderEvent,
+    }
+    switch (try decoder.next()) {
+        .page_block_complete => {},
+        else => return error.UnexpectedDecoderEvent,
+    }
+    switch (try decoder.next()) {
+        .verified => |verified| {
+            try std.testing.expectEqual(@as(u32, 2), verified.page_count);
+            try std.testing.expectEqual(@as(u64, fixture.len), verified.byte_count);
+            try std.testing.expectEqual(
+                @as(u64, 0xff27_3ef8_3077_8b70),
+                verified.trailer.post_apply_checksum.value,
+            );
+            try std.testing.expectEqual(
+                @as(u64, 0xc33c_5c9b_2434_d957),
+                verified.trailer.file_checksum.value,
+            );
+        },
+        else => return error.UnexpectedDecoderEvent,
+    }
 }
 
 test "incremental positions require TXID and checksum continuity" {
@@ -599,6 +689,16 @@ fn snapshot_header(commit: u32) ltx.Header {
         .wal_salt_2 = 0,
         .node_id = 0,
     };
+}
+
+fn fill_xorshift_page(page: *[512]u8) void {
+    var state: u32 = 0x9e37_79b9;
+    for (page) |*byte| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        byte.* = @truncate(state);
+    }
 }
 
 fn load_fixture(comptime path: []const u8, destination: []u8) !void {

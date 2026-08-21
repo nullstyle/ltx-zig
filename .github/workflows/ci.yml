@@ -27,6 +27,8 @@ jobs:
         run: zig build fmt-check
       - name: Check binary fixtures
         run: zig build check-fixtures
+      - name: Check historical Go fixtures
+        run: zig build check-legacy-fixtures
       - name: Test release-safe core
         run: zig build test -Doptimize=ReleaseSafe
       - name: Build library

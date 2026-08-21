@@ -64,6 +64,8 @@ pub const Error = error{
     LockPagePresent,
     InvalidCompressedSize,
     InvalidLZ4Block,
+    InvalidLZ4Frame,
+    LZ4ContentChecksumMismatch,
     DecompressedSizeMismatch,
     VarintOverflow,
     OverlongVarint,

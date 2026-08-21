@@ -33,15 +33,19 @@ the exact oracle pseudo-version and `go.sum` pins transitive content hashes.
 | File | Origin and reproduction | Semantic contents and expected header | Expected trailer | Binary SHA-256 |
 | --- | --- | --- | --- | --- |
 | `celld_v052_two_page_snapshot.ltx` | `denoland/celld` tree `89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9`, test `encoder_matches_superfly_ltx_v0_5_2_bytes`; run that Rust test to reproduce/verify the vector | `.v3` flagged blocks; pages 1/2 are 1024 bytes of `81` / repeated `abcd`; flags `0`, commit `2`, TXIDs `1..1`, timestamp `1000`, pre `0` | post `a09639bc718d9c58`; file `dc2f8726a386540e` | `b7c4c3d21a1c009c297934723f737199cbe392164a95f05a2a3763dda059eecb` |
-| `go_v3_legacy_unflagged.ltx` | Historical Go `FileSpec.WriteTo` at commit `133c1b1dba55dfb8033affedb3d400aaa3d8b807`; verify with that checkout's `go run ./cmd/ltx verify <file>` | `.v3` unflagged LZ4 frame; page 1 = 512 zero bytes; flags `0`, commit `1`, TXIDs `1..1`, timestamp `0`, pre `0` | post `efb1f44fecd99000`; file `ae80e1069c9bc795` | `cebdc979fea5b00f51eacdcdeef579f6b87a5b5fb901f4fb952d857eef19da1f` |
+| `go_v3_legacy_unflagged.ltx` | Historical Go `FileSpec.WriteTo` at `133c1b1dba55dfb8033affedb3d400aaa3d8b807`; `mise exec -- zig build upstream-legacy-fixture -Dlegacy-fixture=snapshot-zero` | `.v3` unflagged compressed LZ4 frame; page 1 = 512 zero bytes; flags `0`, commit `1`, TXIDs `1..1`, timestamp `0`, pre `0` | post `efb1f44fecd99000`; file `ae80e1069c9bc795` | `cebdc979fea5b00f51eacdcdeef579f6b87a5b5fb901f4fb952d857eef19da1f` |
+| `go_v3_legacy_mixed.ltx` | Historical Go `FileSpec.WriteTo` at `133c1b1dba55dfb8033affedb3d400aaa3d8b807`; `mise exec -- zig build upstream-legacy-fixture -Dlegacy-fixture=mixed` | `.v3` unflagged frames; page 1 = 512 zero bytes (compressed), page 2 = fixed-seed xorshift bytes (stored); flags `0`, commit `2`, TXIDs `1..1`, timestamp `0`, pre `0` | post `ff273ef830778b70`; file `c33c5c9b2434d957` | `42c81f74ae54b11cf22768223b99a6c2f271e06559ccb619bc8b553533fcb2c5` |
 
-The legacy vector is retained to make the unsupported encoding boundary
-executable; the Zig decoder currently returns `UnsupportedPageEncoding`.
+The historical generator is separately pinned because current Go only emits
+flagged blocks. Both legacy files use the exact upstream profile: one
+independent 64 KiB block, a content checksum, and no optional descriptor
+fields. The mixed fixture proves both compressed and high-bit stored blocks.
 
 ## Malformed corpus
 
 `tests/malformed.zig` derives malformed checksum, truncated-header,
-truncated-compressed-payload, invalid-index, unsupported-flag, page-order, and
-trailing-byte cases deterministically from the current one-page fixture. Every
-strict byte prefix is exercised, so separate redundant truncated payload files
-are unnecessary. The tests assert controlled errors and failed-state poisoning.
+truncated-compressed-payload, legacy descriptor/footer, invalid-index,
+unsupported-flag, page-order, and trailing-byte cases deterministically from
+the current and historical one-page fixtures. Every strict byte prefix of both
+is exercised, so separate redundant truncated payload files are unnecessary.
+The tests assert controlled errors and failed-state poisoning.

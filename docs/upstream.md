@@ -18,6 +18,16 @@ At the pinned TigerBeetle tree, `docs/TIGER_STYLE.md` has blob
 `d4cefaa6249483357a41b786d7e042f1d94a3ea5`; its last modifying commit is
 `1e40c4c876216b4e27d70fa2c45adb47124e2a7b`.
 
+The legacy-v3 audit additionally traced Go history. Unflagged LZ4 frames were
+emitted from v3 introduction commit
+`2e6df57fc041819c837bba4f94438fec5868b85e` through
+`133c1b1dba55dfb8033affedb3d400aaa3d8b807`; those revisions share encoder
+blob `fde8297bdd4a2ee003dacddafb430630d5c0f44e`. The current flagged raw-block
+encoding entered main at `d017048fab4a3e0850cd1e270870a311bcc16009`.
+A size-prefixed complete-frame experiment at
+`fdbcb22c829f6fab749b76554bf53d5223a98160` was never merged and is not part of
+the compatibility target.
+
 ## Files inspected
 
 For Go: `README.md`, `CLAUDE.md`, `ltx.go`, `checksum.go`, `encoder.go`,
@@ -111,13 +121,17 @@ accept. These are hardening differences, not silent reinterpretations.
 14. **Legacy rollout evidence.** Celld retains both flagged raw-block and
     unflagged frame decoders under v3 and documents reader-first deployment.
     This independently confirms that the unchanged version marker created a
-    real rollout constraint. Zig keeps the legacy fixture and an explicit
-    `UnsupportedPageEncoding` result until that decoder is implemented.
+    real rollout constraint. Zig decodes the canonical historical profile:
+    one independent 64 KiB block, a content checksum, and no optional frame
+    fields. Standard LZ4 frame profiles that upstream never emitted remain an
+    explicit `UnsupportedPageEncoding` boundary.
 
 The unflagged v3 LZ4-frame encoding was introduced with v3 and later replaced
-without a version bump. A fixture from Go commit
-`133c1b1dba55dfb8033affedb3d400aaa3d8b807` is retained in the test suite, but
-Zig currently returns `error.UnsupportedPageEncoding` for it.
+without a version bump. Two fixtures from the last historical writer commit
+`133c1b1dba55dfb8033affedb3d400aaa3d8b807` exercise compressed and stored
+blocks. Frame descriptor and physical payload bytes are excluded from LTX's
+logical file checksum, while the decompressed page and LZ4 XXH32 content
+checksum are verified.
 
 ## Fixture provenance
 
@@ -133,7 +147,8 @@ binary artifacts are:
 - `go_v3_incremental`: `3a5f87b53d70343c7e19d760b7ff2536b61b229673ae832af15bcf8d18966956`
 - `go_v3_no_checksum`: `3c27d6dbb89142fd4054f80d3c4a84027346e71b6dd2d7a87e096359aade7f89`
 - `go_v3_near_lock_page`: `e72968228256e29ecb024f0e29a056fbf0ee2c872f7c2589f8bb96901c3f246e`
-- legacy unflagged fixture: `cebdc979fea5b00f51eacdcdeef579f6b87a5b5fb901f4fb952d857eef19da1`
+- legacy unflagged fixture: `cebdc979fea5b00f51eacdcdeef579f6b87a5b5fb901f4fb952d857eef19da1f`
+- legacy mixed fixture: `42c81f74ae54b11cf22768223b99a6c2f271e06559ccb619bc8b553533fcb2c5`
 - `celld_v052_two_page_snapshot`: `b7c4c3d21a1c009c297934723f737199cbe392164a95f05a2a3763dda059eecb`
 
 The 211-byte Celld vector is copied from the pinned crate's byte-exact
@@ -143,6 +158,13 @@ compressor test, where it is asserted equal to Go LTX v0.5.2
 tree. It covers two distinct normal match-compressed 1024-byte pages, a
 multi-entry page index, post-apply checksum `a09639bc718d9c58`, and file
 checksum `dc2f8726a386540e`.
+
+The separately pinned historical generator reproduces both legacy fixtures.
+The 725-byte mixed vector contains a compressed zero page followed by a stored
+512-byte fixed-seed xorshift page. Its post-apply checksum is
+`ff273ef830778b70`, its file checksum is `c33c5c9b2434d957`, and the current Go
+oracle verifies it. Regenerate it with `mise exec -- zig build
+upstream-legacy-fixture -Dlegacy-fixture=mixed`.
 
 The pinned Go generator in `tools/upstream_verify/fixturegen` reproduces three
 additional vectors: a two-page incremental with a negative timestamp, a

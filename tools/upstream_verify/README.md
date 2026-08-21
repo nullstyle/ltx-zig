@@ -21,6 +21,17 @@ through the root build:
 mise exec -- zig build upstream-fixture -Dfixture=incremental > /tmp/go-incremental.ltx
 ```
 
+The separate historical module pins the last canonical unflagged-frame writer.
+It regenerates the compressed one-page and mixed compressed/stored fixtures:
+
+```sh
+mise exec -- zig build upstream-legacy-fixture -Dlegacy-fixture=snapshot-zero > /tmp/go-legacy-zero.ltx
+mise exec -- zig build upstream-legacy-fixture -Dlegacy-fixture=mixed > /tmp/go-legacy-mixed.ltx
+```
+
+Check both committed historical vectors against that pinned writer with
+`mise exec -- zig build check-legacy-fixtures`.
+
 After reviewing changes to the hex mirrors, regenerate all directly consumable
 binary fixtures with `mise exec -- zig build materialize-fixtures`. Confirm the
 committed pairs without modifying them with `mise exec -- zig build

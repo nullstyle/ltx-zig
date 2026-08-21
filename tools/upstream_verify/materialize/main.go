@@ -12,6 +12,7 @@ var fixtureNames = []string{
 	"celld_v052_two_page_snapshot",
 	"go_v3_empty_snapshot",
 	"go_v3_incremental",
+	"go_v3_legacy_mixed",
 	"go_v3_legacy_unflagged",
 	"go_v3_near_lock_page",
 	"go_v3_no_checksum",

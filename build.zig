@@ -104,6 +104,52 @@ pub fn build(b: *std.Build) void {
     );
     upstream_fixture_step.dependOn(&upstream_fixture.step);
 
+    const legacy_fixture_name = b.option(
+        []const u8,
+        "legacy-fixture",
+        "Historical pinned-Go fixture: snapshot-zero or mixed",
+    ) orelse "mixed";
+    const legacy_fixture = b.addSystemCommand(&.{
+        "go",
+        "run",
+        ".",
+        legacy_fixture_name,
+    });
+    legacy_fixture.setCwd(b.path("tools/legacy_fixturegen"));
+    legacy_fixture.setEnvironmentVariable("GOWORK", "off");
+    const legacy_fixture_step = b.step(
+        "upstream-legacy-fixture",
+        "Write a selected historical pinned-Go fixture to stdout",
+    );
+    legacy_fixture_step.dependOn(&legacy_fixture.step);
+
+    const check_legacy_snapshot = b.addSystemCommand(&.{
+        "go",
+        "run",
+        ".",
+        "--check",
+        "snapshot-zero",
+        "../../tests/fixtures/go_v3_legacy_unflagged.ltx",
+    });
+    check_legacy_snapshot.setCwd(b.path("tools/legacy_fixturegen"));
+    check_legacy_snapshot.setEnvironmentVariable("GOWORK", "off");
+    const check_legacy_mixed = b.addSystemCommand(&.{
+        "go",
+        "run",
+        ".",
+        "--check",
+        "mixed",
+        "../../tests/fixtures/go_v3_legacy_mixed.ltx",
+    });
+    check_legacy_mixed.setCwd(b.path("tools/legacy_fixturegen"));
+    check_legacy_mixed.setEnvironmentVariable("GOWORK", "off");
+    const check_legacy_step = b.step(
+        "check-legacy-fixtures",
+        "Check historical Go output against committed legacy fixtures",
+    );
+    check_legacy_step.dependOn(&check_legacy_snapshot.step);
+    check_legacy_step.dependOn(&check_legacy_mixed.step);
+
     const materialize_fixtures = b.addSystemCommand(&.{
         "go",
         "run",

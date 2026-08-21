@@ -125,6 +125,66 @@ test "every truncation of a known-good Go file is rejected without panic" {
     }
 }
 
+test "every truncation of a legacy Go frame is rejected without panic" {
+    var fixture: [183]u8 = undefined;
+    try load_fixture("fixtures/go_v3_legacy_unflagged.ltx", &fixture);
+    var prefix_length: usize = 0;
+    while (prefix_length < fixture.len) : (prefix_length += 1) {
+        try expect_decode_failure(fixture[0..prefix_length]);
+    }
+}
+
+test "legacy frame corruption returns specific errors and poisons the decoder" {
+    var fixture: [183]u8 = undefined;
+    try load_fixture("fixtures/go_v3_legacy_unflagged.ltx", &fixture);
+    const cases = [_]struct {
+        offset: usize,
+        xor_mask: u8,
+        expected_error: anyerror,
+    }{
+        .{ .offset = 106, .xor_mask = 1, .expected_error = error.InvalidLZ4Frame },
+        .{ .offset = 112, .xor_mask = 1, .expected_error = error.InvalidLZ4Frame },
+        .{ .offset = 119, .xor_mask = 1, .expected_error = error.InvalidLZ4Block },
+        .{ .offset = 141, .xor_mask = 1, .expected_error = error.UnsupportedPageEncoding },
+        .{ .offset = 145, .xor_mask = 1, .expected_error = error.LZ4ContentChecksumMismatch },
+    };
+    inline for (cases) |case| {
+        var mutated = fixture;
+        mutated[case.offset] ^= case.xor_mask;
+        var harness: DecoderHarness = undefined;
+        try harness.init(&mutated);
+        _ = try harness.decoder.next();
+        try std.testing.expectError(case.expected_error, harness.decoder.next());
+        try std.testing.expectEqual(ltx.DecoderState.failed, harness.decoder.current_state());
+        try std.testing.expectError(error.InvalidState, harness.decoder.next());
+    }
+}
+
+test "legacy payload limit is checked before reading compressed bytes" {
+    var fixture: [183]u8 = undefined;
+    try load_fixture("fixtures/go_v3_legacy_unflagged.ltx", &fixture);
+    var constrained = limits;
+    constrained.max_compressed_page_size = 23;
+    var harness: DecoderHarness = undefined;
+    try harness.init_with_limits(&fixture, constrained);
+    _ = try harness.decoder.next();
+    try std.testing.expectError(error.CompressedPageLimitExceeded, harness.decoder.next());
+    try std.testing.expectEqual(ltx.DecoderState.failed, harness.decoder.current_state());
+}
+
+test "legacy physical frame size is cross-checked by the page index" {
+    var fixture: [183]u8 = undefined;
+    try load_fixture("fixtures/go_v3_legacy_unflagged.ltx", &fixture);
+    fixture[157] += 1;
+    var harness: DecoderHarness = undefined;
+    try harness.init(&fixture);
+    _ = try harness.decoder.next();
+    _ = try harness.decoder.next();
+    _ = try harness.decoder.next();
+    try std.testing.expectError(error.PageIndexMismatch, harness.decoder.next());
+    try std.testing.expectEqual(ltx.DecoderState.failed, harness.decoder.current_state());
+}
+
 test "bad magic poisons the decoder" {
     var fixture: [168]u8 = undefined;
     try load_fixture("fixtures/go_v3_snapshot_zero_page.ltx", &fixture);
@@ -593,6 +653,58 @@ test "decoder accepts one-byte transport reads" {
     try std.testing.expectEqual(fixture.len, probe.read_calls);
 }
 
+test "legacy decoder accepts one-byte transport reads" {
+    var fixture: [183]u8 = undefined;
+    try load_fixture("fixtures/go_v3_legacy_unflagged.ltx", &fixture);
+    var probe = ProbeReader{ .bytes = &fixture, .max_chunk = 1 };
+    var page_workspace: [65_536]u8 = undefined;
+    var compressed_workspace: [66_000]u8 = undefined;
+    var index_workspace: [8]ltx.PageIndexEntry = undefined;
+    var decoder = try ltx.Decoder.init(
+        .v3,
+        limits,
+        probe.reader(),
+        &page_workspace,
+        &compressed_workspace,
+        &index_workspace,
+    );
+    _ = try decoder.next();
+    _ = try decoder.next();
+    _ = try decoder.next();
+    switch (try decoder.next()) {
+        .verified => |verified| {
+            try std.testing.expectEqual(@as(u64, fixture.len), verified.byte_count);
+        },
+        else => return error.ExpectedVerifiedEvent,
+    }
+    try std.testing.expectEqual(fixture.len, probe.read_calls);
+}
+
+test "reader failure inside a legacy frame poisons the decoder" {
+    var fixture: [183]u8 = undefined;
+    try load_fixture("fixtures/go_v3_legacy_unflagged.ltx", &fixture);
+    var probe = ProbeReader{
+        .bytes = &fixture,
+        .max_chunk = 1,
+        .fail_at_offset = 110,
+    };
+    var page_workspace: [65_536]u8 = undefined;
+    var compressed_workspace: [66_000]u8 = undefined;
+    var index_workspace: [8]ltx.PageIndexEntry = undefined;
+    var decoder = try ltx.Decoder.init(
+        .v3,
+        limits,
+        probe.reader(),
+        &page_workspace,
+        &compressed_workspace,
+        &index_workspace,
+    );
+    _ = try decoder.next();
+    try std.testing.expectError(error.InputFailure, decoder.next());
+    try std.testing.expectEqual(ltx.DecoderState.failed, decoder.current_state());
+    try std.testing.expectError(error.InvalidState, decoder.next());
+}
+
 test "decoder propagates reader failures and becomes failed" {
     var probe = ProbeReader{ .bytes = "", .fail_read = true };
     var page_workspace: [65_536]u8 = undefined;
@@ -656,6 +768,7 @@ const ProbeReader = struct {
     max_chunk: usize = std.math.maxInt(usize),
     read_calls: usize = 0,
     fail_read: bool = false,
+    fail_at_offset: ?usize = null,
     fail_at_end: bool = false,
 
     fn reader(self: *ProbeReader) ltx.Reader {
@@ -670,6 +783,9 @@ const ProbeReader = struct {
         const self: *ProbeReader = @ptrCast(@alignCast(context));
         self.read_calls += 1;
         if (self.fail_read) return error.InputFailure;
+        if (self.fail_at_offset) |offset| {
+            if (self.offset >= offset) return error.InputFailure;
+        }
         const remaining = self.bytes.len - self.offset;
         const count = @min(destination.len, @min(self.max_chunk, remaining));
         @memcpy(destination[0..count], self.bytes[self.offset..][0..count]);

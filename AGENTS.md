@@ -28,8 +28,9 @@
   pages and index entries in strict order, and is deterministic.
 - Test positive and negative boundaries. Maintain independent Go-derived known
   answers; a Zig round trip alone is not an interoperability test.
-- Do not describe planned support as implemented. In particular, legacy
-  unflagged v3 LZ4 frames, v2, apply, and compaction are not currently supported.
+- Preserve decoding of the canonical legacy unflagged v3 LZ4 profile as well
+  as current flagged blocks. V2, apply, and compaction are not currently
+  supported.
 - Run `mise exec -- zig build fmt-check` and `mise exec -- zig build test`
   before handing off changes. Run `mise exec -- zig build interop` for encoder
   or wire-format changes when Go is available; normal tests stay network-free.

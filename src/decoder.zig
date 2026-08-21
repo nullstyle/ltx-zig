@@ -2,6 +2,7 @@ const std = @import("std");
 const checksum = @import("checksum.zig");
 const format = @import("format.zig");
 const lz4_block = @import("lz4_block.zig");
+const lz4_frame = @import("lz4_frame.zig");
 const page_index = @import("page_index.zig");
 const Limits = @import("limits.zig").Limits;
 const Reader = @import("transport.zig").Reader;
@@ -144,10 +145,10 @@ pub const Decoder = struct {
             return .{ .page_block_complete = {} };
         }
         try self.validate_page_header(page_header);
-        if (page_header.flags & format.page_header_flag_size == 0) {
-            return error.UnsupportedPageEncoding;
+        if (page_header.flags & format.page_header_flag_size != 0) {
+            return self.decode_flagged_page(page_header, frame_offset_bytes);
         }
-        return self.decode_flagged_page(page_header, frame_offset_bytes);
+        return self.decode_legacy_page(page_header, frame_offset_bytes);
     }
 
     fn validate_page_header(self: *Decoder, header: format.PageHeader) format.Error!void {
@@ -202,8 +203,38 @@ pub const Decoder = struct {
         const page_length: usize = @intCast(self.header_value.page_size);
         const page = self.page_workspace[0..page_length];
         try lz4_block.decode(compressed, page);
-        self.file_hasher.update(page);
+        return self.finish_page(page_header, frame_offset_bytes, page);
+    }
 
+    fn decode_legacy_page(
+        self: *Decoder,
+        page_header: format.PageHeader,
+        frame_offset_bytes: u64,
+    ) format.Error!DecoderEvent {
+        const page_length: usize = @intCast(self.header_value.page_size);
+        const page = self.page_workspace[0..page_length];
+        const source = lz4_frame.Source{
+            .context = self,
+            .read_exact_fn = read_legacy_exact,
+        };
+        const encoded_size = try lz4_frame.decode(
+            source,
+            self.compressed_workspace,
+            page,
+            self.limits.max_compressed_page_size,
+        );
+        const physical_size = self.input_offset_bytes - frame_offset_bytes;
+        std.debug.assert(physical_size == format.page_header_size + encoded_size);
+        return self.finish_page(page_header, frame_offset_bytes, page);
+    }
+
+    fn finish_page(
+        self: *Decoder,
+        page_header: format.PageHeader,
+        frame_offset_bytes: u64,
+        page: []const u8,
+    ) format.Error!DecoderEvent {
+        self.file_hasher.update(page);
         const frame_size_bytes = self.input_offset_bytes - frame_offset_bytes;
         self.record_page(page_header.page_number, frame_offset_bytes, frame_size_bytes);
         try self.update_snapshot_checksum(page_header.page_number, page);
@@ -370,5 +401,10 @@ pub const Decoder = struct {
             self.input_offset_bytes += @intCast(count);
         }
         std.debug.assert(self.input_offset_bytes == final_offset);
+    }
+
+    fn read_legacy_exact(context: *anyopaque, destination: []u8) format.Error!void {
+        const self: *Decoder = @ptrCast(@alignCast(context));
+        try self.read_exact(destination);
     }
 };

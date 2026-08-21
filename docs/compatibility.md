@@ -12,7 +12,7 @@ check is manual; pinned upstream vectors are identified in the evidence.
 | Go decodes Zig output | Tested | Optional automated `zig build interop` uses the exact pinned Go module |
 | Flagged raw LZ4 block frames | Tested | Go match-compressed block plus Zig literal-only blocks |
 | Normal compressed matches | Tested | Pinned Go/Celld vectors cover overlap, extension lengths, and 512..65536-byte pages |
-| Legacy unflagged v3 frames | Planned | Fixture retained; currently returns `UnsupportedPageEncoding` |
+| Legacy unflagged v3 frames | Tested | Historical Go compressed and stored-block fixtures; canonical one-block 64 KiB profile |
 | LTX v2 | Unsupported | Same magic is never auto-detected or reinterpreted |
 | Snapshots | Tested | One-page and empty pinned Go fixtures; completeness enforced |
 | Incremental transitions | Tested | Pinned Go two-page fixture plus strict order and checksum-continuity tests |
@@ -21,11 +21,14 @@ check is manual; pinned upstream vectors are identified in the evidence.
 | Page-index validation | Tested | Exact entries, offsets, sizes, canonical varints, and byte size |
 | Nonzero reserved header bytes | Supported | Accepted by structural header decoding; encoder emits zero |
 | Trailing-byte rejection | Tested | Exact EOF required after the trailer |
-| Truncation boundaries | Tested | Every strict prefix of the current Go fixture is rejected |
+| Truncation boundaries | Tested | Every strict prefix of one current and one legacy Go fixture is rejected |
 | Position contiguity | Tested | Exact TXID and enabled-checksum equality |
 | Compaction | Unsupported | Future layer above the verified codec |
 | Direct SQLite apply | Unsupported | Future staging layer must publish only after verification |
 
 The encoder prioritizes interoperability over compression ratio. It emits a
 valid deterministic literal-only raw block. The decoder is not restricted to
-that subset and processes normal LZ4 matches emitted by Go.
+that subset and processes normal LZ4 matches emitted by Go. Legacy decoding is
+strictly scoped to the independent 64 KiB, content-checksummed frame profile
+emitted by upstream; other standard LZ4 frame options return
+`UnsupportedPageEncoding`.
