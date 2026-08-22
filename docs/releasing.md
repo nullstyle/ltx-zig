@@ -44,6 +44,9 @@ mise exec -- zig build sqlite-integration -Doptimize=ReleaseSafe
 mise exec -- zig build consumer-smoke -Doptimize=ReleaseSafe
 mise exec -- zig build api-freeze
 mise exec -- zig build api-freeze -Doptimize=ReleaseSafe
+mise exec -- zig build resource-check -Doptimize=ReleaseSafe
+mise exec -- zig build bench-compile -Dbench-optimize=ReleaseSafe
+mise exec -- zig build benchmark-smoke -Dbench-optimize=ReleaseSafe
 mise exec -- zig build example-round-trip -Doptimize=ReleaseSafe
 mise exec -- zig build example-apply-snapshot -Doptimize=ReleaseSafe
 mise exec -- zig build example-sqlite-store -Doptimize=ReleaseSafe
@@ -60,6 +63,10 @@ canonical local `zig fetch` tarball, extracts it away from the checkout, and
 runs the archived consumer plus all three examples with isolated local and
 global caches. It therefore checks package-path completeness without a cached
 or live-source fallback; it does not replace fetching the final remote tag.
+`benchmark-smoke` verifies all 17 deterministic benchmark cases, including
+encoded bytes and digests, decoded images, compacted semantics, and
+callback/event/page counts. Neither it nor any other CI gate compares elapsed
+time or throughput.
 
 Use the official Litestream v0.5.16 archive for the host and verify its
 SHA-256 against the values recorded in [`upstream.md`](upstream.md) before the

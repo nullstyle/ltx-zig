@@ -61,6 +61,12 @@ jobs:
         run: mise exec -- zig build example-sqlite-store -Doptimize=ReleaseSafe
       - name: Test canonical source archive
         run: mise exec -- zig build source-archive-smoke -Doptimize=ReleaseSafe
+      - name: Check resource budget model
+        run: mise exec -- zig build resource-check -Doptimize=ReleaseSafe
+      - name: Compile benchmark executables
+        run: mise exec -- zig build bench-compile -Dbench-optimize=ReleaseSafe
+      - name: Run benchmark correctness smoke
+        run: mise exec -- zig build benchmark-smoke -Dbench-optimize=ReleaseSafe
       - name: Check binary fixtures
         run: mise exec -- zig build check-fixtures
       - name: Check historical Go fixtures

@@ -43,6 +43,12 @@ All notable changes to this project are documented here. The format follows
   and synchronized cross-process generation-lease abandonment coverage.
 - MIT licensing with the required separate BSD-3-Clause LZ4 and Apache-2.0
   Celld/Litestream attributions.
+- A checked resource-budget model with conservative workspace/output formulas,
+  reference configurations, and portable formula tests.
+- A 17-case encoder/decoder 4 KiB–64 KiB pattern matrix, 1/4/16-input
+  compaction scaling, checked/no-checksum staged-apply benchmarks, and a
+  correctness-only smoke mode; the focused raw-LZ4 microbenchmark remains
+  available separately.
 
 ### Fixed
 
@@ -59,3 +65,5 @@ All notable changes to this project are documented here. The format follows
 - SQLite directory durability barriers are portable across qualified hosts.
 - Release metadata validation permits `TBD` during candidate work but requires
   a real `YYYY-MM-DD` changelog date before tag qualification.
+- CI compiles both benchmark executables and runs resource and benchmark-smoke
+  correctness gates without timing thresholds.

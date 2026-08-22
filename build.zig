@@ -4,6 +4,11 @@ const valid_chain_manifest = @import("tests/valid_chain_manifest.zig");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const bench_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "bench-optimize",
+        "Optimization mode for benchmark executables",
+    ) orelse .ReleaseFast;
 
     const ltx = b.addModule("ltx", .{
         .root_source_file = b.path("src/ltx.zig"),
@@ -211,6 +216,30 @@ pub fn build(b: *std.Build) void {
     });
     const run_fuzz_lz4_tests = b.addRunArtifact(fuzz_lz4_tests);
     run_fuzz_lz4_tests.has_side_effects = true;
+    const resource_model = b.createModule(.{
+        .root_source_file = b.path("benchmarks/resource_model.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ltx", .module = ltx }},
+    });
+    const resource_model_tests = b.addTest(.{
+        .name = "ltx-resource-model-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/resource_model.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ltx", .module = ltx },
+                .{ .name = "resource_model", .module = resource_model },
+            },
+        }),
+    });
+    const run_resource_model_tests = b.addRunArtifact(resource_model_tests);
+    const resource_check_step = b.step(
+        "resource-check",
+        "Verify bounded workspace and output-budget formulas",
+    );
+    resource_check_step.dependOn(&run_resource_model_tests.step);
 
     const test_step = b.step("test", "Run all LTX tests");
     test_step.dependOn(&run_unit_tests.step);
@@ -225,6 +254,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_sqlite_store_tests.step);
     test_step.dependOn(&run_sqlite_store_crash_tests.step);
     test_step.dependOn(&run_fuzz_lz4_tests.step);
+    test_step.dependOn(&run_resource_model_tests.step);
 
     const compile_tests_step = b.step(
         "compile-tests",
@@ -232,6 +262,7 @@ pub fn build(b: *std.Build) void {
     );
     compile_tests_step.dependOn(&unit_tests.step);
     compile_tests_step.dependOn(&portability_sqlite_tests.step);
+    compile_tests_step.dependOn(&resource_model_tests.step);
 
     const fuzz_step = b.step(
         "fuzz",
@@ -628,23 +659,68 @@ pub fn build(b: *std.Build) void {
     );
     litestream_interop_step.dependOn(&run_litestream_interop.step);
 
+    const benchmark_ltx = b.createModule(.{
+        .root_source_file = b.path("src/ltx.zig"),
+        .target = b.graph.host,
+        .optimize = bench_optimize,
+    });
+    const benchmark_resource_model = b.createModule(.{
+        .root_source_file = b.path("benchmarks/resource_model.zig"),
+        .target = b.graph.host,
+        .optimize = bench_optimize,
+        .imports = &.{.{ .name = "ltx", .module = benchmark_ltx }},
+    });
     const benchmark_lz4 = b.createModule(.{
         .root_source_file = b.path("src/lz4_block.zig"),
         .target = b.graph.host,
-        .optimize = .ReleaseFast,
+        .optimize = bench_optimize,
     });
-    const benchmark_executable = b.addExecutable(.{
+    const lz4_benchmark_executable = b.addExecutable(.{
         .name = "ltx-lz4-benchmark",
         .root_module = b.createModule(.{
             .root_source_file = b.path("benchmarks/lz4.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseFast,
+            .optimize = bench_optimize,
             .imports = &.{.{ .name = "lz4_block", .module = benchmark_lz4 }},
         }),
     });
-    const run_benchmark = b.addRunArtifact(benchmark_executable);
-    const benchmark_step = b.step("bench", "Benchmark raw LZ4 page compression");
-    benchmark_step.dependOn(&run_benchmark.step);
+    const run_lz4_benchmark = b.addRunArtifact(lz4_benchmark_executable);
+    const lz4_benchmark_step = b.step("bench-lz4", "Benchmark raw LZ4 page compression");
+    lz4_benchmark_step.dependOn(&run_lz4_benchmark.step);
+
+    const core_benchmark_executable = b.addExecutable(.{
+        .name = "ltx-core-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/core.zig"),
+            .target = b.graph.host,
+            .optimize = bench_optimize,
+            .imports = &.{
+                .{ .name = "ltx", .module = benchmark_ltx },
+                .{ .name = "resource_model", .module = benchmark_resource_model },
+            },
+        }),
+    });
+    const run_core_benchmark = b.addRunArtifact(core_benchmark_executable);
+    if (b.args) |args| run_core_benchmark.addArgs(args);
+    const benchmark_step = b.step("bench", "Benchmark representative core LTX operations");
+    benchmark_step.dependOn(&run_core_benchmark.step);
+    const core_benchmark_step = b.step("bench-core", "Alias for the core LTX benchmark");
+    core_benchmark_step.dependOn(&run_core_benchmark.step);
+
+    const run_benchmark_smoke = b.addRunArtifact(core_benchmark_executable);
+    run_benchmark_smoke.addArg("--smoke");
+    const benchmark_smoke_step = b.step(
+        "benchmark-smoke",
+        "Run benchmark fixtures and counters without timing assertions",
+    );
+    benchmark_smoke_step.dependOn(&run_benchmark_smoke.step);
+
+    const benchmark_compile_step = b.step(
+        "bench-compile",
+        "Compile core and raw LZ4 benchmark executables",
+    );
+    benchmark_compile_step.dependOn(&core_benchmark_executable.step);
+    benchmark_compile_step.dependOn(&lz4_benchmark_executable.step);
 
     const upstream_fixture_name = b.option(
         []const u8,

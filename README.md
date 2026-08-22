@@ -138,11 +138,15 @@ mise exec -- zig build example-apply-snapshot
 mise exec -- zig build example-sqlite-store
 mise exec -- zig build source-archive-smoke
 mise exec -- zig build release-check
+mise exec -- zig build resource-check
+mise exec -- zig build bench-compile -Dbench-optimize=ReleaseSafe
+mise exec -- zig build benchmark-smoke -Dbench-optimize=ReleaseSafe
 mise exec -- zig build fuzz -Doptimize=ReleaseSafe # replay fuzz corpora
 mise exec -- zig build fuzz --fuzz=10K -Doptimize=ReleaseSafe --seed 0
 mise exec -- zig build interop # optional; requires Go and may download modules
 mise exec -- zig build litestream-interop -Dlitestream=/absolute/path/to/litestream
-mise exec -- zig build bench   # optional local compression benchmark
+mise exec -- zig build bench # optional core benchmark; ReleaseFast by default
+mise exec -- zig build bench-lz4 # optional raw-LZ4 microbenchmark
 ```
 
 With Docker running, the pinned `act` task parses and executes the exact Linux
@@ -242,6 +246,28 @@ network-free, replay the checked-in fuzz corpora, and run a deterministic
 mutation suite; [docs/fuzzing.md](docs/fuzzing.md) documents the bounded native
 fuzz run used in CI and longer local sessions.
 
+## Resource budgets and benchmarks
+
+The checked [resource-budget model](docs/resource-budgets.md) turns configured
+limits into conservative decoder, encoder, staged-apply, compactor, and output
+storage requirements. `resource-check` verifies those formulas and the
+documented reference configurations without measuring wall-clock time.
+
+`bench` runs the representative core suite: isolated zero, mixed, and
+pseudorandom encode/decode cases at 4 KiB and 64 KiB; checked 1-, 4-, and
+16-input compaction chains; and checked plus no-checksum staged apply. It
+reports `ns/op`, median `ns/page`, logical and wire throughput, byte/page/event
+counts, and apply callback counts. Arguments after `--` are forwarded to the
+executable, which accepts `--filter all|encode|decode|compact|apply` and bounded
+`--iterations 1..10000` options.
+`bench-core` is an alias, while `bench-lz4` retains the focused raw-compressor
+microbenchmark. Benchmark executables use `-Dbench-optimize`, independently of
+the library/test `-Doptimize` setting, and default to `ReleaseFast`.
+`benchmark-smoke` runs all 17 core cases and validates their bytes, digests,
+semantics, and counters in a short mode. CI compiles both executables and runs
+this smoke mode with `ReleaseSafe`, but never treats timing measurements as
+pass/fail gates.
+
 ## Encoding workspace
 
 In addition to compressed-output and page-index storage, each encoder receives
@@ -324,7 +350,9 @@ while (event_count < decoder.event_budget()) : (event_count += 1) {
 See [docs/design.md](docs/design.md) for trust, memory, and state-machine
 details, [docs/compaction.md](docs/compaction.md) for the bounded merge API,
 [docs/apply.md](docs/apply.md) for the storage backend contract, and
-[docs/compatibility.md](docs/compatibility.md) for the exact feature matrix.
+[docs/resource-budgets.md](docs/resource-budgets.md) for workspace formulas.
+The exact feature matrix is in
+[docs/compatibility.md](docs/compatibility.md).
 
 ## Quiescent SQLite store
 
