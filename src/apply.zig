@@ -25,6 +25,10 @@ pub const ApplyState = enum {
     initialized,
     staging,
     published,
+    /// The publication commit point could not be resolved. The backend has
+    /// ended private staging, but must recover its authoritative state before
+    /// another apply begins.
+    recovery_required,
     failed,
 };
 
@@ -51,8 +55,9 @@ pub const StagedPage = struct {
 
 /// Storage-neutral private staging. Callbacks must be synchronous,
 /// non-reentrant, and keep the staging image immutable except while servicing
-/// these calls. Successful `begin` owns an isolated image until exactly one
-/// successful `publish` or `abort` call; failed `begin` owns nothing.
+/// these calls. Successful `begin` owns an isolated image until `publish`
+/// succeeds, `abort` is called, or an indeterminate `publish` ends the stage;
+/// failed `begin` owns nothing.
 pub const ApplyBackend = struct {
     context: *anyopaque,
     /// Acquires stable current metadata and creates an isolated image at the
@@ -79,14 +84,17 @@ pub const ApplyBackend = struct {
     ) error{ApplyReadFailure}!void,
     /// Atomically compares all authoritative metadata with `expected_current`,
     /// then publishes the staged image, its page size, and verified
-    /// post-position together. Every error must leave authoritative state
-    /// unchanged and staging active.
+    /// post-position together. Ordinary errors leave authoritative state
+    /// unchanged and staging active. `ApplyPublishIndeterminate` means the
+    /// durable commit point may have been crossed; the backend must end its
+    /// stage before returning it, and the caller must run backend recovery.
     publish_fn: *const fn (
         context: *anyopaque,
         expected_current: ApplyCurrent,
         verified: format.VerifiedLTX,
     ) error{
         ApplyPublishFailure,
+        ApplyPublishIndeterminate,
         NonContiguousTransition,
         DivergentHistory,
         DatabasePageSizeMismatch,
@@ -128,6 +136,8 @@ pub const ApplyBackend = struct {
 
 /// One-shot verified apply session. It owns the decoder state and can publish
 /// only after the complete LTX and the resulting private database image verify.
+/// An indeterminate publication is terminal and requires backend recovery; it
+/// is never followed by `abort` because the backend has already ended staging.
 /// This is a stateful, single-owner value: never copy it or operate through
 /// copies after initialization.
 pub const StagedApplier = struct {
@@ -182,6 +192,11 @@ pub const StagedApplier = struct {
     pub fn apply(self: *StagedApplier) format.Error!format.VerifiedLTX {
         if (self.state != .initialized) return error.InvalidState;
         return self.apply_internal() catch |err| {
+            if (self.state == .recovery_required) {
+                std.debug.assert(!self.staging_active);
+                std.debug.assert(err == error.ApplyPublishIndeterminate);
+                return err;
+            }
             const must_abort = self.staging_active;
             self.staging_active = false;
             self.state = .failed;
@@ -207,7 +222,14 @@ pub const StagedApplier = struct {
 
         const verified = try self.consume_verified(plan);
         try self.verify_database_checksum(verified);
-        try self.backend.publish(current, verified);
+        self.backend.publish(current, verified) catch |err| switch (err) {
+            error.ApplyPublishIndeterminate => {
+                self.staging_active = false;
+                self.state = .recovery_required;
+                return err;
+            },
+            else => return err,
+        };
         self.staging_active = false;
         self.state = .published;
         return verified;

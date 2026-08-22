@@ -35,6 +35,8 @@ const BackendFailure = enum {
     stage_second,
     read,
     publish,
+    publish_indeterminate_before_commit,
+    publish_indeterminate_after_commit,
 };
 
 const PublishRace = enum {
@@ -199,6 +201,7 @@ const MemoryBackend = struct {
         verified: ltx.VerifiedLTX,
     ) error{
         ApplyPublishFailure,
+        ApplyPublishIndeterminate,
         NonContiguousTransition,
         DivergentHistory,
         DatabasePageSizeMismatch,
@@ -207,6 +210,10 @@ const MemoryBackend = struct {
         self.record(.publish);
         self.publish_attempt_count += 1;
         if (!self.active or self.failure == .publish) return error.ApplyPublishFailure;
+        if (self.failure == .publish_indeterminate_before_commit) {
+            self.active = false;
+            return error.ApplyPublishIndeterminate;
+        }
         switch (self.publish_race) {
             .none => {},
             .txid => self.position.txid.value +%= 1,
@@ -233,6 +240,9 @@ const MemoryBackend = struct {
         self.page_size = verified.header.page_size;
         self.publish_count += 1;
         self.active = false;
+        if (self.failure == .publish_indeterminate_after_commit) {
+            return error.ApplyPublishIndeterminate;
+        }
     }
 
     fn abort(context: *anyopaque) void {
@@ -555,6 +565,9 @@ test "backend failures abort exactly once after begin and never publish" {
             .stage_first, .stage_second => error.ApplyStageFailure,
             .read => error.ApplyReadFailure,
             .publish => error.ApplyPublishFailure,
+            .publish_indeterminate_before_commit,
+            .publish_indeterminate_after_commit,
+            => unreachable,
             .none => unreachable,
         };
         try std.testing.expectError(expected, harness.applier.apply());
@@ -572,6 +585,64 @@ test "backend failures abort exactly once after begin and never publish" {
         if (failure == .publish) {
             try std.testing.expectEqual(@as(u8, 1), backend.publish_attempt_count);
         }
+    }
+}
+
+test "indeterminate publication requires recovery for either commit outcome" {
+    const cases = [_]struct {
+        failure: BackendFailure,
+        expected_publish_count: u8,
+    }{
+        .{ .failure = .publish_indeterminate_before_commit, .expected_publish_count = 0 },
+        .{ .failure = .publish_indeterminate_after_commit, .expected_publish_count = 1 },
+    };
+    for (cases) |case| {
+        var backend = MemoryBackend{ .failure = case.failure };
+        const original: [2048]u8 = @splat(0x71);
+        const position = ltx.Position{
+            .txid = .init(23),
+            .post_apply_checksum = .init(ltx.checksum_flag | 0x23),
+        };
+        try backend.seed(&original, position, 512);
+        var harness: ApplyHarness = undefined;
+        try harness.init(celld_fixture, backend.backend(), .replace_snapshot, apply_limits);
+
+        try std.testing.expectError(error.ApplyPublishIndeterminate, harness.applier.apply());
+
+        try std.testing.expectEqual(
+            ltx.ApplyState.recovery_required,
+            harness.applier.current_state(),
+        );
+        try std.testing.expectEqual(@as(u8, 1), backend.publish_attempt_count);
+        try std.testing.expectEqual(case.expected_publish_count, backend.publish_count);
+        try std.testing.expectEqual(@as(u8, 0), backend.abort_count);
+        try std.testing.expect(!backend.active);
+        try expect_calls(&backend, &.{
+            .begin,
+            .stage_page,
+            .stage_page,
+            .read_page,
+            .read_page,
+            .publish,
+        });
+        if (case.expected_publish_count == 0) {
+            try std.testing.expectEqualDeep(position, backend.position);
+            try std.testing.expectEqualSlices(
+                u8,
+                &original,
+                backend.published[0..backend.published_length_bytes],
+            );
+        } else {
+            try std.testing.expect(backend.position.txid.value != position.txid.value);
+            try std.testing.expect(!std.mem.eql(
+                u8,
+                &original,
+                backend.published[0..backend.published_length_bytes],
+            ));
+        }
+        const call_count = backend.call_count;
+        try std.testing.expectError(error.InvalidState, harness.applier.apply());
+        try std.testing.expectEqual(call_count, backend.call_count);
     }
 }
 

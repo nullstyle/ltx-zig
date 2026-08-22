@@ -14,6 +14,18 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
+    _ = b.addModule("ltx_sqlite", .{
+        .root_source_file = b.path("src/sqlite_store.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ltx", .module = ltx }},
+    });
+    const host_sqlite_store = b.createModule(.{
+        .root_source_file = b.path("src/sqlite_store.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ltx", .module = host_ltx }},
+    });
     const host_lz4 = b.createModule(.{
         .root_source_file = b.path("src/lz4_block.zig"),
         .target = b.graph.host,
@@ -71,6 +83,25 @@ pub fn build(b: *std.Build) void {
     });
     const run_apply_tests = b.addRunArtifact(apply_tests);
     run_apply_tests.has_side_effects = true;
+    const sqlite_store_unit_tests = b.addTest(.{
+        .name = "ltx-sqlite-store-unit-tests",
+        .root_module = host_sqlite_store,
+    });
+    const run_sqlite_store_unit_tests = b.addRunArtifact(sqlite_store_unit_tests);
+    const sqlite_store_tests = b.addTest(.{
+        .name = "ltx-sqlite-store-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sqlite_store.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ltx", .module = host_ltx },
+                .{ .name = "ltx_sqlite", .module = host_sqlite_store },
+            },
+        }),
+    });
+    const run_sqlite_store_tests = b.addRunArtifact(sqlite_store_tests);
+    run_sqlite_store_tests.has_side_effects = true;
     const fuzz_lz4_tests = b.addTest(.{
         .name = "ltx-lz4-fuzz-tests",
         .root_module = b.createModule(.{
@@ -89,6 +120,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_malformed.step);
     test_step.dependOn(&run_fuzz_decoder_tests.step);
     test_step.dependOn(&run_apply_tests.step);
+    test_step.dependOn(&run_sqlite_store_unit_tests.step);
+    test_step.dependOn(&run_sqlite_store_tests.step);
     test_step.dependOn(&run_fuzz_lz4_tests.step);
 
     const fuzz_step = b.step(

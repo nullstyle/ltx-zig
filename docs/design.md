@@ -67,14 +67,24 @@ The staged applier is also one shot:
 
 ```text
 initialized -> staging -> published
-      \            \
-       +------------+-> failed
+     |            |  \
+     +----------> failed
+                  |
+                  +-----> recovery_required
 ```
 
 It begins private staging only after a validated header and bounded final-image
-plan. A successful `begin` is followed by exactly one successful `publish` or
-one infallible `abort`. Any error poisons the session. Publication occurs only
-after `VerifiedLTX` and the applicable full staged-image checksum scan.
+plan. A successful `begin` normally ends with one successful `publish` or one
+infallible `abort`. Ordinary errors poison the session as `failed`. Publication
+occurs only after `VerifiedLTX` and the applicable full staged-image checksum
+scan.
+
+`ApplyPublishIndeterminate` is distinct because the backend's durable commit
+point may have been crossed. The backend ends staging before returning it, so
+the applier does not call `abort` and instead becomes `recovery_required`.
+Authoritative bytes, page-size metadata, and position must then be resolved by
+backend-specific recovery before another apply. Every terminal state rejects
+further calls with `error.InvalidState`.
 
 ## Memory and transports
 
@@ -213,20 +223,26 @@ Errors remain distinguishable by cause:
 - staged apply bounds and backend failures: `DatabasePageLimitExceeded`,
   `DatabaseSizeLimitExceeded`, `DatabasePageSizeMismatch`,
   `ApplyBeginFailure`, `ApplyStageFailure`, `ApplyReadFailure`,
-  `ApplyPublishFailure`;
+  `ApplyPublishFailure`, `ApplyPublishIndeterminate`;
 - API misuse or poisoned terminal state: `InvalidState`.
 
 Malformed external input returns errors; assertions are reserved for internal
 invariants and caller-side programming contracts already established by types
 or initialization.
 
-## Future layers
+## Storage boundary and future layers
 
-A direct SQLite backend must implement private staging and atomically combine
-the expected-position and page-size comparison, complete-image publication,
-page-size metadata, and position advance. Coordination with live SQLite
-connections, rollback journals, WAL and SHM files, durability, and crash
-recovery is not implemented yet. Compaction will sit above the codec and
-produce a new, independently verified transition. Concrete storage adapters,
-encryption, Tigris transport, actor lifecycle, and scheduler coordination
-remain outside this focused library.
+The optional `ltx_sqlite` adapter implements private filesystem staging and
+atomically combines the expected-position comparison, complete-image selection,
+page-size metadata, and position advance in one checksummed manifest. It
+requires application-owned SQLite quiescence and immutable read-only active
+generations; the core itself remains filesystem- and SQLite-independent. The
+exact durability and recovery protocol is in
+[`sqlite-store.md`](sqlite-store.md).
+
+Fixed-path publication beneath open SQLite handles remains unsupported because
+SQLite associates journals and WAL state with the pathname, and its Online
+Backup API does not preserve exact LTX page-one bytes. Compaction will sit above
+the codec and produce a new, independently verified transition. Encryption,
+Tigris transport, local-writer capture, actor lifecycle, and scheduler
+coordination remain outside this focused library.

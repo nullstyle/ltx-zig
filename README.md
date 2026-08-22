@@ -35,16 +35,22 @@ also used as a secondary format and deployment reference:
 - strict terminal verification and trailing-byte rejection;
 - storage-neutral private staging with explicit contiguous and snapshot-replace
   modes;
-- a full staged-image checksum pass and one atomic backend publication boundary.
+- a full staged-image checksum pass and one atomic backend publication boundary;
+- an optional allocation-free `ltx_sqlite` filesystem store with quiescent
+  connection lifecycle hooks, two immutable database generations, a
+  checksummed atomic manifest, sidecar rejection, durability barriers, and
+  explicit recovery after an indeterminate commit.
 
 The decoder covers both page encodings emitted across upstream v3 history. The
 encoder always emits the current flagged raw-block representation. Valid LZ4
 frame profiles that upstream LTX never emitted remain deliberately unsupported.
-LTX v2, compaction, and a direct live SQLite backend are not implemented. The
-core API is synchronous and transport-neutral; convenience filesystem and
-allocation-owning wrappers are intentionally absent at this milestone. The
-apply core does not coordinate SQLite connections, WAL files, or shared-memory
-files.
+LTX v2, compaction, and fixed-path replacement beneath live SQLite connections
+are not implemented. The core API remains synchronous, transport-neutral, and
+free of filesystem and SQLite dependencies. The optional store is deliberately
+a quiescent replica/apply destination: the host drains SQLite through an
+application-owned lifecycle gate, and published generation paths may be opened
+only read-only. It does not link a second SQLite copy or manage application
+connection handles itself. See [docs/sqlite-store.md](docs/sqlite-store.md).
 
 `ltx-zig` is licensed under the [MIT License](LICENSE). The fast-compressor
 algorithm includes BSD-3-Clause-licensed work whose separate notice is retained
@@ -183,3 +189,19 @@ while (event_count < decoder.event_budget()) : (event_count += 1) {
 See [docs/design.md](docs/design.md) for trust, memory, and state-machine
 details, [docs/apply.md](docs/apply.md) for the storage backend contract, and
 [docs/compatibility.md](docs/compatibility.md) for the exact feature matrix.
+
+## Quiescent SQLite store
+
+Consumers that need durable filesystem publication can also import the optional
+module as `ltx_sqlite`. Its `Store` borrows a `std.Io.Dir`, a non-empty
+caller-owned copy/checksum workspace, and a `Lifecycle` callback pair. The
+quiesce callback must stop new SQLite opens, checkpoint and close all owned
+connections, and leave both generation names without `-wal`, `-shm`, or
+`-journal` files. `store.backend()` plugs directly into `StagedApplier`.
+
+After a successful apply, `store.current()` returns the manifest-bound position,
+page size, exact length, generation, and database filename. If apply returns
+`error.ApplyPublishIndeterminate`, the store deliberately keeps the lifecycle
+gate closed; call `store.recover()` until it succeeds before opening SQLite or
+starting another apply. Full deployment constraints and crash outcomes are in
+[the SQLite store guide](docs/sqlite-store.md).

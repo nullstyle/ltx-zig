@@ -6,8 +6,11 @@ workspace, performs no allocation, and imports neither filesystem nor SQLite
 APIs. A caller supplies an `ApplyBackend` whose callbacks manage one private
 database image.
 
-This layer does not yet include a live SQLite adapter or coordinate SQLite
-connections, WAL files, or shared-memory files.
+The core layer deliberately does not import SQLite or coordinate its connection
+handles. The optional `ltx_sqlite` adapter implements this backend with a
+host-owned quiescence gate and atomic filesystem generations; see
+[`sqlite-store.md`](sqlite-store.md). It does not replace a fixed pathname while
+SQLite has it open.
 
 The public entry point combines decoder and apply initialization so the
 session owns one coherent state machine:
@@ -36,8 +39,10 @@ An apply session is one shot:
 
 ```text
 initialized -> staging -> published
-      \            \
-       +------------+-> failed
+     |            |  \
+     +----------> failed
+                  |
+                  +-----> recovery_required
 ```
 
 `StagedApplier` is a stateful, single-owner value. Copying it would duplicate
@@ -61,11 +66,19 @@ The remaining sequence is:
    trailer;
 5. call `publish` once.
 
-No page callback authorizes publication. If any operation after a successful
-`begin` fails, `StagedApplier` calls the infallible `abort` callback exactly
-once and enters `failed`. A failed `begin` promises that it left no active
-stage, so it is not followed by `abort`. Calls after `published` or `failed`
-return `error.InvalidState` without invoking the backend again.
+No page callback authorizes publication. If an ordinary operation after a
+successful `begin` fails, `StagedApplier` calls the infallible `abort` callback
+exactly once and enters `failed`. A failed `begin` promises that it left no
+active stage, so it is not followed by `abort`.
+
+`ApplyPublishIndeterminate` is the sole exception. It means `publish` may have
+crossed its durable commit point, so authoritative state may be either the old
+or new image and position. Before returning this error, the backend ends its
+private stage. `StagedApplier` therefore does not call `abort`; it enters
+`recovery_required`, and the caller must use backend-specific recovery before
+starting another apply. Calls after `published`, `failed`, or
+`recovery_required` return `error.InvalidState` without invoking the backend
+again.
 
 No-checksum LTX files still require complete structural and file-checksum
 verification. Their explicit wire contract omits the final database-image
@@ -100,7 +113,7 @@ callbacks:
 | `begin(plan)` | Open an isolated stage for exactly `plan.final_database_size_bytes`, then return the authoritative position and page-size metadata used to construct it. An error leaves no active stage. |
 | `stage_page(page)` | Copy `page.data` before returning; decoder workspace is reused by the next operation. Apply it at the supplied checked page number and byte offset. |
 | `read_page(number, destination)` | Fill the complete destination from the private staged image. This is used only for the pre-publication database checksum scan. |
-| `publish(expected_current, verified)` | Atomically recheck the authoritative position and page-size metadata, install the complete staged image and its page size, and advance the position to `verified.post_apply_position()`. An error publishes none of those changes. |
+| `publish(expected_current, verified)` | Atomically recheck the authoritative position and page-size metadata, install the complete staged image and its page size, and advance the position to `verified.post_apply_position()`. Ordinary errors publish none of those changes and leave staging active for `abort`. `ApplyPublishIndeterminate` may represent either the pre- or post-commit state and ends staging without `abort`. |
 | `abort()` | Infallibly discard the active stage without changing authoritative bytes or position. |
 
 For an incremental transition, `begin` constructs staging from the exact
@@ -122,6 +135,9 @@ replacement, page-size update, and position advance must share one atomic
 commit or exclusive lock. If another writer changes the state after `begin`,
 `publish` returns `NonContiguousTransition`, `DivergentHistory`, or
 `DatabasePageSizeMismatch` and leaves the authoritative state untouched.
+An adapter that cannot determine whether its durable commit completed instead
+returns `ApplyPublishIndeterminate`; it must expose a recovery operation that
+resolves the authoritative image and position before accepting more work.
 
 `ApplyBackend.backing_bytes`, when available, lets initialization reject
 aliasing between backend staging, input, and codec workspaces. All unreported
@@ -140,10 +156,10 @@ a time; it does not allocate an image, page list, or checksum table. It cannot
 observe bytes beyond the planned final length, so exact staging length remains
 part of the backend's `begin` and atomic publication contract.
 
-A future SQLite adapter can implement the backend with a private database file
-or equivalent transaction, but it must preserve the same boundary. In
-particular, `stage_page` must never write into the live database, and publication
-must include the position compare-and-swap and complete image change. Safe live
-deployment also needs an explicit policy for SQLite connections, rollback
-journals, WAL and SHM files, file and directory durability, and crash recovery.
-Those concerns intentionally remain outside the current core.
+The optional SQLite store implements this boundary with one inactive database
+slot and a checksummed manifest as the sole commit pointer. `stage_page` never
+writes into the manifest-selected generation. Its lifecycle hook drains host
+SQLite connections, it rejects rollback-journal, WAL, and SHM sidecars, and its
+publication sequence syncs the staged database, temporary manifest, and parent
+directory around the atomic rename. These policies remain outside the core and
+are documented in [`sqlite-store.md`](sqlite-store.md).

@@ -15,6 +15,8 @@ exact revisions:
   `89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9`
 - [`pierrec/lz4` v4.1.23](https://github.com/pierrec/lz4/tree/cd9d7a4f66405a92f4881933816b828b0f7d5fe2):
   `cd9d7a4f66405a92f4881933816b828b0f7d5fe2`
+- [SQLite 3.53.4 source mirror](https://github.com/sqlite/sqlite/tree/b09c88c14082339b66c7b7158d609a771e64ca69):
+  `b09c88c14082339b66c7b7158d609a771e64ca69`
 
 At the pinned TigerBeetle tree, `docs/TIGER_STYLE.md` has blob
 `d4cefaa6249483357a41b786d7e042f1d94a3ea5`; its last modifying commit is
@@ -102,6 +104,42 @@ and its restore path does not define coordination with open SQLite connections,
 WAL files, or SHM files. The Zig backend contract additionally requires the
 authoritative position check, complete image publication, and position advance
 to be atomic.
+
+## SQLite publication evidence
+
+The filesystem adapter design was checked against SQLite's published locking,
+journaling, backup, and corruption guidance. SQLite explicitly classifies
+[renaming or unlinking an open database](https://www.sqlite.org/howtocorrupt.html#_unlinking_or_renaming_a_database_file_while_in_use)
+as undefined and corruption-prone. A WAL file can contain committed state that
+is absent from the main database, so it must remain paired with that database
+until SQLite has checkpointed and closed it through the same VFS
+([WAL persistence](https://www.sqlite.org/wal.html#the_wal_file)). A hot rollback
+journal has the same recovery significance. Consequently, raw LTX page writes
+are permitted only in a private generation after an application-owned gate has
+drained and closed every SQLite connection. A filesystem advisory lock
+coordinates participating processes but cannot make an arbitrary SQLite client
+cooperate.
+
+SQLite's Online Backup API is not a byte-exact publication substitute. At
+backup completion SQLite intentionally increments the destination schema cookie
+in [`backup.c`](https://github.com/sqlite/sqlite/blob/b09c88c14082339b66c7b7158d609a771e64ca69/src/backup.c#L437-L449),
+and committing the destination also changes page-one transaction metadata. The
+[database-header layout](https://www.sqlite.org/fileformat2.html#the_database_header)
+places those fields inside the bytes covered by LTX's page-one checksum. A
+SQLite 3.51.0 experiment copying the same 2048-byte source into fresh and
+existing destinations confirmed differences at the change-counter,
+schema-cookie, and version-valid-for fields. The backup images were valid
+SQLite databases, but neither was the exact verified LTX image.
+
+The adapter therefore uses two closed database generations and one checksummed
+manifest as the sole authority. Publication prepares and syncs the inactive
+generation, syncs a temporary manifest containing both the image selection and
+LTX position, then atomically renames that manifest. This also exposes a
+general storage fact that the earlier abstract backend contract omitted: if
+the rename succeeds and the following directory sync fails, the visible commit
+may have changed while crash durability is unknown. That outcome is reported
+separately as `ApplyPublishIndeterminate` and requires manifest recovery; it is
+never treated as an ordinary failure followed by stage deletion.
 
 ## Compatibility decisions and disagreements
 

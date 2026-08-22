@@ -36,8 +36,10 @@
 - Test positive and negative boundaries. Maintain independent Go-derived known
   answers; a Zig round trip alone is not an interoperability test.
 - Preserve decoding of the canonical legacy unflagged v3 LZ4 profile as well
-  as current flagged blocks. V2, compaction, and a direct live SQLite backend
-  are not currently supported.
+  as current flagged blocks. V2, compaction, and fixed-path replacement beneath
+  open SQLite connections are not currently supported. The optional
+  `ltx_sqlite` store requires a host-owned quiescence gate and read-only active
+  generations.
 - Run `mise exec -- zig build fmt-check` and `mise exec -- zig build test`
   before handing off changes. Run `mise exec -- zig build interop` for encoder
   or wire-format changes when Go is available; normal tests stay network-free.

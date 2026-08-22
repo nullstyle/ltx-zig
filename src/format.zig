@@ -85,6 +85,7 @@ pub const Error = error{
     ApplyStageFailure,
     ApplyReadFailure,
     ApplyPublishFailure,
+    ApplyPublishIndeterminate,
     WorkspaceAliasing,
     InvalidState,
 };
