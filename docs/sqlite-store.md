@@ -210,12 +210,16 @@ and retry recovery on the same `Store`, or terminate the process. Do not reopen
 SQLite after a recovery error. This fail-closed rule also applies when recovery
 was invoked at startup rather than after an indeterminate apply.
 
-The test suite terminates a separate process immediately after every baseline
-and publication durability boundary, then reopens and recovers the store through
-a fresh `Store` in the parent process. These tests prove resource abandonment,
-lock release, and deterministic visible old/new selection after an application
-crash. They do not simulate a machine power loss; the sync/rename ordering and
-filesystem contract are the basis for that guarantee.
+The network-free test suite terminates a separate process immediately after
+every baseline and publication durability boundary, then reopens and recovers
+the store through a fresh `Store` in the parent process. The host-SQLite
+integration suite repeats the first publication, A-to-B growth, and B-to-C
+shrink/slot-reuse boundaries using SQLite-produced checksummed images. Recovery
+must select and checksum-scan the exact old or new image, which is then opened
+read-only through a typed access and checked semantically. These tests prove
+resource abandonment, lock release, and deterministic visible old/new selection
+after an application crash. They do not simulate a machine power loss; the
+sync/rename ordering and filesystem contract are the basis for that guarantee.
 
 `zig build sqlite-integration` also creates three bounded database images using
 the host SQLite library in WAL mode. It publishes A as a checksummed snapshot,
@@ -224,7 +228,10 @@ grows and shrinks. The test requires an old reader to block a truncate
 checkpoint, a generation lease to block slot reuse, late LTX corruption to
 leave A authoritative, exact active and retained slot bytes, balanced lifecycle
 ownership, read-only semantic queries, `PRAGMA integrity_check`, and no SQLite
-sidecars after closure.
+sidecars after closure. Closing SQLite while deliberately retaining its access
+continues to block publication and recovery. Releasing that access makes copied
+handles stale; they cannot unlock the next epoch when the same caller-owned
+storage is reused.
 
 Those incrementals are deterministic page differences between fully
 checkpointed SQLite images. They qualify staged application and publication;

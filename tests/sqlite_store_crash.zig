@@ -1,15 +1,9 @@
 const std = @import("std");
 const sqlite = @import("ltx_sqlite");
 const crash_options = @import("crash_options");
+const protocol = @import("sqlite_crash_protocol.zig");
 
-const crash_exit_code: u8 = 86;
 const page_size: usize = 512;
-
-const Scenario = enum {
-    baseline,
-    first_publication,
-    existing_publication,
-};
 
 const Expected = union(enum) {
     empty,
@@ -49,55 +43,8 @@ const Gate = struct {
     }
 };
 
-const baseline_points = [_]sqlite.FaultPoint{
-    .baseline_manifest_sync,
-    .baseline_directory_sync,
-    .baseline_manifest_rename,
-    .baseline_commit_directory_sync,
-};
-
-const handoff_points = [_]sqlite.FaultPoint{
-    .loaded_manifest_directory_sync,
-};
-
-const publication_cases = [_]struct {
-    point: sqlite.FaultPoint,
-    first: Expected,
-    existing: Expected,
-}{
-    .{ .point = .database_sync, .first = .empty, .existing = first_generation() },
-    .{ .point = .database_directory_sync, .first = .empty, .existing = first_generation() },
-    .{ .point = .manifest_sync, .first = .empty, .existing = first_generation() },
-    .{ .point = .manifest_directory_sync, .first = .empty, .existing = first_generation() },
-    .{ .point = .manifest_rename, .first = first_generation(), .existing = second_generation() },
-    .{ .point = .commit_directory_sync, .first = first_generation(), .existing = second_generation() },
-};
-
-comptime {
-    const point_count = std.meta.fields(sqlite.FaultPoint).len;
-    var seen: [point_count]bool = @splat(false);
-    for (baseline_points) |point| {
-        const index = @intFromEnum(point);
-        if (seen[index]) @compileError("duplicate SQLite crash fault point");
-        seen[index] = true;
-    }
-    for (handoff_points) |point| {
-        const index = @intFromEnum(point);
-        if (seen[index]) @compileError("duplicate SQLite crash fault point");
-        seen[index] = true;
-    }
-    for (publication_cases) |case| {
-        const index = @intFromEnum(case.point);
-        if (seen[index]) @compileError("duplicate SQLite crash fault point");
-        seen[index] = true;
-    }
-    for (seen) |covered| {
-        if (!covered) @compileError("SQLite crash fault point lacks subprocess coverage");
-    }
-}
-
 test "process crash at every empty-baseline boundary recovers canonical empty state" {
-    for (baseline_points) |point| {
+    for (protocol.baseline_points) |point| {
         var temporary = std.testing.tmpDir(.{});
         defer temporary.cleanup();
         try run_crash_child(temporary.dir, .baseline, point);
@@ -106,25 +53,31 @@ test "process crash at every empty-baseline boundary recovers canonical empty st
 }
 
 test "process crash at every first-publication boundary recovers one atomic state" {
-    for (publication_cases) |case| {
+    for (protocol.publication_cases) |case| {
         var temporary = std.testing.tmpDir(.{});
         defer temporary.cleanup();
         try run_crash_child(temporary.dir, .first_publication, case.point);
-        try expect_recovery(temporary.dir, case.first);
+        try expect_recovery(
+            temporary.dir,
+            if (case.new_visible) first_generation() else .empty,
+        );
     }
 }
 
 test "process crash at every later-publication boundary preserves old or new generation" {
-    for (publication_cases) |case| {
+    for (protocol.publication_cases) |case| {
         var temporary = std.testing.tmpDir(.{});
         defer temporary.cleanup();
         try run_crash_child(temporary.dir, .existing_publication, case.point);
-        try expect_recovery(temporary.dir, case.existing);
+        try expect_recovery(
+            temporary.dir,
+            if (case.new_visible) second_generation() else first_generation(),
+        );
     }
 }
 
 test "process crash while stabilizing an observed manifest preserves its selected slot" {
-    for (handoff_points) |point| {
+    for (protocol.handoff_points) |point| {
         var temporary = std.testing.tmpDir(.{});
         defer temporary.cleanup();
         try run_crash_child(temporary.dir, .existing_publication, point);
@@ -134,41 +87,17 @@ test "process crash while stabilizing an observed manifest preserves its selecte
 
 fn run_crash_child(
     dir: std.Io.Dir,
-    scenario: Scenario,
+    scenario: protocol.Scenario,
     point: sqlite.FaultPoint,
 ) !void {
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path_length = try dir.realPath(std.testing.io, &path_buffer);
-    const result = try std.process.run(
+    try protocol.run_child(
         std.testing.allocator,
         std.testing.io,
-        .{
-            .argv = &.{
-                crash_options.child_path,
-                @tagName(scenario),
-                @tagName(point),
-                path_buffer[0..path_length],
-            },
-            .stdout_limit = .limited(4096),
-            .stderr_limit = .limited(4096),
-            .timeout = .{ .duration = .{
-                .clock = .awake,
-                .raw = .fromSeconds(10),
-            } },
-        },
+        crash_options.child_path,
+        dir,
+        scenario,
+        point,
     );
-    defer std.testing.allocator.free(result.stdout);
-    defer std.testing.allocator.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code != crash_exit_code) {
-            std.debug.print("crash child exited {d}: {s}\n", .{ code, result.stderr });
-            return error.UnexpectedChildTermination;
-        },
-        else => {
-            std.debug.print("crash child terminated {any}: {s}\n", .{ result.term, result.stderr });
-            return error.UnexpectedChildTermination;
-        },
-    }
 }
 
 fn expect_recovery(dir: std.Io.Dir, expected: Expected) !void {

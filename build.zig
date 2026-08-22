@@ -131,6 +131,7 @@ pub fn build(b: *std.Build) void {
     });
     const crash_options = b.addOptions();
     crash_options.addOptionPath("child_path", sqlite_store_crash_child.getEmittedBin());
+    const crash_options_module = crash_options.createModule();
     const sqlite_store_crash_tests = b.addTest(.{
         .name = "ltx-sqlite-store-crash-tests",
         .root_module = b.createModule(.{
@@ -139,7 +140,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ltx_sqlite", .module = host_sqlite_store },
-                .{ .name = "crash_options", .module = crash_options.createModule() },
+                .{ .name = "crash_options", .module = crash_options_module },
             },
         }),
     });
@@ -154,6 +155,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "ltx", .module = host_ltx },
             .{ .name = "ltx_sqlite", .module = host_sqlite_store },
+            .{ .name = "crash_options", .module = crash_options_module },
         },
     });
     sqlite_integration_module.linkSystemLibrary("sqlite3", .{});

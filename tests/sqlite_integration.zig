@@ -1,6 +1,8 @@
 const std = @import("std");
 const ltx = @import("ltx");
 const sqlite_store = @import("ltx_sqlite");
+const crash_options = @import("crash_options");
+const crash_protocol = @import("sqlite_crash_protocol.zig");
 
 const SQLite = opaque {};
 const Statement = opaque {};
@@ -93,6 +95,15 @@ const DatabaseImage = struct {
 const EncodedTransition = struct {
     length_bytes: usize,
     verified: ltx.VerifiedLTX,
+};
+
+const RealCrashInputs = struct {
+    snapshot: []const u8,
+    incremental: []const u8,
+    reuse: []const u8,
+    image_a: *const DatabaseImage,
+    image_b: *const DatabaseImage,
+    image_c: *const DatabaseImage,
 };
 
 const ChainState = enum {
@@ -226,6 +237,11 @@ const ManagedLifecycle = struct {
     }
 
     fn close(self: *ManagedLifecycle) !void {
+        try self.close_sqlite();
+        try self.release_generation();
+    }
+
+    fn close_sqlite(self: *ManagedLifecycle) !void {
         if (self.held_statement) |statement| {
             self.held_statement = null;
             try std.testing.expectEqual(sqlite_ok, sqlite3_finalize(statement));
@@ -234,6 +250,10 @@ const ManagedLifecycle = struct {
             try std.testing.expectEqual(sqlite_ok, sqlite3_close(database));
             self.database = null;
         }
+    }
+
+    fn release_generation(self: *ManagedLifecycle) !void {
+        if (self.held_statement != null or self.database != null) return error.InvalidState;
         if (self.generation_access) |*access| {
             try access.release();
             self.generation_access = null;
@@ -374,6 +394,195 @@ test "real SQLite checksummed incrementals grow and shrink generations" {
         encoded_bytes[0..encoded_c.length_bytes],
         encoded_c,
     );
+}
+
+test "real SQLite images recover atomically across publication process crashes" {
+    try std.testing.expect(sqlite3_libversion_number() >= 3_022_000);
+    var source = std.testing.tmpDir(.{});
+    defer source.cleanup();
+    var image_a: DatabaseImage = .{};
+    var image_b: DatabaseImage = .{};
+    var image_c: DatabaseImage = .{};
+    var encoded_a_bytes: [max_ltx_bytes]u8 = undefined;
+    var encoded_b_bytes: [max_ltx_bytes]u8 = undefined;
+    var encoded_c_bytes: [max_ltx_bytes]u8 = undefined;
+    const encoded = try prepare_real_crash_inputs(
+        source.dir,
+        &image_a,
+        &image_b,
+        &image_c,
+        &encoded_a_bytes,
+        &encoded_b_bytes,
+        &encoded_c_bytes,
+    );
+    const inputs: RealCrashInputs = .{
+        .snapshot = encoded_a_bytes[0..encoded[0].length_bytes],
+        .incremental = encoded_b_bytes[0..encoded[1].length_bytes],
+        .reuse = encoded_c_bytes[0..encoded[2].length_bytes],
+        .image_a = &image_a,
+        .image_b = &image_b,
+        .image_c = &image_c,
+    };
+
+    for (crash_protocol.publication_cases) |case| {
+        try run_real_crash_case(
+            .real_first_publication,
+            case.point,
+            if (case.new_visible) .a else null,
+            inputs,
+        );
+        try run_real_crash_case(
+            .real_existing_publication,
+            case.point,
+            if (case.new_visible) .b else .a,
+            inputs,
+        );
+        try run_real_crash_case(
+            .real_reuse_publication,
+            case.point,
+            if (case.new_visible) .c else .b,
+            inputs,
+        );
+    }
+    for (crash_protocol.handoff_points) |point| {
+        try run_real_crash_case(
+            .real_existing_publication,
+            point,
+            .a,
+            inputs,
+        );
+        try run_real_crash_case(
+            .real_reuse_publication,
+            point,
+            .b,
+            inputs,
+        );
+    }
+}
+
+fn prepare_real_crash_inputs(
+    dir: std.Io.Dir,
+    image_a: *DatabaseImage,
+    image_b: *DatabaseImage,
+    image_c: *DatabaseImage,
+    encoded_a_bytes: *[max_ltx_bytes]u8,
+    encoded_b_bytes: *[max_ltx_bytes]u8,
+    encoded_c_bytes: *[max_ltx_bytes]u8,
+) ![3]EncodedTransition {
+    const seed_path = try DatabasePath.init(dir, database_name);
+    try create_and_drain_wal_database(dir, seed_path.sentinel());
+    try expect_source_sidecars_absent(dir);
+    try load_database_image(dir, database_name, image_a);
+    const encoded_a = try encode_transition(null, image_a, 1, encoded_a_bytes);
+    try mutate_seed_to_b(dir, seed_path.sentinel());
+    try load_database_image(dir, database_name, image_b);
+    try std.testing.expect(image_b.page_count > image_a.page_count);
+    const encoded_b = try encode_transition(image_a, image_b, 2, encoded_b_bytes);
+    try expect_incremental(encoded_b, image_a, image_b, 2);
+    try mutate_seed_to_c(dir, seed_path.sentinel());
+    try load_database_image(dir, database_name, image_c);
+    try std.testing.expect(image_c.page_count < image_b.page_count);
+    const encoded_c = try encode_transition(image_b, image_c, 3, encoded_c_bytes);
+    try expect_incremental(encoded_c, image_b, image_c, 3);
+    return .{ encoded_a, encoded_b, encoded_c };
+}
+
+fn run_real_crash_case(
+    scenario: crash_protocol.Scenario,
+    point: sqlite_store.FaultPoint,
+    expected: ?ChainState,
+    inputs: RealCrashInputs,
+) !void {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try write_crash_transition(
+        temporary.dir,
+        crash_protocol.real_snapshot_name,
+        inputs.snapshot,
+    );
+    try write_crash_transition(
+        temporary.dir,
+        crash_protocol.real_incremental_name,
+        inputs.incremental,
+    );
+    try write_crash_transition(temporary.dir, crash_protocol.real_reuse_name, inputs.reuse);
+    try crash_protocol.run_child(
+        std.testing.allocator,
+        std.testing.io,
+        crash_options.child_path,
+        temporary.dir,
+        scenario,
+        point,
+    );
+    try expect_real_crash_recovery(
+        temporary.dir,
+        expected,
+        inputs.image_a,
+        inputs.image_b,
+        inputs.image_c,
+    );
+}
+
+fn write_crash_transition(dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
+    var file = try dir.createFile(std.testing.io, name, .{
+        .read = false,
+        .truncate = true,
+        .exclusive = true,
+    });
+    errdefer file.close(std.testing.io);
+    try file.writePositionalAll(std.testing.io, bytes, 0);
+    file.close(std.testing.io);
+}
+
+fn expect_real_crash_recovery(
+    dir: std.Io.Dir,
+    expected: ?ChainState,
+    image_a: *const DatabaseImage,
+    image_b: *const DatabaseImage,
+    image_c: *const DatabaseImage,
+) !void {
+    var lifecycle: ManagedLifecycle = .{};
+    var copy_workspace: [4096]u8 = undefined;
+    var store = try sqlite_store.Store.init(
+        std.testing.io,
+        dir,
+        &copy_workspace,
+        lifecycle.lifecycle(),
+        .{},
+    );
+    const recovered = try store.recover();
+    try std.testing.expectEqual(lifecycle.quiesce_count, lifecycle.release_count);
+    try std.testing.expectEqualDeep(recovered, try store.current());
+    try std.testing.expect(!try path_exists(dir, sqlite_store.manifest_temporary_name));
+    if (expected == null) {
+        try std.testing.expectEqual(null, recovered);
+        try std.testing.expect(!try path_exists(dir, sqlite_store.database_a_name));
+        try std.testing.expect(!try path_exists(dir, sqlite_store.database_b_name));
+        return;
+    }
+
+    const state = expected.?;
+    const image = switch (state) {
+        .a => image_a,
+        .b => image_b,
+        .c => image_c,
+    };
+    var access_storage: sqlite_store.GenerationAccessStorage = .{};
+    var access_workspace: sqlite_store.GenerationAccessWorkspace = .{};
+    const current = try open_and_expect_generation(
+        &store,
+        &lifecycle,
+        &access_storage,
+        &access_workspace,
+        dir,
+        image,
+        @intFromEnum(state) + 1,
+        if (state == .b) .b else .a,
+        state,
+    );
+    try std.testing.expectEqual(current, recovered.?);
+    if (state == .c) try expect_file_image(dir, sqlite_store.database_b_name, image_b);
+    try lifecycle.close();
 }
 
 fn expect_open_generation(
@@ -618,7 +827,6 @@ fn exercise_blocked_then_valid_c(
     encoded_c: EncodedTransition,
 ) !void {
     try expect_incremental(encoded_c, image_b, image_c, 3);
-    try lifecycle.hold_read_transaction();
     var competing_lifecycle: ManagedLifecycle = .{};
     var competing_copy_workspace: [4096]u8 = undefined;
     var competing_store = try sqlite_store.Store.init(
@@ -628,21 +836,29 @@ fn exercise_blocked_then_valid_c(
         competing_lifecycle.lifecycle(),
         .{},
     );
-    try std.testing.expectError(
-        error.ApplyBeginFailure,
-        apply_encoded(&competing_store, encoded_bytes, .contiguous),
+    var stale_b = try block_c_through_retained_b(
+        lifecycle,
+        &competing_store,
+        &competing_lifecycle,
+        encoded_bytes,
     );
-    try std.testing.expectEqual(.store_busy, competing_store.last_failure());
-    try std.testing.expectEqual(
-        competing_lifecycle.quiesce_count,
-        competing_lifecycle.release_count,
-    );
-    try expect_chain_rows(lifecycle.database.?, .b);
-    try expect_file_image(database_dir, sqlite_store.database_b_name, image_b);
 
+    _ = try open_and_expect_generation(
+        store,
+        lifecycle,
+        access_storage,
+        access_workspace,
+        database_dir,
+        image_b,
+        2,
+        .b,
+        .b,
+    );
+    try expect_stale_access(&stale_b);
+    try expect_competing_apply_busy(&competing_store, &competing_lifecycle, encoded_bytes);
     try lifecycle.close();
     _ = try apply_and_expect(&competing_store, encoded_bytes, encoded_c);
-    _ = try open_and_expect_generation(
+    const current_c = try open_and_expect_generation(
         store,
         lifecycle,
         access_storage,
@@ -655,8 +871,105 @@ fn exercise_blocked_then_valid_c(
     );
     try expect_file_image(database_dir, sqlite_store.database_b_name, image_b);
     try lifecycle.close();
+    try recover_and_reopen_c(
+        store,
+        lifecycle,
+        &competing_store,
+        &competing_lifecycle,
+        access_storage,
+        access_workspace,
+        database_dir,
+        image_c,
+        current_c,
+    );
     try expect_no_slot_sidecars(database_dir, .a);
     try expect_no_slot_sidecars(database_dir, .b);
+}
+
+fn recover_and_reopen_c(
+    store: *sqlite_store.Store,
+    lifecycle: *ManagedLifecycle,
+    competing_store: *sqlite_store.Store,
+    competing_lifecycle: *ManagedLifecycle,
+    access_storage: *sqlite_store.GenerationAccessStorage,
+    access_workspace: *sqlite_store.GenerationAccessWorkspace,
+    database_dir: std.Io.Dir,
+    image_c: *const DatabaseImage,
+    current_c: sqlite_store.Current,
+) !void {
+    try std.testing.expectEqual(current_c, (try competing_store.recover()).?);
+    try std.testing.expectEqual(
+        competing_lifecycle.quiesce_count,
+        competing_lifecycle.release_count,
+    );
+    _ = try open_and_expect_generation(
+        store,
+        lifecycle,
+        access_storage,
+        access_workspace,
+        database_dir,
+        image_c,
+        3,
+        .a,
+        .c,
+    );
+    try lifecycle.close();
+}
+
+fn block_c_through_retained_b(
+    lifecycle: *ManagedLifecycle,
+    competing_store: *sqlite_store.Store,
+    competing_lifecycle: *ManagedLifecycle,
+    encoded_bytes: []const u8,
+) !sqlite_store.GenerationAccess {
+    var stale_b = lifecycle.generation_access orelse return error.ExpectedGeneration;
+    const current_b = try stale_b.current();
+    try lifecycle.hold_read_transaction();
+    try expect_competing_apply_busy(competing_store, competing_lifecycle, encoded_bytes);
+
+    try lifecycle.close_sqlite();
+    try std.testing.expect(lifecycle.database == null);
+    try std.testing.expect(lifecycle.held_statement == null);
+    const retained = if (lifecycle.generation_access) |*access|
+        try access.current()
+    else
+        return error.ExpectedGeneration;
+    try std.testing.expectEqual(current_b, retained);
+    try expect_competing_apply_busy(competing_store, competing_lifecycle, encoded_bytes);
+
+    try std.testing.expectError(error.StoreBusy, competing_store.recover());
+    try std.testing.expect(competing_lifecycle.admission_closed);
+    try std.testing.expectEqual(
+        competing_lifecycle.quiesce_count,
+        competing_lifecycle.release_count + 1,
+    );
+    try lifecycle.release_generation();
+    try expect_stale_access(&stale_b);
+    try std.testing.expectEqual(current_b, (try competing_store.recover()).?);
+    try std.testing.expectEqual(
+        competing_lifecycle.quiesce_count,
+        competing_lifecycle.release_count,
+    );
+    return stale_b;
+}
+
+fn expect_competing_apply_busy(
+    store: *sqlite_store.Store,
+    lifecycle: *ManagedLifecycle,
+    encoded_bytes: []const u8,
+) !void {
+    try std.testing.expectError(
+        error.ApplyBeginFailure,
+        apply_encoded(store, encoded_bytes, .contiguous),
+    );
+    try std.testing.expectEqual(.store_busy, store.last_failure());
+    try std.testing.expectEqual(lifecycle.quiesce_count, lifecycle.release_count);
+}
+
+fn expect_stale_access(access: *sqlite_store.GenerationAccess) !void {
+    try std.testing.expectError(error.InvalidState, access.current());
+    try std.testing.expectError(error.InvalidState, access.sqlite_open_spec());
+    try std.testing.expectError(error.InvalidState, access.release());
 }
 
 fn mutate_seed_to_b(

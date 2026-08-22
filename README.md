@@ -308,8 +308,9 @@ constraints and crash outcomes are in [the SQLite store guide](docs/sqlite-store
 
 Store changes are qualified with real child-process termination at every
 baseline and publication sync/rename boundary. `zig build sqlite-integration`
-additionally builds a real WAL-mode SQLite A -> B -> C chain, applies its
-checksummed snapshot and incrementals through alternating generations, and
-checks blocked WAL reset and publication, exact bytes, read-only queries,
-retained prior-generation bytes, and `PRAGMA integrity_check`. SQLite remains
-linked only into the integration test executable, not either library module.
+additionally builds a real WAL-mode SQLite A -> B -> C chain, crash-replays its
+first publication, growth, shrink, and slot reuse through those boundaries, and
+checks retained leases, stale access epochs, checksum-scanning recovery, exact
+bytes, read-only queries, retained prior-generation bytes, and
+`PRAGMA integrity_check`. SQLite remains linked only into the integration test
+executable, not either library module.

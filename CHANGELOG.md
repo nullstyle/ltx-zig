@@ -20,6 +20,9 @@ All notable changes to this project are documented here. The format follows
 - Real WAL-mode SQLite A-to-B-to-C qualification for checksummed snapshot and
   incremental publication, including growth, shrink, blocked reset and lease
   paths, late input corruption, exact generation bytes, and semantic queries.
+- SQLite-produced A-to-B-to-C process-crash replay at every publication
+  durability boundary, plus retained-lease, stale-epoch, and checksum-scanning
+  recovery qualification over real database images.
 - Pinned Go and Celld interoperability fixtures, mutation and fuzz suites, and
   byte-for-byte Go-oracle compaction checks.
 - MIT licensing with the required separate BSD-3-Clause LZ4 attribution.
