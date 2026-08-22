@@ -9,6 +9,8 @@ permissions:
 
 jobs:
   test:
+    env:
+      GOTOOLCHAIN: local
     strategy:
       fail-fast: false
       matrix:
@@ -21,25 +23,29 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install pinned tools
         uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
-      - name: Verify toolchain pin
-        run: test "$(zig version)" = "0.16.0"
+        with:
+          version: "2026.8.10"
+      - name: Verify toolchain pins
+        run: |
+          test "$(mise exec -- go env GOVERSION)" = "go1.24.13"
+          test "$(mise exec -- zig version)" = "0.16.0"
       - name: Install SQLite integration dependency
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --yes libsqlite3-dev
       - name: Check formatting
-        run: zig build fmt-check
+        run: mise exec -- zig build fmt-check
       - name: Check binary fixtures
-        run: zig build check-fixtures
+        run: mise exec -- zig build check-fixtures
       - name: Check historical Go fixtures
-        run: zig build check-legacy-fixtures
+        run: mise exec -- zig build check-legacy-fixtures
       - name: Test release-safe core
-        run: zig build test -Doptimize=ReleaseSafe
+        run: mise exec -- zig build test -Doptimize=ReleaseSafe
       - name: Test live SQLite durability integration
-        run: zig build sqlite-integration -Doptimize=ReleaseSafe
+        run: mise exec -- zig build sqlite-integration -Doptimize=ReleaseSafe
       - name: Run bounded native fuzzing
         if: runner.os == 'Linux'
-        run: zig build fuzz --fuzz=10K -Doptimize=ReleaseSafe --seed 0
+        run: mise exec -- zig build fuzz --fuzz=10K -Doptimize=ReleaseSafe --seed 0
       - name: Build library
-        run: zig build -Doptimize=ReleaseSafe
+        run: mise exec -- zig build -Doptimize=ReleaseSafe
       - name: Verify Zig output with pinned Go oracle
-        run: zig build interop -Doptimize=ReleaseSafe
+        run: mise exec -- zig build interop -Doptimize=ReleaseSafe

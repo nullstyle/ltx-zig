@@ -793,12 +793,19 @@ test "generation access rejects an absolute slot path beyond the OS bound" {
         var component_length = @min(component_bytes.len, remaining - 1);
         if (remaining - (component_length + 1) == 1) component_length -= 1;
         const component = component_bytes[0..component_length];
-        try current_dir.createDir(std.testing.io, component, .default_dir);
-        const next_dir = try current_dir.openDir(std.testing.io, component, .{});
+        // Some mounted filesystems impose a lower path bound than the host OS.
+        current_dir.createDir(std.testing.io, component, .default_dir) catch |err| switch (err) {
+            error.NameTooLong => return error.SkipZigTest,
+            else => return err,
+        };
+        const next_dir = current_dir.openDir(std.testing.io, component, .{}) catch |err| switch (err) {
+            error.NameTooLong => return error.SkipZigTest,
+            else => return err,
+        };
         if (current_dir_owned) current_dir.close(std.testing.io);
         current_dir = next_dir;
         current_dir_owned = true;
-        current_length = try current_dir.realPath(std.testing.io, &absolute_path);
+        current_length += 1 + component_length;
     }
     try std.testing.expectEqual(target_length, current_length);
 

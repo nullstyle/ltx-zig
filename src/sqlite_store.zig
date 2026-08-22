@@ -1355,10 +1355,15 @@ pub const Store = struct {
     }
 
     fn sync_directory(self: *Store) Error!void {
-        const file: std.Io.File = .{
-            .handle = self.dir.handle,
-            .flags = .{ .nonblocking = false },
-        };
+        // A non-iterable `Dir` may hold an `O_PATH` descriptor on Linux, which
+        // cannot be synced. Reopen the same directory as a syncable file.
+        var file = self.dir.openFile(self.io, ".", .{
+            .mode = .read_only,
+            .allow_directory = true,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        }) catch return error.IOFailure;
+        defer file.close(self.io);
         file.sync(self.io) catch return error.IOFailure;
     }
 

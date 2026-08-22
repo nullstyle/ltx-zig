@@ -69,8 +69,10 @@ applicable notices.
 
 ## Toolchain and tests
 
-Zig 0.16.0 is pinned by `.mise.toml`; `build.zig.zon` also rejects older Zig
-versions through its minimum-version field.
+Zig 0.16.0 and the Go 1.24.13 fixture-oracle toolchain are pinned by
+`.mise.toml`; `build.zig.zon` also rejects older Zig versions through its
+minimum-version field. Setting `GOTOOLCHAIN=local` keeps oracle checks on that
+exact Go toolchain instead of permitting an implicit download.
 
 ```sh
 mise exec -- zig version

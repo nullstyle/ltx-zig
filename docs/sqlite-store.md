@@ -225,7 +225,10 @@ filesystems, uncontrolled clients, `nolock=1`, unsafe SQLite journal modes, and
 storage that lies about sync are outside the durability model. On Darwin,
 `std.Io.File.sync` provides the ordinary `fsync` contract; deployments that
 require stronger physical-media guarantees should supply that at the platform
-layer.
+layer. Each directory barrier opens a dedicated read-only, directory-capable
+descriptor for `.` before syncing; the adapter does not assume the borrowed
+`std.Io.Dir` handle is syncable because Zig may represent it with `O_PATH` on
+Linux.
 
 Lifecycle implementations that operate a multi-connection WAL database should
 use SQLite 3.51.3 or newer, or a fixed 3.44.6/3.50.7 backport. SQLite's
