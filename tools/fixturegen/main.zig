@@ -6,7 +6,7 @@ const limits = ltx.Limits{
     .max_output_bytes = 700,
     .max_pages = 1,
     .max_page_size = 512,
-    .max_compressed_page_size = 515,
+    .max_compressed_page_size = 530,
     .max_page_index_bytes = 32,
     .max_page_index_entries = 1,
     .max_varint_bytes = 10,
@@ -16,13 +16,15 @@ const limits = ltx.Limits{
 pub fn main(init: std.process.Init) !void {
     var output: [700]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
-    var compressed_workspace: [515]u8 = undefined;
+    var compressed_workspace: [530]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
     var index_workspace: [1]ltx.PageIndexEntry = undefined;
     var encoder = try ltx.Encoder.init(
         .v3,
         limits,
         sink.writer(),
         &compressed_workspace,
+        &lz4_workspace,
         &index_workspace,
     );
     try encoder.write_header(snapshot_header());

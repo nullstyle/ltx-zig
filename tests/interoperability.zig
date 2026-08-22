@@ -326,16 +326,18 @@ test "decode Go v3 empty database checksum semantics" {
     }
 }
 
-test "Zig literal-only output verifies through the Zig decoder" {
+test "Zig match-compressed output verifies through the Zig decoder" {
     var output: [2048]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
     var compression_workspace: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
     var encoder_index: [8]ltx.PageIndexEntry = undefined;
     var encoder = try ltx.Encoder.init(
         .v3,
         limits,
         sink.writer(),
         &compression_workspace,
+        &lz4_workspace,
         &encoder_index,
     );
     const header = snapshot_header(1);
@@ -346,10 +348,15 @@ test "Zig literal-only output verifies through the Zig decoder" {
     const encoded = try encoder.finish(post_apply_checksum);
     try std.testing.expectEqual(@as(u32, 1), encoded.page_count);
     try std.testing.expectEqual(@as(u64, sink.written().len), encoded.byte_count);
-    try std.testing.expectEqual(@as(usize, 660), sink.written().len);
+    try std.testing.expectEqual(@as(usize, 168), sink.written().len);
     try std.testing.expectEqual(
-        @as(u64, 0xf9b8_95f2_3744_f218),
+        @as(u64, 0xeb51_21d5_6d33_a656),
         encoded.trailer.file_checksum.value,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        @embedFile("fixtures/go_v3_snapshot_zero_page.ltx"),
+        sink.written(),
     );
 
     var source = ltx.SliceReader.init(sink.written());
@@ -379,6 +386,73 @@ test "Zig literal-only output verifies through the Zig decoder" {
         },
         else => return error.UnexpectedDecoderEvent,
     }
+}
+
+test "Zig encoder honors the configured literal-fallback cap" {
+    var fallback_limits = limits;
+    fallback_limits.max_page_size = 512;
+    fallback_limits.max_compressed_page_size = 515;
+    var output: [660]u8 = undefined;
+    var sink = ltx.SliceWriter.init(&output);
+    var compressed_workspace: [530]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
+    var index_workspace: [8]ltx.PageIndexEntry = undefined;
+    var encoder = try ltx.Encoder.init(
+        .v3,
+        fallback_limits,
+        sink.writer(),
+        &compressed_workspace,
+        &lz4_workspace,
+        &index_workspace,
+    );
+    try encoder.write_header(snapshot_header(1));
+    const page: [512]u8 = @splat(0);
+    try encoder.write_page(1, &page);
+    const verified = try encoder.finish(try ltx.checksum_page(1, &page));
+
+    try std.testing.expectEqual(@as(usize, 660), sink.written().len);
+    try std.testing.expectEqual(@as(u32, 515), std.mem.readInt(
+        u32,
+        sink.written()[106..110],
+        .big,
+    ));
+    try std.testing.expectEqual(
+        @as(u64, 0xf9b8_95f2_3744_f218),
+        verified.trailer.file_checksum.value,
+    );
+}
+
+test "Zig encoder matches the Celld and Go v0.5.2 two-page file" {
+    var output: [211]u8 = undefined;
+    var sink = ltx.SliceWriter.init(&output);
+    var compressed_workspace: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
+    var index_workspace: [8]ltx.PageIndexEntry = undefined;
+    var encoder = try ltx.Encoder.init(
+        .v3,
+        limits,
+        sink.writer(),
+        &compressed_workspace,
+        &lz4_workspace,
+        &index_workspace,
+    );
+    var header = snapshot_header(2);
+    header.page_size = 1024;
+    header.timestamp_ms = 1000;
+    try encoder.write_header(header);
+    const page1: [1024]u8 = @splat(0x81);
+    var page2: [1024]u8 = undefined;
+    for (&page2, 0..) |*byte, index| byte.* = "abcd"[index % 4];
+    try encoder.write_page(1, &page1);
+    try encoder.write_page(2, &page2);
+    const verified = try encoder.finish(.init(0xa096_39bc_718d_9c58));
+
+    try std.testing.expectEqual(@as(u64, output.len), verified.byte_count);
+    try std.testing.expectEqualSlices(
+        u8,
+        @embedFile("fixtures/celld_v052_two_page_snapshot.ltx"),
+        sink.written(),
+    );
 }
 
 test "decode historical Go legacy unflagged v3 fixture" {
@@ -492,12 +566,14 @@ test "incremental positions require TXID and checksum continuity" {
     var output: [2048]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
     var compressed_workspace: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
     var index_workspace: [8]ltx.PageIndexEntry = undefined;
     var encoder = try ltx.Encoder.init(
         .v3,
         limits,
         sink.writer(),
         &compressed_workspace,
+        &lz4_workspace,
         &index_workspace,
     );
     var header = snapshot_header(1);
@@ -562,12 +638,14 @@ test "no-checksum incrementals keep database checksums zero" {
     var output: [2048]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
     var compressed_workspace: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
     var encoder_index: [8]ltx.PageIndexEntry = undefined;
     var encoder = try ltx.Encoder.init(
         .v3,
         limits,
         sink.writer(),
         &compressed_workspace,
+        &lz4_workspace,
         &encoder_index,
     );
     var header = snapshot_header(1);
@@ -614,12 +692,14 @@ test "no-checksum empty snapshot has a coherent zero-checksum encoding" {
     var output: [512]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
     var compressed_workspace: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
     var index_workspace: [8]ltx.PageIndexEntry = undefined;
     var encoder = try ltx.Encoder.init(
         .v3,
         limits,
         sink.writer(),
         &compressed_workspace,
+        &lz4_workspace,
         &index_workspace,
     );
     var header = snapshot_header(0);
@@ -651,12 +731,14 @@ test "fixed-seed generated snapshots encode deterministically" {
 fn encode_generated_snapshot(output: []u8, pages: *const [4][512]u8) !usize {
     var sink = ltx.SliceWriter.init(output);
     var compressed_workspace: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
     var index_workspace: [8]ltx.PageIndexEntry = undefined;
     var encoder = try ltx.Encoder.init(
         .v3,
         limits,
         sink.writer(),
         &compressed_workspace,
+        &lz4_workspace,
         &index_workspace,
     );
     try encoder.write_header(snapshot_header(pages.len));

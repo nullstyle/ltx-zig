@@ -10,6 +10,11 @@ Run it through the repository build so the input is freshly generated:
 mise exec -- zig build interop
 ```
 
+The generated one-page file is required to equal the pinned current-Go
+snapshot fixture byte for byte: 168 physical bytes, file checksum
+`eb5121d56d33a656`, and Go logical byte count 648. This exercises the Zig fast
+match compressor rather than only format-compatible literal output.
+
 This step may download Go modules. The normal Zig test suite is hermetic and
 does not invoke it.
 

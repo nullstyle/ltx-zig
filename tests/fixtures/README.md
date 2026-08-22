@@ -27,6 +27,8 @@ mise exec -- zig build upstream-fixture -Dfixture=<name>
 
 The generator lives in `tools/upstream_verify/fixturegen`; its `go.mod` pins
 the exact oracle pseudo-version and `go.sum` pins transitive content hashes.
+The Zig encoder is separately required to reproduce the complete
+`go_v3_snapshot_zero_page.ltx` bytes, not merely its decoded semantics.
 
 ## Secondary and historical fixtures
 
@@ -40,6 +42,11 @@ The historical generator is separately pinned because current Go only emits
 flagged blocks. Both legacy files use the exact upstream profile: one
 independent 64 KiB block, a content checksum, and no optional descriptor
 fields. The mixed fixture proves both compressed and high-bit stored blocks.
+
+The Zig encoder also reproduces the complete
+`celld_v052_two_page_snapshot.ltx` bytes. Together with the current-Go
+snapshot equality test, this pins match selection and compressor state reset
+independently of Zig's decoder.
 
 ## Malformed corpus
 

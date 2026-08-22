@@ -49,6 +49,7 @@ pub fn build(b: *std.Build) void {
             "build.zig.zon",
             "src",
             "tests",
+            "benchmarks",
             "tools/fixturegen",
         },
         .check = true,
@@ -84,6 +85,24 @@ pub fn build(b: *std.Build) void {
     go_verify.addFileArg(generated_fixture);
     const interop_step = b.step("interop", "Verify Zig output with pinned Go LTX");
     interop_step.dependOn(&go_verify.step);
+
+    const benchmark_lz4 = b.createModule(.{
+        .root_source_file = b.path("src/lz4_block.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseFast,
+    });
+    const benchmark_executable = b.addExecutable(.{
+        .name = "ltx-lz4-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/lz4.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "lz4_block", .module = benchmark_lz4 }},
+        }),
+    });
+    const run_benchmark = b.addRunArtifact(benchmark_executable);
+    const benchmark_step = b.step("bench", "Benchmark raw LZ4 page compression");
+    benchmark_step.dependOn(&run_benchmark.step);
 
     const upstream_fixture_name = b.option(
         []const u8,

@@ -61,17 +61,103 @@ test "encoder rejects a page that aliases index workspace" {
     var output: [2048]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
     var compressed_workspace: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
     var shared: [22]ltx.PageIndexEntry = undefined;
     var encoder = try ltx.Encoder.init(
         .v3,
         limits,
         sink.writer(),
         &compressed_workspace,
+        &lz4_workspace,
         shared[0..8],
     );
     try encoder.write_header(valid_header());
     const page = std.mem.sliceAsBytes(shared[0..])[0..512];
     try std.testing.expectError(error.WorkspaceAliasing, encoder.write_page(1, page));
+}
+
+test "encoder rejects compressed output overlapping LZ4 match state" {
+    var output: [2048]u8 = undefined;
+    var sink = ltx.SliceWriter.init(&output);
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
+    var index_workspace: [8]ltx.PageIndexEntry = undefined;
+    const shared_bytes = std.mem.asBytes(&lz4_workspace);
+
+    try std.testing.expectError(
+        error.WorkspaceAliasing,
+        ltx.Encoder.init(
+            .v3,
+            limits,
+            sink.writer(),
+            shared_bytes[0..66_000],
+            &lz4_workspace,
+            &index_workspace,
+        ),
+    );
+}
+
+test "encoder rejects page index overlapping LZ4 match state" {
+    const SharedWorkspace = extern union {
+        lz4: ltx.LZ4CompressionWorkspace,
+        alignment: [@sizeOf(ltx.LZ4CompressionWorkspace) / @sizeOf(u64)]u64,
+    };
+    var output: [2048]u8 = undefined;
+    var sink = ltx.SliceWriter.init(&output);
+    var compressed_workspace: [66_000]u8 = undefined;
+    var shared: SharedWorkspace = undefined;
+    const index_pointer: [*]ltx.PageIndexEntry = @ptrCast(&shared);
+
+    try std.testing.expectError(
+        error.WorkspaceAliasing,
+        ltx.Encoder.init(
+            .v3,
+            limits,
+            sink.writer(),
+            &compressed_workspace,
+            &shared.lz4,
+            index_pointer[0..8],
+        ),
+    );
+}
+
+test "encoder rejects writer backing overlapping LZ4 match state" {
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
+    var sink = ltx.SliceWriter.init(std.mem.asBytes(&lz4_workspace)[0..2048]);
+    var compressed_workspace: [66_000]u8 = undefined;
+    var index_workspace: [8]ltx.PageIndexEntry = undefined;
+
+    try std.testing.expectError(
+        error.WorkspaceAliasing,
+        ltx.Encoder.init(
+            .v3,
+            limits,
+            sink.writer(),
+            &compressed_workspace,
+            &lz4_workspace,
+            &index_workspace,
+        ),
+    );
+}
+
+test "encoder rejects a page aliasing LZ4 match state and becomes failed" {
+    var output: [2048]u8 = undefined;
+    var sink = ltx.SliceWriter.init(&output);
+    var compressed_workspace: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
+    var index_workspace: [8]ltx.PageIndexEntry = undefined;
+    var encoder = try ltx.Encoder.init(
+        .v3,
+        limits,
+        sink.writer(),
+        &compressed_workspace,
+        &lz4_workspace,
+        &index_workspace,
+    );
+    try encoder.write_header(valid_header());
+    const page = std.mem.asBytes(&lz4_workspace)[0..512];
+
+    try std.testing.expectError(error.WorkspaceAliasing, encoder.write_page(1, page));
+    try std.testing.expectEqual(ltx.EncoderState.failed, encoder.current_state());
 }
 
 test "header validation covers page, TXID, checksum, and WAL invariants" {
@@ -243,12 +329,14 @@ test "decoder rejects out-of-order incremental pages" {
     var output: [2048]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
     var encoder_compressed: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
     var encoder_index: [8]ltx.PageIndexEntry = undefined;
     var encoder = try ltx.Encoder.init(
         .v3,
         limits,
         sink.writer(),
         &encoder_compressed,
+        &lz4_workspace,
         &encoder_index,
     );
     var header = valid_header();
@@ -424,12 +512,14 @@ test "encoder output limit fails before exceeding the bound" {
     var output: [1024]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
     var compressed_workspace: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
     var index_workspace: [8]ltx.PageIndexEntry = undefined;
     var encoder = try ltx.Encoder.init(
         .v3,
         constrained,
         sink.writer(),
         &compressed_workspace,
+        &lz4_workspace,
         &index_workspace,
     );
     try std.testing.expectError(error.OutputLimitExceeded, encoder.write_header(valid_header()));
@@ -443,12 +533,14 @@ test "encoder preflights each page frame before its first write" {
     var output: [1024]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
     var compressed_workspace: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
     var index_workspace: [8]ltx.PageIndexEntry = undefined;
     var encoder = try ltx.Encoder.init(
         .v3,
         constrained,
         sink.writer(),
         &compressed_workspace,
+        &lz4_workspace,
         &index_workspace,
     );
     try encoder.write_header(valid_header());
@@ -460,16 +552,18 @@ test "encoder preflights each page frame before its first write" {
 
 test "encoder preflights the complete terminal section against output limit" {
     var constrained = limits;
-    constrained.max_output_bytes = 659;
+    constrained.max_output_bytes = 167;
     var output: [1024]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
     var compressed_workspace: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
     var index_workspace: [8]ltx.PageIndexEntry = undefined;
     var encoder = try ltx.Encoder.init(
         .v3,
         constrained,
         sink.writer(),
         &compressed_workspace,
+        &lz4_workspace,
         &index_workspace,
     );
     try encoder.write_header(valid_header());
@@ -485,16 +579,18 @@ test "encoder preflights the complete terminal section against output limit" {
 
 test "encoder preflights the complete terminal section against index limit" {
     var constrained = limits;
-    constrained.max_page_index_bytes = 12;
+    constrained.max_page_index_bytes = 11;
     var output: [1024]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
     var compressed_workspace: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
     var index_workspace: [8]ltx.PageIndexEntry = undefined;
     var encoder = try ltx.Encoder.init(
         .v3,
         constrained,
         sink.writer(),
         &compressed_workspace,
+        &lz4_workspace,
         &index_workspace,
     );
     try encoder.write_header(valid_header());
@@ -514,12 +610,14 @@ test "independent index-entry limit bounds incremental encoder pages" {
     var output: [2048]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
     var compressed_workspace: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
     var index_workspace: [1]ltx.PageIndexEntry = undefined;
     var encoder = try ltx.Encoder.init(
         .v3,
         constrained,
         sink.writer(),
         &compressed_workspace,
+        &lz4_workspace,
         &index_workspace,
     );
     var header = valid_header();
@@ -539,12 +637,14 @@ test "independent index-entry limit bounds incremental decoder pages" {
     var output: [2048]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
     var encoder_compressed: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
     var encoder_index: [8]ltx.PageIndexEntry = undefined;
     var encoder = try ltx.Encoder.init(
         .v3,
         limits,
         sink.writer(),
         &encoder_compressed,
+        &lz4_workspace,
         &encoder_index,
     );
     var header = valid_header();
@@ -581,12 +681,14 @@ test "encoder rejects incremental page regression and becomes failed" {
     var output: [2048]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
     var compressed_workspace: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
     var index_workspace: [8]ltx.PageIndexEntry = undefined;
     var encoder = try ltx.Encoder.init(
         .v3,
         limits,
         sink.writer(),
         &compressed_workspace,
+        &lz4_workspace,
         &index_workspace,
     );
     var header = valid_header();
@@ -605,12 +707,14 @@ test "encoder refuses an incomplete snapshot at finish" {
     var output: [2048]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
     var compressed_workspace: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
     var index_workspace: [8]ltx.PageIndexEntry = undefined;
     var encoder = try ltx.Encoder.init(
         .v3,
         limits,
         sink.writer(),
         &compressed_workspace,
+        &lz4_workspace,
         &index_workspace,
     );
     var header = valid_header();
@@ -748,12 +852,14 @@ test "decoder propagates end-of-input callback failures" {
 test "encoder propagates writer failures and becomes failed" {
     var probe = FailingWriter{};
     var compressed_workspace: [66_000]u8 = undefined;
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
     var index_workspace: [8]ltx.PageIndexEntry = undefined;
     var encoder = try ltx.Encoder.init(
         .v3,
         limits,
         probe.writer(),
         &compressed_workspace,
+        &lz4_workspace,
         &index_workspace,
     );
     try std.testing.expectError(error.OutputFailure, encoder.write_header(valid_header()));

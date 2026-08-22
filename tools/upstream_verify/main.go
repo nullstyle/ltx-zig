@@ -24,7 +24,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if got, want := info.Size(), int64(660); got != want {
+	if got, want := info.Size(), int64(168); got != want {
 		fmt.Fprintf(os.Stderr, "unexpected physical byte count: got %d, want %d\n", got, want)
 		os.Exit(1)
 	}
@@ -34,7 +34,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if got, want := decoder.N(), int64(649); got != want {
+	if got, want := decoder.N(), int64(648); got != want {
 		fmt.Fprintf(os.Stderr, "unexpected Go logical byte count: got %d, want %d\n", got, want)
 		os.Exit(1)
 	}
@@ -42,7 +42,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unexpected page count: got %d, want %d\n", got, want)
 		os.Exit(1)
 	}
-	if got, want := uint64(decoder.Trailer().FileChecksum), uint64(0xf9b895f23744f218); got != want {
+	if got, want := uint64(decoder.Trailer().FileChecksum), uint64(0xeb5121d56d33a656); got != want {
 		fmt.Fprintf(os.Stderr, "unexpected file checksum: got %016x, want %016x\n", got, want)
 		os.Exit(1)
 	}

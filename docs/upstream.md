@@ -13,6 +13,8 @@ exact revisions:
   `ceabe1fe1b3076094805244ee6a3acff4d43d1e8`
 - [`denoland/celld` LTX crate](https://github.com/denoland/celld/tree/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx):
   `89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9`
+- [`pierrec/lz4` v4.1.23](https://github.com/pierrec/lz4/tree/cd9d7a4f66405a92f4881933816b828b0f7d5fe2):
+  `cd9d7a4f66405a92f4881933816b828b0f7d5fe2`
 
 At the pinned TigerBeetle tree, `docs/TIGER_STYLE.md` has blob
 `d4cefaa6249483357a41b786d7e042f1d94a3ea5`; its last modifying commit is
@@ -51,6 +53,16 @@ validates exact decompressed length, the declared index size, and the trailer.
 Its `Vec`, `BTreeMap`, and read-to-end design is intentionally not a memory
 model for this allocation-free Zig core, and it does not perform Zig's exact
 one-to-one index/frame cross-check.
+
+For raw-block compression: the current Go oracle pins
+`github.com/pierrec/lz4/v4 v4.1.23` with module content hash
+`h1:oJE7T90aYBGtFNrI8+KbETnPymobAhzRrR8Mu8n1yfU=`. The files inspected were
+`internal/lz4block/block.go`, its tests, and `LICENSE`. Zig ports the fast
+compressor's search, table-update, match-extension, and output order exactly;
+the independently written Celld port is a second byte-exact reference. The
+algorithm is Copyright (c) 2015 Pierre Curto under BSD-3-Clause, retained in
+[`LICENSE.pierrec-lz4`](../LICENSE.pierrec-lz4). That notice does not select a
+project-wide license for `ltx-zig`.
 
 ## Compatibility decisions and disagreements
 
@@ -181,10 +193,14 @@ Known answers include:
 - flagged fixture file checksum `eb5121d56d33a656`
 - empty snapshot file checksum `ef752d544ac8c48f`
 
-`mise exec -- zig build fixturegen` emits a deterministic 660-byte
-literal-only LZ4 file. The pinned Go command
-`go run ./cmd/ltx verify <file>` reports `ok`; its file checksum is
-`f9b895f23744f218`.
+`mise exec -- zig build fixturegen` emits the exact 168-byte current-Go
+snapshot-zero fixture with match-compressed LZ4, file checksum
+`eb5121d56d33a656`, and Go logical byte count 648. The Zig encoder also
+reproduces the complete 211-byte Celld/Go v0.5.2 two-page vector. These
+full-file comparisons supplement the raw-block known answers and round trips.
+With an intentionally smaller 515-byte compressed-page cap, the same input
+exercises the literal fallback and retains its prior 660-byte known answer with
+file checksum `f9b895f23744f218`.
 
 `mise exec -- zig build interop` performs that Go verification from the build
 graph. Its Go module pins the pseudo-version resolving exactly to the recorded

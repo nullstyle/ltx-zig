@@ -24,8 +24,10 @@
   processing failure. Use `finish()`, not an ambiguous `close()`.
 - Keep functions near or below 70 lines, use `snake_case`, capitalize acronyms
   such as `TXID`, and suffix quantities with units such as `_bytes` or `_count`.
-- Canonical encoding zeros reserved bytes, uses flagged raw LZ4 blocks, emits
-  pages and index entries in strict order, and is deterministic.
+- Canonical encoding zeros reserved bytes, uses the pinned byte-compatible fast
+  raw LZ4 compressor with explicit caller-owned match state, emits pages and
+  index entries in strict order, and is deterministic. Preserve its
+  `LICENSE.pierrec-lz4` attribution.
 - Test positive and negative boundaries. Maintain independent Go-derived known
   answers; a Zig round trip alone is not an interoperability test.
 - Preserve decoding of the canonical legacy unflagged v3 LZ4 profile as well
@@ -36,4 +38,5 @@
   or wire-format changes when Go is available; normal tests stay network-free.
 - Keep Linux and macOS CI on the exact Zig pin and pin workflow actions by full
   commit SHA. Go module downloads must remain checksum-locked.
-- This repository has no license. Leave license selection as an explicit TODO.
+- This repository has no project-wide license. Leave license selection as an
+  explicit TODO; the BSD file is only a required third-party notice.

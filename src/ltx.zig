@@ -24,6 +24,8 @@ pub const DecoderState = @import("decoder.zig").DecoderState;
 pub const DecoderEvent = @import("decoder.zig").DecoderEvent;
 pub const Encoder = @import("encoder.zig").Encoder;
 pub const EncoderState = @import("encoder.zig").EncoderState;
+/// Fixed 139,264-byte match state passed by pointer to `Encoder.init`.
+pub const LZ4CompressionWorkspace = @import("lz4_block.zig").CompressionWorkspace;
 
 pub const checksum_page = checksum_impl.checksum_page;
 pub const rolling_checksum_initial = checksum_impl.rolling_initial;

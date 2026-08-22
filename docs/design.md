@@ -67,11 +67,25 @@ The core performs no dynamic allocation. Decoder initialization receives:
 - one workspace at least `Limits.max_compressed_page_size` bytes;
 - a fixed slice with at least `Limits.max_page_index_entries` records.
 
-Encoder initialization receives the compressed-data and page-index workspaces;
-the page passed to `write_page()` is the caller-owned uncompressed workspace.
-Initialization rejects undersized buffers before consuming or emitting bytes.
-The encoder rejects a page slice that aliases its workspaces or a reported
-output backing range.
+Encoder initialization receives the compressed-data workspace, a fixed
+`LZ4CompressionWorkspace`, and the page-index workspace; the page passed to
+`write_page()` is caller owned. The typed LZ4 workspace contains 65,536 `u16`
+match positions plus a 2,048-word occupancy bitmap, for a fixed 139,264-byte
+(136 KiB) footprint. It is passed by pointer so an `Encoder` cannot silently
+copy that storage. Initialization rejects undersized buffers before consuming
+or emitting bytes, and rejects every overlap among its three workspaces and a
+reported output backing range. `write_page()` likewise rejects page input that
+aliases any workspace or reported output storage.
+
+Every raw block is independent. Before any fast-path match-state read, the
+encoder clears the occupancy bitmap, so undefined table bytes and prior pages
+cannot influence output. The literal fallback does not touch the match state.
+When the configured compressed-output cap can hold the canonical LZ4 bound
+`n + n / 255 + 16`, the encoder runs the byte-compatible fast compressor used
+by the pinned Go and Celld sources. A cap below that bound but at or above the
+literal bound selects a deterministic literal-only block instead. This keeps
+the configured memory bound authoritative without rejecting an otherwise safe
+configuration.
 
 Legacy frame decoding reuses the compressed workspace for only the declared
 block payload. Its fixed descriptor, block word, and footer stay inline, so no
@@ -95,9 +109,11 @@ buffers. The core imports no filesystem API and does not require libc.
 
 Slice transports publish their backing range so the codec can reject overlap
 with workspaces, page input, or output. Custom transport implementers should do
-the same when a stable range exists. Their context and any unreported backing
-storage must remain live, stable, non-overlapping, and non-reentrant until the
-codec reaches a terminal state; zero from `read_fn` means permanent EOF.
+the same when a stable range exists. All codec workspaces must remain live,
+address-stable, and exclusively owned until the codec reaches a terminal
+state. Transport contexts and any unreported backing storage have the same
+lifetime requirement and must remain non-overlapping and non-reentrant; zero
+from `read_fn` means permanent EOF.
 `at_end_fn` must be non-consuming and report the exact end of this one LTX
 object, which requires known-length framing or buffering for a shared stream.
 `Decoder` and `Encoder` are stateful, single-owner values: do not copy them or
@@ -108,13 +124,15 @@ the transport context and workspaces while duplicating stream state.
 
 There are no implicit core defaults. `Limits` bounds physical input and output
 bytes, pages, page size, compressed size, index bytes, index entries, bytes per
-varint, and TXID span. Configured workspace maxima are converted to `usize`
-only at slice boundaries. Offset and length additions use checked arithmetic
-before transport access. The encoder preflights a complete page frame and the
-complete sentinel/index/trailer section against configured bounds before the
-first write of either logical section. Transport failures can still be
-partial. Loops are bounded by a configured maximum, an input slice length, or
-a fixed wire width.
+varint, and TXID span. The encoder requires `max_compressed_page_size` to hold
+the worst-case literal block for `max_page_size`; reaching the slightly larger
+canonical fast-compressor bound is optional. Configured workspace maxima are
+converted to `usize` only at slice boundaries. Offset and length additions use
+checked arithmetic before transport access. The encoder preflights a complete
+page frame and the complete sentinel/index/trailer section against configured
+bounds before the first write of either logical section. Transport failures
+can still be partial. Loops are bounded by a configured maximum, an input slice
+length, or a fixed wire width.
 
 ## Checksum model
 
@@ -136,7 +154,8 @@ file-checksum field is also excluded.
 
 Errors remain distinguishable by cause:
 
-- configuration/workspace: `InvalidLimits`, `WorkspaceTooSmall`;
+- configuration/workspace: `InvalidLimits`, `WorkspaceTooSmall`,
+  `WorkspaceAliasing`;
 - configured bounds: `InputLimitExceeded`, `PageLimitExceeded`, and related
   limit errors;
 - transport: `InputFailure`, `OutputFailure`, `TruncatedInput`;

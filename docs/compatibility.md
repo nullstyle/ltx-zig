@@ -10,8 +10,8 @@ check is manual; pinned upstream vectors are identified in the evidence.
 | Decode current Go output | Tested | Byte-exact snapshot, incremental, no-checksum, maximum-page, and near-lock fixtures |
 | Decode Celld/Go v0.5.2 vector | Tested | Pinned byte-exact two-page, multi-index-entry fixture |
 | Go decodes Zig output | Tested | Optional automated `zig build interop` uses the exact pinned Go module |
-| Flagged raw LZ4 block frames | Tested | Go match-compressed block plus Zig literal-only blocks |
-| Normal compressed matches | Tested | Pinned Go/Celld vectors cover overlap, extension lengths, and 512..65536-byte pages |
+| Flagged raw LZ4 block frames | Tested | Zig reproduces complete pinned Go and Celld match-compressed files byte for byte |
+| Normal compressed matches | Tested | Exact pierrec/Celld vectors cover overlap, extension lengths, workspace reset, and 512..65536-byte pages |
 | Legacy unflagged v3 frames | Tested | Historical Go compressed and stored-block fixtures; canonical one-block 64 KiB profile |
 | LTX v2 | Unsupported | Same magic is never auto-detected or reinterpreted |
 | Snapshots | Tested | One-page and empty pinned Go fixtures; completeness enforced |
@@ -26,9 +26,10 @@ check is manual; pinned upstream vectors are identified in the evidence.
 | Compaction | Unsupported | Future layer above the verified codec |
 | Direct SQLite apply | Unsupported | Future staging layer must publish only after verification |
 
-The encoder prioritizes interoperability over compression ratio. It emits a
-valid deterministic literal-only raw block. The decoder is not restricted to
-that subset and processes normal LZ4 matches emitted by Go. Legacy decoding is
-strictly scoped to the independent 64 KiB, content-checksummed frame profile
-emitted by upstream; other standard LZ4 frame options return
-`UnsupportedPageEncoding`.
+The encoder uses a bounded port of the fast raw-block compressor pinned by Go
+and independently ported by Celld. With the canonical output bound it preserves
+their exact match choices and bytes. A deliberately smaller but still safe
+configured cap selects deterministic literal-only blocks. The decoder accepts
+both forms. Legacy decoding is strictly scoped to the independent 64 KiB,
+content-checksummed frame profile emitted by upstream; other standard LZ4 frame
+options return `UnsupportedPageEncoding`.

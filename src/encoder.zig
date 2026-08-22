@@ -22,6 +22,7 @@ pub const Encoder = struct {
     format_version: format.FormatVersion,
     limits: Limits,
     compressed_workspace: []u8,
+    compression_workspace: *lz4_block.CompressionWorkspace,
     index_workspace: []format.PageIndexEntry,
     state: EncoderState = .initialized,
     header_value: format.Header = undefined,
@@ -37,6 +38,7 @@ pub const Encoder = struct {
         limits: Limits,
         writer: Writer,
         compressed_workspace: []u8,
+        compression_workspace: *lz4_block.CompressionWorkspace,
         index_workspace: []format.PageIndexEntry,
     ) format.Error!Encoder {
         try version.validate();
@@ -52,13 +54,18 @@ pub const Encoder = struct {
         };
         if (compressed_workspace.len < compressed_required) return error.WorkspaceTooSmall;
         if (index_workspace.len < index_required) return error.WorkspaceTooSmall;
-        if (workspace.slices_overlap(
-            compressed_workspace,
-            std.mem.sliceAsBytes(index_workspace),
-        )) return error.WorkspaceAliasing;
+        const compression_bytes = std.mem.asBytes(compression_workspace);
+        const index_bytes = std.mem.sliceAsBytes(index_workspace);
+        if (workspace.slices_overlap(compressed_workspace, compression_bytes) or
+            workspace.slices_overlap(compressed_workspace, index_bytes) or
+            workspace.slices_overlap(compression_bytes, index_bytes))
+        {
+            return error.WorkspaceAliasing;
+        }
         if (writer.backing_bytes) |backing| {
             if (workspace.slices_overlap(backing, compressed_workspace) or
-                workspace.slices_overlap(backing, std.mem.sliceAsBytes(index_workspace)))
+                workspace.slices_overlap(backing, compression_bytes) or
+                workspace.slices_overlap(backing, index_bytes))
             {
                 return error.WorkspaceAliasing;
             }
@@ -67,7 +74,8 @@ pub const Encoder = struct {
             .writer = writer,
             .format_version = version,
             .limits = limits,
-            .compressed_workspace = compressed_workspace,
+            .compressed_workspace = compressed_workspace[0..compressed_required],
+            .compression_workspace = compression_workspace,
             .index_workspace = index_workspace,
         };
     }
@@ -133,6 +141,7 @@ pub const Encoder = struct {
         const page_length: usize = @intCast(self.header_value.page_size);
         if (page.len != page_length) return error.InvalidPageDataSize;
         if (workspace.slices_overlap(page, self.compressed_workspace) or
+            workspace.slices_overlap(page, std.mem.asBytes(self.compression_workspace)) or
             workspace.slices_overlap(page, std.mem.sliceAsBytes(self.index_workspace)))
         {
             return error.WorkspaceAliasing;
@@ -142,7 +151,11 @@ pub const Encoder = struct {
         }
         try self.validate_page_number(page_number);
 
-        const compressed = try lz4_block.encode_literal(page, self.compressed_workspace);
+        const compressed = try lz4_block.encode(
+            page,
+            self.compressed_workspace,
+            self.compression_workspace,
+        );
         if (compressed.len > self.limits.max_compressed_page_size) {
             return error.CompressedPageLimitExceeded;
         }
