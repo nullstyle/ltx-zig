@@ -254,6 +254,7 @@ pub fn build(b: *std.Build) void {
             "tools/compaction_fixturegen",
             "tools/litestream_compaction_fixturegen",
             "tools/litestream_interop",
+            "tools/source_archive_smoke",
             "tools/valid_chain_fixturegen",
             "tools/release_check",
         },
@@ -278,6 +279,41 @@ pub fn build(b: *std.Build) void {
     );
     round_trip_example_step.dependOn(&run_round_trip_example.step);
 
+    const apply_snapshot_example = b.addExecutable(.{
+        .name = "ltx-apply-snapshot-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/apply_snapshot.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ltx", .module = host_ltx }},
+        }),
+    });
+    const run_apply_snapshot_example = b.addRunArtifact(apply_snapshot_example);
+    const apply_snapshot_example_step = b.step(
+        "example-apply-snapshot",
+        "Run the private-staging snapshot apply example",
+    );
+    apply_snapshot_example_step.dependOn(&run_apply_snapshot_example.step);
+
+    const sqlite_store_example = b.addExecutable(.{
+        .name = "ltx-sqlite-store-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/sqlite_store_lifecycle.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ltx", .module = host_ltx },
+                .{ .name = "ltx_sqlite", .module = host_sqlite_store },
+            },
+        }),
+    });
+    const run_sqlite_store_example = b.addRunArtifact(sqlite_store_example);
+    const sqlite_store_example_step = b.step(
+        "example-sqlite-store",
+        "Run the quiescent SQLite generation-store lifecycle example",
+    );
+    sqlite_store_example_step.dependOn(&run_sqlite_store_example.step);
+
     const consumer_smoke = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
@@ -294,6 +330,55 @@ pub fn build(b: *std.Build) void {
     );
     consumer_smoke_step.dependOn(&consumer_smoke.step);
 
+    const consumer_compile = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "build",
+        "compile",
+        "--cache-dir",
+        "../../.zig-cache/consumer-api-freeze",
+    });
+    consumer_compile.setCwd(b.path("tests/consumer"));
+    consumer_compile.addArg(b.fmt("-Dtarget={s}", .{
+        target.query.zigTriple(b.allocator) catch @panic("OOM"),
+    }));
+    consumer_compile.addArg(b.fmt("-Doptimize={s}", .{@tagName(optimize)}));
+    consumer_compile.has_side_effects = true;
+    const api_freeze_step = b.step(
+        "api-freeze",
+        "Compile the supported 0.1 public API contract",
+    );
+    api_freeze_step.dependOn(&consumer_compile.step);
+    compile_tests_step.dependOn(&consumer_compile.step);
+
+    const source_archive_smoke = b.addExecutable(.{
+        .name = "ltx-source-archive-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/source_archive_smoke/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_source_archive_smoke = b.addRunArtifact(source_archive_smoke);
+    run_source_archive_smoke.addArg(b.graph.zig_exe);
+    run_source_archive_smoke.addDirectoryArg(b.path("."));
+    run_source_archive_smoke.addArg(@tagName(optimize));
+    run_source_archive_smoke.has_side_effects = true;
+    const source_archive_smoke_step = b.step(
+        "source-archive-smoke",
+        "Fetch and test the canonical source archive with isolated caches",
+    );
+    source_archive_smoke_step.dependOn(&run_source_archive_smoke.step);
+    const source_archive_smoke_tests = b.addTest(.{
+        .name = "ltx-source-archive-smoke-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/source_archive_smoke/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_source_archive_smoke_tests = b.addRunArtifact(source_archive_smoke_tests);
+    test_step.dependOn(&run_source_archive_smoke_tests.step);
+
     const release_check = b.addExecutable(.{
         .name = "ltx-release-check",
         .root_module = b.createModule(.{
@@ -304,7 +389,10 @@ pub fn build(b: *std.Build) void {
     });
     const run_release_check = b.addRunArtifact(release_check);
     run_release_check.addFileArg(b.path("build.zig.zon"));
+    run_release_check.addFileArg(b.path("build.zig"));
     run_release_check.addFileArg(b.path("CHANGELOG.md"));
+    run_release_check.addFileArg(b.path("README.md"));
+    run_release_check.addFileArg(b.path("docs/releasing.md"));
     run_release_check.addFileArg(b.path("LICENSE"));
     run_release_check.addFileArg(b.path("LICENSE.pierrec-lz4"));
     run_release_check.addFileArg(b.path("LICENSE.celld-litestream-apache-2.0"));

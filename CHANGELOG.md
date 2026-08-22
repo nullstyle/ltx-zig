@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-08-21
+## [0.1.0] - TBD
 
 ### Added
 
@@ -15,6 +15,10 @@ All notable changes to this project are documented here. The format follows
 - Strict structure, page-index, CRC-64, rolling database, snapshot, and terminal
   verification over bounded caller-owned workspaces.
 - Bounded storage-neutral compaction and staged apply orchestration.
+- An explicit external-consumer 0.1 source API contract plus runnable bounded
+  snapshot-apply and SQLite generation-store lifecycle examples.
+- A canonical local source-archive smoke gate that extracts with isolated
+  caches and runs the archived consumer and examples.
 - Optional crash-qualified two-generation SQLite storage with typed read-only
   generation leases and explicit recovery after indeterminate publication.
 - Real WAL-mode SQLite A-to-B-to-C qualification for checksummed snapshot and
@@ -53,3 +57,5 @@ All notable changes to this project are documented here. The format follows
 - A pinned, digest-locked `act` task rehearses the Linux lane without mounting
   the host Docker daemon; hosted Linux and macOS remain authoritative.
 - SQLite directory durability barriers are portable across qualified hosts.
+- Release metadata validation permits `TBD` during candidate work but requires
+  a real `YYYY-MM-DD` changelog date before tag qualification.

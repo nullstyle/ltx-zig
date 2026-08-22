@@ -61,13 +61,14 @@ implemented. Compaction is a codec-level merge: it does not select storage
 levels, delete source files, publish a replica, or manage a Litestream process.
 The core API remains synchronous, transport-neutral, and free of filesystem and
 SQLite dependencies. See [docs/compaction.md](docs/compaction.md) for its exact
-contract. The optional store is deliberately a quiescent replica/apply
-destination: the host drains SQLite through an application-owned lifecycle
-gate, and published generation paths may be opened only under a generation
-access lease using SQLite URI `mode=ro&immutable=1` and `query_only`. The lease
-holds a shared store lock from manifest resolution until the host has closed
-every SQLite handle using that URI. It does not link a second SQLite copy or
-manage application connection handles itself. See
+contract. The supported 0.1 declarations and compatibility boundary are listed
+in the [public API contract](docs/api.md). The optional store is deliberately a
+quiescent replica/apply destination: the host drains SQLite through an
+application-owned lifecycle gate, and published generation paths may be opened
+only under a generation access lease using SQLite URI `mode=ro&immutable=1` and
+`query_only`. The lease holds a shared store lock from manifest resolution until
+the host has closed every SQLite handle using that URI. It does not link a
+second SQLite copy or manage application connection handles itself. See
 [docs/sqlite-store.md](docs/sqlite-store.md).
 
 `ltx-zig` is licensed under the [MIT License](LICENSE). The fast-compressor
@@ -109,7 +110,12 @@ b.installArtifact(app);
 
 The `consumer-smoke` build step tests the same dependency and module wiring
 through a local path dependency rather than importing modules directly from the
-repository build. The release checklist separately qualifies a fetched archive.
+repository build. `api-freeze` separately compiles the supported 0.1 source API
+as that external consumer. `source-archive-smoke` creates the canonical local
+`zig fetch` tarball, extracts it into a temporary tree, and uses isolated local
+and global caches to run the archived external consumer and all shipped
+examples. That gate catches missing package paths without consulting the live
+checkout or an existing cache.
 
 ## Toolchain and tests
 
@@ -126,7 +132,11 @@ mise exec -- zig build fmt-check
 mise exec -- zig build test
 mise exec -- zig build sqlite-integration # optional; links the host libsqlite3
 mise exec -- zig build consumer-smoke
+mise exec -- zig build api-freeze
 mise exec -- zig build example-round-trip
+mise exec -- zig build example-apply-snapshot
+mise exec -- zig build example-sqlite-store
+mise exec -- zig build source-archive-smoke
 mise exec -- zig build release-check
 mise exec -- zig build fuzz -Doptimize=ReleaseSafe # replay fuzz corpora
 mise exec -- zig build fuzz --fuzz=10K -Doptimize=ReleaseSafe --seed 0
@@ -158,8 +168,17 @@ matrix therefore remains mandatory. See
 [the release checklist](docs/releasing.md) for the full gate.
 
 The runnable [`examples/round_trip.zig`](examples/round_trip.zig) encodes and
-decodes a one-page snapshot using only bounded stack storage. The project
-history is recorded in [`CHANGELOG.md`](CHANGELOG.md).
+decodes a one-page snapshot using only bounded stack storage.
+[`examples/apply_snapshot.zig`](examples/apply_snapshot.zig) carries that
+snapshot through private staging and atomic publication in a fixed-capacity
+single-owner memory backend. Its callback has no concurrent observers and does
+no fallible work after the publication boundary; durable or concurrent backends
+must supply their own atomic commit mechanism.
+[`examples/sqlite_store_lifecycle.zig`](examples/sqlite_store_lifecycle.zig)
+demonstrates store initialization and recovery, verified snapshot publication,
+a held generation access and SQLite open specification, and the lock/lifecycle
+boundary without linking SQLite. Run them with the three `example-*` commands
+above. The project history is recorded in [`CHANGELOG.md`](CHANGELOG.md).
 
 Generate a deterministic v3 file on standard output with:
 

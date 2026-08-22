@@ -9,19 +9,24 @@ authority.
 1. Start from a clean `main` worktree whose hosted CI run is green.
 2. Set `.version` in `build.zig.zon`, add the matching version section to
    `CHANGELOG.md`, and update versioned command examples in `README.md` and this
-   checklist.
-3. Review `LICENSE`, `LICENSE.pierrec-lz4`, and
+   checklist. During release-candidate work, keep the `0.1.0` changelog heading
+   as `## [0.1.0] - TBD`.
+3. On the final release commit, replace `TBD` with the real release date in
+   `YYYY-MM-DD` form. Do not create the tag while the heading is still pending.
+4. Review `LICENSE`, `LICENSE.pierrec-lz4`, and
    `LICENSE.celld-litestream-apache-2.0`; all notices must remain in the
    package.
-4. Validate the intended tag, including its leading `v`:
+5. Validate the intended tag, including its leading `v`:
 
    ```sh
    mise exec -- zig build release-check -Drelease-tag=v0.1.0
    ```
 
-The release checker rejects a malformed package version, a missing changelog
-section, any tag other than `v${package_version}`, a missing license package
-path, or a changed license notice digest.
+Without `-Drelease-tag`, the release checker accepts the matching `TBD` heading
+while release-candidate work continues. With a release tag, it requires a real,
+valid `YYYY-MM-DD` date and rejects a pending heading. It also rejects malformed
+or mismatched package/tag versions, missing public modules or required package
+paths, stale versioned command examples, and changed license notice digests.
 
 ## Run the local gates
 
@@ -37,12 +42,24 @@ mise exec -- zig build test -Doptimize=ReleaseSafe
 mise exec -- zig build sqlite-integration
 mise exec -- zig build sqlite-integration -Doptimize=ReleaseSafe
 mise exec -- zig build consumer-smoke -Doptimize=ReleaseSafe
+mise exec -- zig build api-freeze
+mise exec -- zig build api-freeze -Doptimize=ReleaseSafe
 mise exec -- zig build example-round-trip -Doptimize=ReleaseSafe
+mise exec -- zig build example-apply-snapshot -Doptimize=ReleaseSafe
+mise exec -- zig build example-sqlite-store -Doptimize=ReleaseSafe
+mise exec -- zig build source-archive-smoke -Doptimize=ReleaseSafe
 mise exec -- zig build fuzz --fuzz=10K -Doptimize=ReleaseSafe --seed 0
 GOTOOLCHAIN=local mise exec -- zig build interop -Doptimize=ReleaseSafe
 mise exec -- zig build litestream-interop -Doptimize=ReleaseSafe \
   -Dlitestream=/absolute/path/to/litestream
 ```
+
+`api-freeze` compiles the supported 0.1 contract through the external consumer
+package. `source-archive-smoke` asks the pinned Zig executable to create its
+canonical local `zig fetch` tarball, extracts it away from the checkout, and
+runs the archived consumer plus all three examples with isolated local and
+global caches. It therefore checks package-path completeness without a cached
+or live-source fallback; it does not replace fetching the final remote tag.
 
 Use the official Litestream v0.5.16 archive for the host and verify its
 SHA-256 against the values recorded in [`upstream.md`](upstream.md) before the
@@ -77,7 +94,8 @@ tagging.
 
 ## Tag and publish
 
-1. Confirm `git status --short` is empty and the hosted commit is green.
+1. Confirm `git status --short` is empty, the `0.1.0` changelog heading contains
+   the real release date rather than `TBD`, and the hosted commit is green.
 2. Create an annotated `v${package_version}` tag on that exact commit.
 3. Push the tag and require the tag-triggered release check and full CI matrix
    to succeed.

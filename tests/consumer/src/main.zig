@@ -29,3 +29,7 @@ test "external package exports ltx and ltx_sqlite" {
         access_workspace.path_bytes.len,
     );
 }
+
+test {
+    _ = @import("api_0_1.zig");
+}

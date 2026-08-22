@@ -49,8 +49,18 @@ jobs:
         run: mise exec -- zig build release-check -Drelease-tag="$GITHUB_REF_NAME"
       - name: Test external package imports
         run: mise exec -- zig build consumer-smoke -Doptimize=ReleaseSafe
+      - name: Compile 0.1 API contract in debug
+        run: mise exec -- zig build api-freeze
+      - name: Compile 0.1 API contract in release-safe
+        run: mise exec -- zig build api-freeze -Doptimize=ReleaseSafe
       - name: Run bounded round-trip example
         run: mise exec -- zig build example-round-trip -Doptimize=ReleaseSafe
+      - name: Run private-staging apply example
+        run: mise exec -- zig build example-apply-snapshot -Doptimize=ReleaseSafe
+      - name: Run SQLite-store lifecycle example
+        run: mise exec -- zig build example-sqlite-store -Doptimize=ReleaseSafe
+      - name: Test canonical source archive
+        run: mise exec -- zig build source-archive-smoke -Doptimize=ReleaseSafe
       - name: Check binary fixtures
         run: mise exec -- zig build check-fixtures
       - name: Check historical Go fixtures
