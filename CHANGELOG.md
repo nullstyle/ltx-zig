@@ -30,6 +30,9 @@ All notable changes to this project are documented here. The format follows
 - Outbound compaction qualification against pinned Go bytes and a
   checksum-pinned Litestream v0.5.16 restore over mixed current-L1 and
   legacy-L0 page representations.
+- A five-chain deterministic compaction matrix with exact Go output bytes,
+  pinned database hashes, staged-apply equivalence, and real-Litestream
+  success/expected-rejection coverage of its no-checksum restore boundary.
 - Public SQLite store state and adapter-specific failure inspection, with an
   explicit retry/recovery decision contract.
 - Exhaustive returned-fault qualification at every SQLite durability boundary

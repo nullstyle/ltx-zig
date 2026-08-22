@@ -40,6 +40,9 @@ also used as a secondary format and deployment reference:
   truncation;
 - outbound compaction qualification in which pinned Go byte-matches a Zig L1
   prefix and Litestream v0.5.16 restores it together with a legacy L0 tail;
+- a deterministic five-chain compaction matrix spanning checksummed growth,
+  sparse shrink, maximum-page no-checksum shrink, checked deletion, and a
+  legacy-to-current transition, with pinned Go bytes and database hashes;
 - storage-neutral private staging with explicit contiguous and snapshot-replace
   modes;
 - a full staged-image checksum pass and one atomic backend publication boundary;
@@ -201,9 +204,19 @@ compact captured TX1 through TX4, stage that current flagged output, and apply
 the legacy TX5/TX6 tail through the exact final database hash. The optional
 `interop` step verifies a fresh Zig snapshot with the exact pinned Go decoder,
 byte-matches synthetic compaction cases, and independently compacts the real
-TX1–TX4 prefix with Go before decoding its database image. The separate
-`litestream-interop` step requires a binary reporting exactly v0.5.16 and makes
-that real reader restore the Zig L1 prefix followed by the legacy L0 tail.
+TX1–TX4 prefix with Go before decoding its database image. Its five-chain
+matrix also proves that sequential Zig apply, a direct database model, and
+apply of the compacted file produce the same pinned image for 512-, 1024-,
+4096-, and 65,536-byte pages. Pinned Go first byte-matches all 12 source files,
+then compacts those Zig bytes and byte-matches every final output. The separate
+`litestream-interop` step requires a
+binary reporting exactly v0.5.16. That reader restores the mixed Zig-L1 and
+legacy-L0 capture plus the matrix's no-checksum maximum-page output to exact
+image hashes. It also pins the checked-growth case's rejection: Litestream
+forces no-checksum compaction during restore but retains the nonzero post-apply
+checksum. This is a Litestream v0.5.16 limitation, not a Zig/Go byte mismatch.
+The matrix images contain synthetic byte patterns and are not claimed to be
+valid SQLite databases.
 Release qualification and CI use the official archive, and CI extracts and
 runs it only after checking its pinned SHA-256. Normal tests stay
 network-free, replay the checked-in fuzz corpora, and run a deterministic

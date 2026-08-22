@@ -40,18 +40,21 @@ const child_timeout: std.Io.Timeout = .{ .duration = .{
     .clock = .awake,
     .raw = .fromSeconds(30),
 } };
-const max_ltx_bytes: u64 = 64 * 1024;
+const max_ltx_bytes: u64 = 66 * 1024;
+const max_database_bytes: u64 = 64 * 1024;
 const copy_buffer_bytes: usize = 4096;
-const database_bytes: u64 = 5 * 4096;
-const database_chunk_count: u8 = @intCast(
-    (database_bytes + copy_buffer_bytes - 1) / copy_buffer_bytes,
-);
+const real_database_bytes: u64 = 5 * 4096;
+const max_page_database_bytes: u64 = 64 * 1024;
 const tx4_sha256 = "27d2e8ad59731445c4798eec1c76146e85bd931383728d89fbd96f91d97b0f6a";
 const tx6_sha256 = "ee705e74c9788b64f5dc63b9c3dc028ae05aae34f240bad1362d9436c65150e0";
+const max_page_sha256 = "1f2d41b212c74e121e69ba1f71cdf254ce7b478dfb675bca590a1bb9c952354f";
+const checked_restore_error = "validate trailer: post-apply checksum not allowed";
 
 const compacted_name = "0000000000000001-0000000000000004.ltx";
 const tx5_name = "0000000000000005-0000000000000005.ltx";
 const tx6_name = "0000000000000006-0000000000000006.ltx";
+const grow_name = "0000000000000001-0000000000000003.ltx";
+const max_page_name = "0000000000000001-0000000000000002.ltx";
 const tx4_value = "0000000000000004";
 
 const BoundedPath = struct {
@@ -142,34 +145,48 @@ pub fn main(init: std.process.Init) !void {
         else => return error.UnsupportedPlatform,
     }
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 5) return error.InvalidArguments;
+    if (args.len != 7) return error.InvalidArguments;
     try require_bounded_argument(args[1]);
     const compacted = try BoundedPath.resolve(init.io, args[2]);
     const tx5 = try BoundedPath.resolve(init.io, args[3]);
     const tx6 = try BoundedPath.resolve(init.io, args[4]);
+    const grow = try BoundedPath.resolve(init.io, args[5]);
+    const max_page = try BoundedPath.resolve(init.io, args[6]);
     try require_litestream_version(init, args[1]);
 
     var temporary = try TemporaryDirectory.create(init.io);
     defer temporary.cleanup(init.io);
     try populate_replica(init.io, temporary.dir, &compacted, &tx5, &tx6);
+    try populate_synthetic_replicas(init.io, temporary.dir, &grow, &max_page);
 
     var root = try directory_path(init.io, temporary.dir);
     const replica = try BoundedPath.join(&root, "replica");
+    const grow_replica = try BoundedPath.join(&root, "grow-replica");
+    const max_page_replica = try BoundedPath.join(&root, "max-page-replica");
     const tx4_database = try BoundedPath.join(&root, "tx4.sqlite");
     const tx6_database = try BoundedPath.join(&root, "tx6.sqlite");
+    const grow_database = try BoundedPath.join(&root, "grow.sqlite");
+    const max_page_database = try BoundedPath.join(&root, "max-page.sqlite");
     var replica_url_buffer: ["file://".len + std.fs.max_path_bytes]u8 = undefined;
+    var grow_url_buffer: ["file://".len + std.fs.max_path_bytes]u8 = undefined;
+    var max_page_url_buffer: ["file://".len + std.fs.max_path_bytes]u8 = undefined;
     const replica_url = try std.fmt.bufPrint(&replica_url_buffer, "file://{s}", .{replica.slice()});
+    const grow_url = try std.fmt.bufPrint(&grow_url_buffer, "file://{s}", .{grow_replica.slice()});
+    const max_page_url = try std.fmt.bufPrint(&max_page_url_buffer, "file://{s}", .{max_page_replica.slice()});
 
-    try restore(init, args[1], replica_url, &tx4_database, tx4_value);
-    try expect_file_sha256(init.io, &tx4_database, tx4_sha256);
-    try restore(init, args[1], replica_url, &tx6_database, null);
-    try expect_file_sha256(init.io, &tx6_database, tx6_sha256);
+    try restore(init, args[1], replica_url, &tx4_database, tx4_value, "restore TX4");
+    try expect_file_sha256(init.io, &tx4_database, real_database_bytes, tx4_sha256);
+    try restore(init, args[1], replica_url, &tx6_database, null, "restore TX6");
+    try expect_file_sha256(init.io, &tx6_database, real_database_bytes, tx6_sha256);
     try expect_final_database(&tx6_database);
+    try expect_checked_restore_rejection(init, args[1], grow_url, &grow_database);
+    try restore(init, args[1], max_page_url, &max_page_database, null, "restore max-page chain");
+    try expect_file_sha256(init.io, &max_page_database, max_page_database_bytes, max_page_sha256);
 
-    var stdout_buffer: [128]u8 = undefined;
+    var stdout_buffer: [192]u8 = undefined;
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     try stdout_writer.interface.writeAll(
-        "Litestream 0.5.16 restored the Zig TX1-TX4 compaction through legacy TX6\n",
+        "Litestream 0.5.16 restored real and max-page compactions; checked-input rejection reproduced\n",
     );
     try stdout_writer.interface.flush();
 }
@@ -200,6 +217,21 @@ fn populate_replica(
     try copy_ltx(io, compacted, level_one, compacted_name);
     try copy_ltx(io, tx5, level_zero, tx5_name);
     try copy_ltx(io, tx6, level_zero, tx6_name);
+}
+
+fn populate_synthetic_replicas(
+    io: std.Io,
+    root: std.Io.Dir,
+    grow: *const BoundedPath,
+    max_page: *const BoundedPath,
+) !void {
+    var grow_level_one = try root.createDirPathOpen(io, "grow-replica/ltx/1", .{});
+    defer grow_level_one.close(io);
+    try copy_ltx(io, grow, grow_level_one, grow_name);
+
+    var max_page_level_one = try root.createDirPathOpen(io, "max-page-replica/ltx/1", .{});
+    defer max_page_level_one.close(io);
+    try copy_ltx(io, max_page, max_page_level_one, max_page_name);
 }
 
 fn copy_ltx(
@@ -262,6 +294,7 @@ fn restore(
     replica_url: []const u8,
     output: *const BoundedPath,
     txid: ?[]const u8,
+    operation: []const u8,
 ) !void {
     const result = if (txid) |value|
         try run_child(init, &.{ executable, "restore", "-o", output.slice(), "-txid", value, replica_url })
@@ -269,7 +302,29 @@ fn restore(
         try run_child(init, &.{ executable, "restore", "-o", output.slice(), replica_url });
     defer init.gpa.free(result.stdout);
     defer init.gpa.free(result.stderr);
-    try require_success(if (txid == null) "restore TX6" else "restore TX4", &result);
+    try require_success(operation, &result);
+}
+
+fn expect_checked_restore_rejection(
+    init: std.process.Init,
+    executable: []const u8,
+    replica_url: []const u8,
+    output: *const BoundedPath,
+) !void {
+    const result = try run_child(init, &.{ executable, "restore", "-o", output.slice(), replica_url });
+    defer init.gpa.free(result.stdout);
+    defer init.gpa.free(result.stderr);
+    const expected_exit = switch (result.term) {
+        .exited => |code| code == 1,
+        else => false,
+    };
+    if (!expected_exit or result.stdout.len != 0 or
+        std.mem.indexOf(u8, result.stderr, "Error: decode database:") == null or
+        std.mem.indexOf(u8, result.stderr, checked_restore_error) == null)
+    {
+        print_child_result("restore checked grow rejection mismatch", &result);
+        return error.CheckedRestoreRejectionMismatch;
+    }
 }
 
 fn run_child(init: std.process.Init, argv: []const []const u8) !std.process.RunResult {
@@ -299,20 +354,33 @@ fn print_child_result(operation: []const u8, result: *const std.process.RunResul
     );
 }
 
-fn expect_file_sha256(io: std.Io, path: *const BoundedPath, expected_hex: []const u8) !void {
+fn expect_file_sha256(
+    io: std.Io,
+    path: *const BoundedPath,
+    expected_size_bytes: u64,
+    expected_hex: []const u8,
+) !void {
+    if (expected_size_bytes > max_database_bytes or
+        expected_hex.len != std.crypto.hash.sha2.Sha256.digest_length * 2)
+    {
+        return error.InvalidExpectedDatabaseImage;
+    }
     var file = try std.Io.Dir.cwd().openFile(io, path.slice(), .{
         .mode = .read_only,
         .allow_directory = false,
     });
     defer file.close(io);
     const stat = try file.stat(io);
-    if (stat.kind != .file or stat.size != database_bytes) return error.InvalidDatabaseImage;
+    if (stat.kind != .file or stat.size != expected_size_bytes) return error.InvalidDatabaseImage;
 
     var digest = std.crypto.hash.sha2.Sha256.init(.{});
     var buffer: [copy_buffer_bytes]u8 = undefined;
     var offset_bytes: u64 = 0;
     var chunk_count: u8 = 0;
-    while (offset_bytes < stat.size and chunk_count < database_chunk_count) : (chunk_count += 1) {
+    const max_chunk_count: u8 = @intCast(
+        (expected_size_bytes + buffer.len - 1) / buffer.len,
+    );
+    while (offset_bytes < stat.size and chunk_count < max_chunk_count) : (chunk_count += 1) {
         const length: usize = @intCast(@min(stat.size - offset_bytes, buffer.len));
         const read = try file.readPositionalAll(io, buffer[0..length], offset_bytes);
         if (read != length) return error.DatabaseImageChanged;
@@ -320,6 +388,10 @@ fn expect_file_sha256(io: std.Io, path: *const BoundedPath, expected_hex: []cons
         offset_bytes += length;
     }
     if (offset_bytes != stat.size) return error.InvalidDatabaseImage;
+    const final_stat = try file.stat(io);
+    if (final_stat.kind != .file or final_stat.size != stat.size) {
+        return error.DatabaseImageChanged;
+    }
     var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     digest.final(&actual);
     const actual_hex = std.fmt.bytesToHex(actual, .lower);

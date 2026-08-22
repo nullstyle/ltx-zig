@@ -127,6 +127,27 @@ commit zero. The no-checksum case covers the mode emitted by Celld's
 storage-level compactor and configures the Go oracle explicitly for that output
 mode.
 
+The same gate runs a broader deterministic valid-chain matrix:
+
+| Case | Inputs | Final image |
+| --- | ---: | --- |
+| Checksummed growth, 512-byte pages | 3 | Five pages after updates at each growth stage |
+| Checksummed sparse update and shrink, 4096-byte pages | 3 | Three pages, with newest versions retained below the final commit |
+| No-checksum shrink, 65,536-byte pages | 2 | One maximum-size page |
+| Checksummed deletion, 1024-byte pages | 2 | Empty database |
+| Legacy unflagged plus current, 512-byte pages | 2 | One current updated page |
+
+For every row, hermetic Zig tests compare sequential staged application, an
+independent direct image model, and staged application of the compacted output.
+The database SHA-256 is pinned. The Go verifier independently rebuilds the
+current inputs, uses the committed historical fixture for the legacy prefix,
+runs the pinned `ltx.NewCompactor` over the 12 byte-matched Zig source files,
+requires complete output byte equality, and decodes the same database hash.
+Fresh source headers deliberately contain
+nonzero WAL and node metadata; the compacted header must zero those fields.
+The legacy/current case additionally proves that a legacy unflagged input is
+accepted while every emitted page uses the current flagged raw-LZ4 profile.
+
 The same Go gate also compacts TX1 through TX4 of the immutable real
 Litestream capture. It byte-matches the Zig output, requires current flagged
 raw-LZ4 pages, and decodes the exact known TX4 SQLite image. For the deployment
@@ -136,7 +157,14 @@ v0.5.16. Release qualification and CI use the checksum-pinned official archive.
 The harness builds a forced replica plan containing the Zig TX1–TX4 L1 object
 and the legacy-frame TX5/TX6 L0 tail, restores at TX4 and TX6, and checks both
 database hashes plus final SQLite integrity and rows. Hosted Linux CI extracts
-and runs the archive only after verifying its pinned SHA-256. Normal Zig tests
+and runs the archive only after verifying its pinned SHA-256. The harness also
+restores the matrix's no-checksum maximum-page output as a standalone L1 object
+and requires its exact image hash. Its checked-growth probe is a bounded
+expected rejection: Litestream v0.5.16 forces Go compaction to no-checksum mode
+but retains the input's nonzero post-apply checksum, producing an invalid
+combination. The Zig output remains byte-identical to the pinned Go compactor
+in its checksummed mode. These matrix payloads are synthetic byte-pattern
+database images, so neither probe is a SQLite-validity claim. Normal Zig tests
 do not run Go or Litestream and never access the network; they reproduce the
 same mixed-representation chain with the bounded staged applier.
 

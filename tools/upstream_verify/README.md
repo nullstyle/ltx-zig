@@ -25,6 +25,36 @@ exactly contiguous incremental deletion to commit zero. The `no-checksum` case
 covers the mode emitted by Celld's storage-level compactor and explicitly sets
 the pinned Go compactor's output flags to match.
 
+It also generates and verifies a five-chain differential matrix:
+
+- three checksummed 512-byte-page transitions that grow to five pages;
+- three checksummed 4096-byte-page transitions with sparse updates and a final
+  shrink to three pages;
+- two no-checksum transitions at the 65,536-byte maximum page size that shrink
+  to one page;
+- a checksummed three-page 1024-byte snapshot followed by deletion to empty;
+- the committed legacy unflagged 512-byte zero-page snapshot followed by a
+  current incremental.
+
+For each matrix case, the verifier reconstructs the current inputs
+independently, requires byte equality for all 12 Zig source files, runs
+`ltx.NewCompactor` over those Zig bytes, requires complete output byte equality,
+decodes the compacted database with Go, and checks a pinned SHA-256. It
+also verifies the final header, pages, checksum mode, current page flags, and
+zeroed WAL offset, WAL size, salts, and node ID. The legacy/current case proves
+that historical unflagged input is rewritten into the current flagged page
+profile.
+
+The five decoded database hashes, in the order above, are:
+
+```text
+c89c89ca0c8c8a5ad990add46f40c64237cc847535b7c46a1338671f24727203
+748180e5b2dcef3c390c2b9b26700b20df220c43455bc52f75d41e769b6f7adc
+1f2d41b212c74e121e69ba1f71cdf254ce7b478dfb675bca590a1bb9c952354f
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+a84f98fa7bc9cfbb6ee11fc4eb67c730d9648d3a32a4933b289d5cc28fc72865
+```
+
 This proves interoperability with the exact pinned Go library, not integration
 with a running Litestream deployment. The step may download Go modules. The
 normal Zig test suite is hermetic and does not invoke it.

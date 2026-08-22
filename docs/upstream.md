@@ -431,13 +431,46 @@ the Go oracle explicitly sets `Compactor.HeaderFlags` because Go does not derive
 the output mode from its input headers. These files are generated during the
 interop build rather than treated as committed Go-derived corpus.
 
+The deterministic valid-chain matrix broadens that differential check without
+turning generated outputs into committed corpus:
+
+| Case | Transition shape | Decoded database SHA-256 |
+| --- | --- | --- |
+| `checked-grow-512` | Three checksummed TXIDs grow from two to five 512-byte pages, then update two pages | `c89c89ca0c8c8a5ad990add46f40c64237cc847535b7c46a1338671f24727203` |
+| `checked-sparse-shrink-4096` | Three checksummed TXIDs sparsely update five 4096-byte pages, then shrink to three | `748180e5b2dcef3c390c2b9b26700b20df220c43455bc52f75d41e769b6f7adc` |
+| `no-checksum-max-page-shrink-65536` | Two no-checksum TXIDs shrink two maximum-size pages to one updated page | `1f2d41b212c74e121e69ba1f71cdf254ce7b478dfb675bca590a1bb9c952354f` |
+| `checked-delete-1024` | A three-page checksummed snapshot followed by a contiguous deletion | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
+| `legacy-current-512` | The committed legacy unflagged zero-page snapshot followed by a current incremental | `a84f98fa7bc9cfbb6ee11fc4eb67c730d9648d3a32a4933b289d5cc28fc72865` |
+
+Hermetic Zig tests build the expected image directly, apply each source in
+order, compact the chain, and apply that output independently. All three paths
+must agree byte for byte and with the hash above. Every fresh source has
+nonzero WAL offset, WAL size, salts, and node ID; every compacted header zeros
+those source-local fields. Page-bearing outputs use the current flagged
+raw-LZ4 profile, including the output whose first input is historical
+unflagged v3.
+
+The pinned Go verifier separately constructs the current source files, reads
+the committed legacy fixture where applicable, and byte-matches all 12 Zig
+source files before running `ltx.NewCompactor` over those bytes. Each complete
+Zig output must be byte-identical to Go before Go decodes and checks its
+database SHA-256. The checksum-verified Litestream v0.5.16 binary
+also restores `no-checksum-max-page-shrink-65536` as a standalone L1 object
+and reproduces its exact hash. The same harness requires a bounded rejection
+for `checked-grow-512`: Litestream forces no-checksum compaction while retaining
+that checksummed file's nonzero post checksum. This is a Litestream v0.5.16
+mode-conversion limitation, not a Zig/Go output mismatch. Both payloads are
+deterministic byte patterns rather than SQLite-generated pages, so these probes
+qualify LTX deployment reading, not SQLite database validity.
+
 `mise exec -- zig build interop` performs the snapshot verification plus all
 synthetic and real-capture compaction checks from the build graph. For
 compaction, the exact pinned Go module independently reconstructs or reads the
 inputs, runs `ltx.NewCompactor`, byte-compares the full output with Zig, and
-decodes it for semantic checks. `mise exec -- zig build litestream-interop
+decodes it for semantic checks, including the five-case matrix. `mise exec -- zig build litestream-interop
 -Dlitestream=/absolute/path/to/litestream` adds the real v0.5.16 deployment
-reader over the mixed-level tree described above. The Go module uses the
+reader over the mixed-level tree and selected matrix probes described above.
+The Go module uses the
 checksum-locked pseudo-version resolving exactly to the recorded commit;
 unlike the normal test suite, the interop gates may require downloaded tools
 or modules.

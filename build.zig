@@ -1,4 +1,5 @@
 const std = @import("std");
+const valid_chain_manifest = @import("tests/valid_chain_manifest.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -109,6 +110,23 @@ pub fn build(b: *std.Build) void {
     });
     const run_litestream_compaction_tests = b.addRunArtifact(litestream_compaction_tests);
     run_litestream_compaction_tests.has_side_effects = true;
+    const valid_chain_cases = b.createModule(.{
+        .root_source_file = b.path("tests/valid_chain_cases.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ltx", .module = host_ltx }},
+    });
+    const valid_chain_matrix_tests = b.addTest(.{
+        .name = "ltx-valid-chain-matrix-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/valid_chain_matrix.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ltx", .module = host_ltx }},
+        }),
+    });
+    const run_valid_chain_matrix_tests = b.addRunArtifact(valid_chain_matrix_tests);
+    run_valid_chain_matrix_tests.has_side_effects = true;
     const sqlite_store_unit_tests = b.addTest(.{
         .name = "ltx-sqlite-store-unit-tests",
         .root_module = host_sqlite_store,
@@ -202,6 +220,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_apply_tests.step);
     test_step.dependOn(&run_compactor_tests.step);
     test_step.dependOn(&run_litestream_compaction_tests.step);
+    test_step.dependOn(&run_valid_chain_matrix_tests.step);
     test_step.dependOn(&run_sqlite_store_unit_tests.step);
     test_step.dependOn(&run_sqlite_store_tests.step);
     test_step.dependOn(&run_sqlite_store_crash_tests.step);
@@ -235,6 +254,7 @@ pub fn build(b: *std.Build) void {
             "tools/compaction_fixturegen",
             "tools/litestream_compaction_fixturegen",
             "tools/litestream_interop",
+            "tools/valid_chain_fixturegen",
             "tools/release_check",
         },
         .check = true,
@@ -430,6 +450,56 @@ pub fn build(b: *std.Build) void {
     ));
     interop_step.dependOn(&go_verify_real_compaction.step);
 
+    const valid_chain_fixturegen = b.addExecutable(.{
+        .name = "ltx-valid-chain-fixturegen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/valid_chain_fixturegen/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ltx", .module = host_ltx },
+                .{ .name = "valid_chain_cases", .module = valid_chain_cases },
+            },
+        }),
+    });
+    var valid_chain_outputs: [valid_chain_manifest.all.len]std.Build.LazyPath = undefined;
+    var valid_chain_inputs: [valid_chain_manifest.total_input_count]std.Build.LazyPath = undefined;
+    var generated_input_count: usize = 0;
+    for (valid_chain_manifest.all, 0..) |kind, index| {
+        const case_name = valid_chain_manifest.name(kind);
+        const generate = b.addRunArtifact(valid_chain_fixturegen);
+        generate.addArg(case_name);
+        valid_chain_outputs[index] = generate.captureStdOut(.{
+            .basename = b.fmt("{s}.ltx", .{case_name}),
+        });
+        for (0..valid_chain_manifest.input_count(kind)) |input_index| {
+            const generate_input = b.addRunArtifact(valid_chain_fixturegen);
+            generate_input.addArg(case_name);
+            generate_input.addArg(b.fmt("{d}", .{input_index}));
+            valid_chain_inputs[generated_input_count] = generate_input.captureStdOut(.{
+                .basename = b.fmt("{s}-input-{d}.ltx", .{ case_name, input_index + 1 }),
+            });
+            generated_input_count += 1;
+        }
+    }
+    const go_verify_valid_chain = b.addSystemCommand(&.{
+        "go",
+        "run",
+        "./verify_valid_chain",
+    });
+    go_verify_valid_chain.setCwd(b.path("tools/upstream_verify"));
+    go_verify_valid_chain.setEnvironmentVariable("GOWORK", "off");
+    var input_offset: usize = 0;
+    for (valid_chain_manifest.all, 0..) |kind, index| {
+        go_verify_valid_chain.addFileArg(valid_chain_outputs[index]);
+        for (0..valid_chain_manifest.input_count(kind)) |_| {
+            go_verify_valid_chain.addFileArg(valid_chain_inputs[input_offset]);
+            input_offset += 1;
+        }
+    }
+    go_verify_valid_chain.addFileArg(b.path("tests/fixtures/go_v3_legacy_unflagged.ltx"));
+    interop_step.dependOn(&go_verify_valid_chain.step);
+
     const litestream_interop_module = b.createModule(.{
         .root_source_file = b.path("tools/litestream_interop/main.zig"),
         .target = b.graph.host,
@@ -454,6 +524,16 @@ pub fn build(b: *std.Build) void {
     run_litestream_interop.addFileArg(b.path(
         fixture_root ++ "0000000000000006-0000000000000006.ltx",
     ));
+    run_litestream_interop.addFileArg(valid_chain_outputs[
+        valid_chain_manifest.index(
+            .checked_grow_512,
+        )
+    ]);
+    run_litestream_interop.addFileArg(valid_chain_outputs[
+        valid_chain_manifest.index(
+            .no_checksum_max_page_shrink_65536,
+        )
+    ]);
     const litestream_interop_step = b.step(
         "litestream-interop",
         "Restore Zig-compacted real captures with Litestream v0.5.16",
