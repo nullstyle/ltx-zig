@@ -27,6 +27,8 @@ mise exec -- zig build upstream-fixture -Dfixture=<name>
 
 The generator lives in `tools/upstream_verify/fixturegen`; its `go.mod` pins
 the exact oracle pseudo-version and `go.sum` pins transitive content hashes.
+The aggregate `mise exec -- zig build check-fixtures` gate regenerates and
+byte-compares all five files with that pinned writer.
 The Zig encoder is separately required to reproduce the complete
 `go_v3_snapshot_zero_page.ltx` bytes, not merely its decoded semantics.
 

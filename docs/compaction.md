@@ -181,9 +181,9 @@ do not run Go or Litestream and never access the network; they reproduce the
 same mixed-representation chain with the bounded staged applier.
 
 The v2 input profile is anchored to `superfly/ltx` v0.4.0 at commit
-`2af9b0cb7a6eebfb59c2ca76acc4ae3adf4b6a09`. Migration uses the canonical v3
-encoder whose output is separately byte-qualified against the current Go pin;
-the exact v2 migration chain is not a new direct Go comparison. Celld provides
-secondary v3 compaction and deployment evidence but no v2 implementation. The
-pinned source evidence and deliberate strictness differences are recorded in
-[`upstream.md`](upstream.md).
+`2af9b0cb7a6eebfb59c2ca76acc4ae3adf4b6a09`. The interoperability gate migrates
+v2-only, mixed v2/v3, and valid SQLite-image inputs and requires complete output
+byte equality with independently constructed current-Go canonical v3 files.
+Celld provides secondary v3 compaction and deployment evidence but no v2
+implementation. The pinned source evidence and deliberate strictness
+differences are recorded in [`upstream.md`](upstream.md).

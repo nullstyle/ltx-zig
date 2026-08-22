@@ -55,6 +55,14 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 a84f98fa7bc9cfbb6ee11fc4eb67c730d9648d3a32a4933b289d5cc28fc72865
 ```
 
+The interoperability gate also checks three explicit migration outputs. The
+historical v0.4.0 module first reproduces the committed v2 sources. Zig then
+compacts the v2-only chain, an equivalent mixed v2/v3 chain, and the valid v2
+SQLite snapshot into canonical v3. The current pinned Go module independently
+constructs the expected canonical outputs for all three routes, requires
+complete byte equality, decodes each output, and checks the final database
+SHA-256.
+
 This proves interoperability with the exact pinned Go library, not integration
 with a running Litestream deployment. The step may download Go modules. The
 normal Zig test suite is hermetic and does not invoke it.
@@ -66,6 +74,10 @@ through the root build:
 ```sh
 mise exec -- zig build upstream-fixture -Dfixture=incremental > /tmp/go-incremental.ltx
 ```
+
+`mise exec -- zig build check-fixtures` regenerates and byte-compares all five
+current fixtures as well as the v2 fixtures before checking every binary/hex
+pair.
 
 The separate historical module pins the last canonical unflagged-frame writer.
 It regenerates the compressed one-page and mixed compressed/stored fixtures:

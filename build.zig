@@ -283,6 +283,7 @@ pub fn build(b: *std.Build) void {
             "benchmarks",
             "tools/fixturegen",
             "tools/compaction_fixturegen",
+            "tools/v2_migration_fixturegen",
             "tools/litestream_compaction_fixturegen",
             "tools/litestream_interop",
             "tools/source_archive_smoke",
@@ -517,6 +518,54 @@ pub fn build(b: *std.Build) void {
     go_verify.addFileArg(generated_fixture);
     const interop_step = b.step("interop", "Verify Zig output with pinned Go LTX");
     interop_step.dependOn(&go_verify.step);
+
+    const v2_migration_fixturegen = b.addExecutable(.{
+        .name = "ltx-v2-migration-fixturegen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/v2_migration_fixturegen/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ltx", .module = host_ltx },
+                .{
+                    .name = "v2_migration_inputs",
+                    .module = b.createModule(.{
+                        .root_source_file = b.path("tests/v2_migration_inputs.zig"),
+                        .target = b.graph.host,
+                        .optimize = optimize,
+                    }),
+                },
+            },
+        }),
+    });
+    const migration_names = [_][]const u8{ "v2-only", "mixed", "sqlite-empty" };
+    var migration_outputs: [migration_names.len]std.Build.LazyPath = undefined;
+    for (migration_names, 0..) |name, index| {
+        const generate = b.addRunArtifact(v2_migration_fixturegen);
+        generate.addArg(name);
+        migration_outputs[index] = generate.captureStdOut(.{
+            .basename = b.fmt("ltx-zig-{s}-migration.ltx", .{name}),
+        });
+    }
+    const verify_v2_migration_inputs = b.addSystemCommand(&.{
+        "go",
+        "run",
+        ".",
+        "--check",
+        "../../tests/fixtures",
+    });
+    verify_v2_migration_inputs.setCwd(b.path("tools/v2_fixturegen"));
+    verify_v2_migration_inputs.setEnvironmentVariable("GOWORK", "off");
+    const go_verify_v2_migration = b.addSystemCommand(&.{
+        "go",
+        "run",
+        "./verify_v2_migration",
+    });
+    go_verify_v2_migration.setCwd(b.path("tools/upstream_verify"));
+    go_verify_v2_migration.setEnvironmentVariable("GOWORK", "off");
+    for (migration_outputs) |output| go_verify_v2_migration.addFileArg(output);
+    go_verify_v2_migration.step.dependOn(&verify_v2_migration_inputs.step);
+    interop_step.dependOn(&go_verify_v2_migration.step);
 
     const interop_merge_fixturegen = b.addRunArtifact(compaction_fixturegen);
     interop_merge_fixturegen.addArg("merge");
@@ -774,6 +823,21 @@ pub fn build(b: *std.Build) void {
     );
     check_v2_fixtures_step.dependOn(&check_v2_fixtures.step);
 
+    const check_current_fixtures = b.addSystemCommand(&.{
+        "go",
+        "run",
+        "./fixturegen",
+        "--check",
+        "../../tests/fixtures",
+    });
+    check_current_fixtures.setCwd(b.path("tools/upstream_verify"));
+    check_current_fixtures.setEnvironmentVariable("GOWORK", "off");
+    const check_current_fixtures_step = b.step(
+        "check-current-fixtures",
+        "Check current Go output against all committed current fixtures",
+    );
+    check_current_fixtures_step.dependOn(&check_current_fixtures.step);
+
     const legacy_fixture_name = b.option(
         []const u8,
         "legacy-fixture",
@@ -848,5 +912,6 @@ pub fn build(b: *std.Build) void {
         "Check binary fixtures against reviewed hex mirrors",
     );
     check_fixtures_step.dependOn(&check_fixtures.step);
+    check_fixtures_step.dependOn(check_current_fixtures_step);
     check_fixtures_step.dependOn(check_v2_fixtures_step);
 }

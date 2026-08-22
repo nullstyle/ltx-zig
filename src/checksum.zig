@@ -58,6 +58,13 @@ test "page and rolling checksums are independently known answers" {
     try std.testing.expectEqual(format.checksum_flag, rolling_initial().value);
 }
 
+test "rolling checksum rejects an invalid flag on either operand" {
+    const valid = rolling_initial();
+    const invalid = format.Checksum.init(0);
+    try std.testing.expectError(error.InvalidChecksumFormat, rolling_add(invalid, valid));
+    try std.testing.expectError(error.InvalidChecksumFormat, rolling_add(valid, invalid));
+}
+
 test "rolling checksum matches the upstream three-page known answer" {
     const pages = [_][512]u8{
         @splat(0x01),

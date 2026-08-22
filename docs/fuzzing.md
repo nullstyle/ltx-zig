@@ -47,13 +47,22 @@ strict prefix and one fixed single-bit mutation per byte. The 65,536-byte v2
 and v3 near-lock fixtures remain covered by byte-exact interoperability tests;
 their raw compressed pages are covered by the LZ4 corpus.
 
-The compactor property accepts at most 1,024 hostile bytes as either one input
-or two halves. Every processing result must reach exactly one terminal state:
-failure poisons the compactor and success must produce an output whose decoded
-`VerifiedLTX` exactly matches the returned value. A second `compact()` call is
-always rejected. Separate deterministic tests cover aggregate page bounds,
-cross-workspace aliasing, and unverified partial output after a late checksum
-failure.
+The staged-applier property accepts at most 1,024 hostile bytes under a
+structured `.v2` or `.v3` selection. Its corpus includes snapshot, empty,
+incremental, and no-checksum inputs for both versions. Success must publish
+exactly once with the selected version in both `VerifiedLTX` and `ApplyPlan`;
+failure must poison the applier, never publish, abort exactly when a private
+stage was acquired, and leave no active stage.
+
+The compactor property accepts one or two hostile inputs of at most 1,024 bytes
+each and selects `.v2` or `.v3` independently for every input. Its corpus
+includes current v3, v2, a v2-only chain, and a mixed legacy-v3/v2 chain. Every
+processing result must reach exactly one terminal state: failure poisons the
+compactor and leaves only bounded, unverified output, while success must produce
+canonical v3 whose decoded `VerifiedLTX` exactly matches the returned value. A
+second `compact()` call is always rejected. Separate deterministic tests cover
+aggregate page bounds, cross-workspace aliasing, and unverified partial output
+after a late checksum failure.
 
 The raw LZ4 decoder property accepts at most 1,024 compressed bytes and chooses
 from fixed output sizes spanning 0 through 65,536 bytes. Differently poisoned
@@ -72,8 +81,9 @@ coverage outside this mutation bound.
 
 Corpus entries are Zig `Smith` decision streams, not bare LTX or LZ4 files.
 They encode each selected integer before the length-prefixed byte slice. Keep
-the seed helpers in `tests/fuzz.zig`, `tests/compactor.zig`, and
-`tests/fuzz_lz4.zig` as the canonical way to construct them.
+the seed helpers in `tests/fuzz.zig`, `tests/apply.zig`,
+`tests/compactor.zig`, and `tests/fuzz_lz4.zig` as the canonical way to
+construct them.
 
 Zig reports learned and crashing inputs under `.zig-cache/f/`. Minimize and
 replay a failure, then promote it either to the appropriate checked-in corpus

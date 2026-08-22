@@ -1,26 +1,100 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/superfly/ltx"
 )
 
+var fixtures = []struct {
+	name     string
+	basename string
+}{
+	{name: "snapshot-zero", basename: "go_v3_snapshot_zero_page"},
+	{name: "empty", basename: "go_v3_empty_snapshot"},
+	{name: "incremental", basename: "go_v3_incremental"},
+	{name: "no-checksum", basename: "go_v3_no_checksum"},
+	{name: "near-lock", basename: "go_v3_near_lock_page"},
+}
+
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: fixturegen <snapshot-zero|empty|incremental|no-checksum|near-lock>")
-		os.Exit(2)
-	}
-	spec, err := fixture(os.Args[1])
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
-	}
-	if _, err := spec.WriteTo(os.Stdout); err != nil {
+	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func run(args []string) error {
+	switch {
+	case len(args) == 1:
+		data, err := generate(args[0])
+		if err != nil {
+			return err
+		}
+		_, err = os.Stdout.Write(data)
+		return err
+	case len(args) == 2 && args[0] == "--check":
+		return checkAll(args[1])
+	default:
+		return fmt.Errorf("usage: fixturegen <snapshot-zero|empty|incremental|no-checksum|near-lock> | --check <fixtures-directory>")
+	}
+}
+
+func generate(name string) ([]byte, error) {
+	spec, err := fixture(name)
+	if err != nil {
+		return nil, err
+	}
+	var output bytes.Buffer
+	if _, err := spec.WriteTo(&output); err != nil {
+		return nil, fmt.Errorf("generate %s: %w", name, err)
+	}
+	return output.Bytes(), nil
+}
+
+func checkAll(directory string) error {
+	for _, entry := range fixtures {
+		expected, err := generate(entry.name)
+		if err != nil {
+			return err
+		}
+		path := filepath.Join(directory, entry.basename+".ltx")
+		actual, err := readExactFile(path, int64(len(expected)))
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(actual, expected) {
+			return fmt.Errorf("generated fixture does not match %s", path)
+		}
+	}
+	return nil
+}
+
+func readExactFile(path string, expectedBytes int64) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() != expectedBytes {
+		return nil, fmt.Errorf("%s has size %d, expected %d", path, info.Size(), expectedBytes)
+	}
+	actual, err := io.ReadAll(io.LimitReader(file, expectedBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	if int64(len(actual)) != expectedBytes {
+		return nil, fmt.Errorf("%s changed while reading", path)
+	}
+	return actual, nil
 }
 
 func fixture(name string) (*ltx.FileSpec, error) {

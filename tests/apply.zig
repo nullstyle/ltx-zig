@@ -26,9 +26,12 @@ const apply_limits = ltx.ApplyLimits{
 
 const celld_fixture = @embedFile("fixtures/celld_v052_two_page_snapshot.ltx");
 const empty_fixture = @embedFile("fixtures/go_v3_empty_snapshot.ltx");
+const incremental_fixture = @embedFile("fixtures/go_v3_incremental.ltx");
 const no_checksum_fixture = @embedFile("fixtures/go_v3_no_checksum.ltx");
 const v2_mixed_snapshot_fixture = @embedFile("fixtures/go_v2_mixed_snapshot.ltx");
+const v2_empty_fixture = @embedFile("fixtures/go_v2_empty_snapshot.ltx");
 const v2_incremental_fixture = @embedFile("fixtures/go_v2_incremental.ltx");
+const v2_no_checksum_fixture = @embedFile("fixtures/go_v2_no_checksum.ltx");
 
 const CelldLitestreamCapture = struct {
     bytes: []const u8,
@@ -971,13 +974,23 @@ test "atomic publish position race aborts the private image" {
     }
 }
 
-const apply_seed_snapshot = indexed_slice_seed(1, celld_fixture);
-const apply_seed_empty = indexed_slice_seed(2, empty_fixture);
-const apply_seed_no_checksum = indexed_slice_seed(3, no_checksum_fixture);
+const apply_seed_snapshot = versioned_slice_seed(false, celld_fixture);
+const apply_seed_empty = versioned_slice_seed(false, empty_fixture);
+const apply_seed_incremental = versioned_slice_seed(false, incremental_fixture);
+const apply_seed_no_checksum = versioned_slice_seed(false, no_checksum_fixture);
+const apply_seed_v2_snapshot = versioned_slice_seed(true, v2_mixed_snapshot_fixture);
+const apply_seed_v2_empty = versioned_slice_seed(true, v2_empty_fixture);
+const apply_seed_v2_incremental = versioned_slice_seed(true, v2_incremental_fixture);
+const apply_seed_v2_no_checksum = versioned_slice_seed(true, v2_no_checksum_fixture);
 const apply_corpus = [_][]const u8{
     &apply_seed_snapshot,
     &apply_seed_empty,
+    &apply_seed_incremental,
     &apply_seed_no_checksum,
+    &apply_seed_v2_snapshot,
+    &apply_seed_v2_empty,
+    &apply_seed_v2_incremental,
+    &apply_seed_v2_no_checksum,
 };
 
 test "staged apply fuzz never publishes before verification" {
@@ -985,12 +998,14 @@ test "staged apply fuzz never publishes before verification" {
 }
 
 fn fuzz_apply(_: void, smith: *std.testing.Smith) !void {
+    const version: ltx.FormatVersion = if (smith.value(bool)) .v2 else .v3;
     var input_storage: [1024]u8 = undefined;
     const input_length: usize = smith.slice(&input_storage);
     var backend = MemoryBackend{};
     seed_fuzz_position(&backend, input_storage[0..input_length]);
     var harness: ApplyHarness = undefined;
-    try harness.init(
+    try harness.init_versioned(
+        version,
         input_storage[0..input_length],
         backend.backend(),
         .replace_snapshot,
@@ -999,6 +1014,8 @@ fn fuzz_apply(_: void, smith: *std.testing.Smith) !void {
 
     const result = harness.applier.apply();
     if (result) |verified| {
+        try std.testing.expectEqual(version, verified.format_version);
+        try std.testing.expectEqual(version, backend.plan.?.format_version);
         try std.testing.expectEqual(ltx.ApplyState.published, harness.applier.current_state());
         try std.testing.expectEqual(@as(u8, 1), backend.publish_count);
         try std.testing.expectEqual(@as(u8, 0), backend.abort_count);
@@ -1156,12 +1173,12 @@ fn encode_incremental(output: *[2048]u8, initial_database: *[4 * 512]u8) !usize 
     return sink.written().len;
 }
 
-fn indexed_slice_seed(
-    comptime selector: u64,
+fn versioned_slice_seed(
+    comptime use_v2: bool,
     comptime bytes: []const u8,
 ) [12 + bytes.len]u8 {
     var seed: [12 + bytes.len]u8 = undefined;
-    std.mem.writeInt(u64, seed[0..8], selector, .little);
+    std.mem.writeInt(u64, seed[0..8], @intFromBool(use_v2), .little);
     std.mem.writeInt(u32, seed[8..12], bytes.len, .little);
     @memcpy(seed[12..], bytes);
     return seed;

@@ -583,6 +583,20 @@ test "decoder compressed-page limit applies before reading the payload" {
     try std.testing.expectEqual(ltx.DecoderState.failed, harness.decoder.current_state());
 }
 
+test "decoder rejects a valid page size above the configured limit" {
+    var fixture: [168]u8 = undefined;
+    try load_fixture("fixtures/go_v3_snapshot_zero_page.ltx", &fixture);
+    std.mem.writeInt(u32, fixture[8..12], 1024, .big);
+    var constrained = limits;
+    constrained.max_page_size = 512;
+    var harness: DecoderHarness = undefined;
+    try harness.init_with_limits(&fixture, constrained);
+
+    try std.testing.expectError(error.PageSizeLimitExceeded, harness.decoder.next());
+    try std.testing.expectEqual(ltx.DecoderState.failed, harness.decoder.current_state());
+    try std.testing.expectError(error.InvalidState, harness.decoder.next());
+}
+
 test "decoder page-index byte limit includes its size suffix" {
     var fixture: [168]u8 = undefined;
     try load_fixture("fixtures/go_v3_snapshot_zero_page.ltx", &fixture);

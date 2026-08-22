@@ -131,12 +131,13 @@ protocol used for v3; it does not retain or expose the source wire framing.
 Migration compaction carries an explicit version on every input. V2-only and
 mixed v2/v3 chains still require exact TXID continuity, enabled-checksum
 continuity, and a common checksum mode. Their only supported output is the
-current canonical v3 profile. That Zig encoder is separately byte-qualified
-against the current Go valid-output oracle; this is not a direct Go comparison
-of the exact v2 migration chain. Attempting to initialize encoding or compactor
-output as `.v2` returns `UnsupportedFormatVersion`. Celld independently informs
-v3 compaction and deployment behavior but supplies no v2 implementation or
-oracle.
+current canonical v3 profile. The optional interoperability gate regenerates
+the v0.4.0 source fixtures, emits v2-only, mixed v2/v3, and SQLite-image
+migrations with Zig, and requires their complete bytes to match independently
+constructed `FileSpec` outputs from the current Go pin. Attempting to initialize
+encoding or compactor output as `.v2` returns `UnsupportedFormatVersion`. Celld
+independently informs v3 compaction and deployment behavior but supplies no v2
+implementation or oracle.
 
 ## Compaction evidence
 
@@ -434,10 +435,18 @@ maximum-size pages around the SQLite lock page. Their SHA-256 values are:
 - `go_v2_near_lock_page`: `35a89b6af9e8f5b29377ad5e904444eb62cef5cf87ae8a512aa400b5a3058e30`
 
 These fixtures are import known answers. They do not make v2 an output target.
-Migration tests require v2-only and mixed inputs to match a canonical v3 result
-emitted by Zig; that v3 encoder is separately byte-qualified against current
-Go. This is transitive output evidence, not a direct Go comparison of the exact
-v2 migration chain. The pinned Celld corpus contains no v2 artifact.
+The optional migration gate requires v2-only and mixed inputs to produce the
+same 736-byte canonical v3 object as an independently constructed current-Go
+`FileSpec` (SHA-256
+`0a1686e10066a7df8c9e5032054e668d5afdff07ad9dae4edbeaa5f1fa4b45d3`).
+It also migrates the valid SQLite fixture to a 233-byte current v3 object
+(SHA-256
+`18cd3220519ab8c75cd6f44b8d96dc71bf8e21335c3ad4f5462adc71b53a8e4c`)
+and checks the decoded database hash with current Go. Litestream v0.5.16 is not
+used for this checksummed object because its restore path forces no-checksum
+mode while retaining the nonzero post-apply checksum; weakening the migration
+would violate the wire contract. The pinned Celld corpus contains no v2
+artifact.
 
 The current Go v3 fixtures in `tests/fixtures/` were generated with the pinned
 Go `NewEncoder`, directly or through `FileSpec.WriteTo`. The SHA-256 values of

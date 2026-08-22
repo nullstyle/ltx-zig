@@ -95,7 +95,7 @@ version selection, the pinned oracles, and the interoperability suites.
 For a tagged release, add the package to a consumer's `build.zig.zon` with:
 
 ```sh
-zig fetch --save=ltx_zig https://github.com/nullstyle/ltx-zig/archive/refs/tags/v0.1.0.tar.gz
+zig fetch --save=ltx_zig https://github.com/nullstyle/ltx-zig/archive/refs/tags/v0.2.0.tar.gz
 ```
 
 Then expose either or both public modules to the consumer root module:
@@ -256,11 +256,11 @@ valid SQLite databases.
 
 LTX v2 import and migration use `superfly/ltx` v0.4.0 at commit
 `2af9b0cb7a6eebfb59c2ca76acc4ae3adf4b6a09` as their independent wire oracle.
-Migration uses the same canonical v3 encoder whose output is separately
-byte-qualified against the current Go pin; the exact v2 migration chain is not
-presented as a new direct Go comparison. Celld is a secondary v3 reader, writer,
-and deployment reference only; its crate contains no v2 implementation or v2
-fixtures.
+The optional interoperability gate migrates v2-only, mixed v2/v3, and valid
+SQLite-image inputs, then requires their complete canonical v3 bytes to equal
+independently constructed current-Go `FileSpec` outputs. Celld is a secondary
+v3 reader, writer, and deployment reference only; its crate contains no v2
+implementation or v2 fixtures.
 
 Release qualification and CI use the official archive, and CI extracts and
 runs it only after checking its pinned SHA-256. Normal tests stay

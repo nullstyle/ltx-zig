@@ -7,17 +7,27 @@ version is zero, the Zig source API is intentionally unstable.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-22
+
 ### Added
 
 - Explicit LTX v2 import support for decoding, staged application, and
   crash-safe SQLite generation publication, anchored to `superfly/ltx` v0.4.0.
 - Per-input format selection for bounded compaction so verified v2 and v3
   transitions can be migrated into one canonical v3 output.
+- Independent current-Go byte qualification for v2-only, mixed v2/v3, and
+  SQLite-image migrations into canonical v3.
+- Structured v2/v3 apply and compactor fuzz corpora plus direct page-limit,
+  checksum-operand, and SQLite generation-overflow coverage.
 
 ### Changed
 
 - Format selection remains out of band because LTX v2 and v3 share the `LTX1`
   magic. The encoder remains v3-only; v1 remains unsupported.
+- `CompactionInput.init` now requires the trusted out-of-band format version
+  for every input; this is an intentional pre-1.0 source change.
+- The aggregate fixture gate now reproduces all committed current-Go and v2
+  oracle fixtures in addition to checking their reviewed hex mirrors.
 
 ## [0.1.0] - 2026-08-22
 

@@ -224,6 +224,23 @@ fn read_exact(file: std.Io.File, bytes: []u8, offset: u64) !void {
     try std.testing.expectEqual(bytes.len, read);
 }
 
+fn overwrite_manifest_generation(dir: std.Io.Dir, generation: u64) !void {
+    const generation_offset = 16;
+    const digest_offset = 56;
+    var bytes: [64]u8 = undefined;
+    var file = try dir.openFile(std.testing.io, sqlite.manifest_name, .{
+        .mode = .read_write,
+        .follow_symlinks = false,
+    });
+    defer file.close(std.testing.io);
+    try read_exact(file, &bytes, 0);
+    std.mem.writeInt(u64, bytes[generation_offset..][0..8], generation, .big);
+    const digest = std.hash.crc.Crc64GoIso.hash(bytes[0..digest_offset]);
+    std.mem.writeInt(u64, bytes[digest_offset..][0..8], digest, .big);
+    try file.writePositionalAll(std.testing.io, &bytes, 0);
+    try file.sync(std.testing.io);
+}
+
 fn expect_missing(dir: std.Io.Dir, name: []const u8) !void {
     _ = dir.statFile(std.testing.io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -600,6 +617,42 @@ test "publish outside staging records invalid state" {
     try std.testing.expectEqual(sqlite.Failure.invalid_state, store.last_failure());
     try std.testing.expectEqual(null, try store.current());
     try std.testing.expectEqual(sqlite.Failure.none, store.last_failure());
+}
+
+test "publication generation overflow preserves the authoritative manifest" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var gate: Gate = .{};
+    var workspace: [31]u8 = undefined;
+    var store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &workspace,
+        gate.lifecycle(),
+        .{},
+    );
+    const first = try publish_empty_generation(&store, 1);
+    try overwrite_manifest_generation(temporary.dir, std.math.maxInt(u64));
+    var saturated = first;
+    saturated.generation = std.math.maxInt(u64);
+    try std.testing.expectEqual(saturated, (try store.current()).?);
+
+    const header = make_header(2, 2, 0);
+    const expected = try begin(&store, make_plan(.contiguous, header));
+    try std.testing.expectError(
+        error.ApplyPublishFailure,
+        publish(&store, expected, make_verified(header)),
+    );
+    try std.testing.expectEqual(sqlite.Failure.generation_overflow, store.last_failure());
+    try std.testing.expectEqual(sqlite.StoreState.staging, store.current_state());
+    try std.testing.expect(gate.held);
+    abort(&store);
+
+    try std.testing.expectEqual(sqlite.StoreState.idle, store.current_state());
+    try std.testing.expect(!gate.held);
+    try std.testing.expectEqual(gate.quiesce_count, gate.release_count);
+    try expect_missing(temporary.dir, sqlite.manifest_temporary_name);
+    try std.testing.expectEqual(saturated, (try store.current()).?);
 }
 
 test "recovery durably initializes a pristine store" {
@@ -1164,6 +1217,47 @@ test "generation access returns null for empty state and unwinds for reuse" {
         try store.acquire_generation(&access_storage, &access_workspace),
     );
     try std.testing.expectEqual(gate.quiesce_count, gate.release_count);
+}
+
+test "generation access epoch reaches max then overflows without retaining a lock" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var gate: Gate = .{};
+    var copy_workspace: [31]u8 = undefined;
+    var store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &copy_workspace,
+        gate.lifecycle(),
+        .{},
+    );
+    const current = try publish_empty_generation(&store, 1);
+    var access_storage = sqlite.GenerationAccessStorage{
+        .epoch = std.math.maxInt(u64) - 1,
+    };
+    var access_workspace: sqlite.GenerationAccessWorkspace = .{};
+    var access = (try store.acquire_generation(&access_storage, &access_workspace)).?;
+    try std.testing.expectEqual(current, try access.current());
+    try access.release();
+    try std.testing.expectEqual(std.math.maxInt(u64), access_storage.epoch);
+
+    try std.testing.expectError(
+        error.GenerationOverflow,
+        store.acquire_generation(&access_storage, &access_workspace),
+    );
+    try std.testing.expectEqual(sqlite.Failure.generation_overflow, store.last_failure());
+    try std.testing.expectEqual(std.math.maxInt(u64), access_storage.epoch);
+
+    const next_header = make_header(2, 2, 0);
+    _ = try begin(&store, make_plan(.contiguous, next_header));
+    abort(&store);
+    try std.testing.expectEqual(gate.quiesce_count, gate.release_count);
+
+    var fresh_storage: sqlite.GenerationAccessStorage = .{};
+    var fresh_workspace: sqlite.GenerationAccessWorkspace = .{};
+    var fresh = (try store.acquire_generation(&fresh_storage, &fresh_workspace)).?;
+    try std.testing.expectEqual(current, try fresh.current());
+    try fresh.release();
 }
 
 test "generation access rejects an absolute slot path beyond the OS bound" {

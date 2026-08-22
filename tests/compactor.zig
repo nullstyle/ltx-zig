@@ -29,6 +29,7 @@ const compaction_limits = ltx.CompactionLimits{
 
 const current_snapshot_fixture = @embedFile("fixtures/go_v3_snapshot_zero_page.ltx");
 const legacy_snapshot_fixture = @embedFile("fixtures/go_v3_legacy_unflagged.ltx");
+const legacy_mixed_snapshot_fixture = @embedFile("fixtures/go_v3_legacy_mixed.ltx");
 const v2_mixed_snapshot_fixture = @embedFile("fixtures/go_v2_mixed_snapshot.ltx");
 const v2_incremental_fixture = @embedFile("fixtures/go_v2_incremental.ltx");
 
@@ -735,40 +736,56 @@ test "legacy and current page frames compact into current canonical frames" {
     try std.testing.expectEqual(ltx.page_header_flag_size, decoded.page_flags[0]);
 }
 
-const compactor_fuzz_seed_valid = indexed_slice_seed(0, current_snapshot_fixture);
-const compactor_fuzz_seed_split = indexed_slice_seed(1, current_snapshot_fixture);
-const compactor_fuzz_seed_malformed = indexed_slice_seed(2, "not an ltx stream");
+const compactor_fuzz_seed_current = compactor_single_seed(false, current_snapshot_fixture);
+const compactor_fuzz_seed_v2 = compactor_single_seed(true, v2_mixed_snapshot_fixture);
+const compactor_fuzz_seed_v2_chain = compactor_pair_seed(
+    true,
+    v2_mixed_snapshot_fixture,
+    true,
+    v2_incremental_fixture,
+);
+const compactor_fuzz_seed_mixed = compactor_pair_seed(
+    false,
+    legacy_mixed_snapshot_fixture,
+    true,
+    v2_incremental_fixture,
+);
+const compactor_fuzz_seed_malformed = compactor_single_seed(false, "not an ltx stream");
 const compactor_fuzz_corpus = [_][]const u8{
-    &compactor_fuzz_seed_valid,
-    &compactor_fuzz_seed_split,
+    &compactor_fuzz_seed_current,
+    &compactor_fuzz_seed_v2,
+    &compactor_fuzz_seed_v2_chain,
+    &compactor_fuzz_seed_mixed,
     &compactor_fuzz_seed_malformed,
 };
 
-test "bounded compactor fuzz inputs terminate in one terminal state" {
+test "bounded v2 and v3 compactor fuzz inputs terminate in one terminal state" {
     try std.testing.fuzz({}, fuzz_compactor, .{ .corpus = &compactor_fuzz_corpus });
 }
 
 fn fuzz_compactor(_: void, smith: *std.testing.Smith) !void {
-    const mode = smith.valueRangeAtMost(u8, 0, 2);
-    var input_bytes: [1024]u8 = undefined;
-    const input_length = smith.slice(&input_bytes);
-    const split = input_length / 2;
-    const one_file = [_][]const u8{input_bytes[0..input_length]};
-    const two_files = [_][]const u8{
-        input_bytes[0..split],
-        input_bytes[split..input_length],
-    };
-    if (mode == 0) {
-        try expect_fuzz_terminal(&one_file);
-    } else {
-        try expect_fuzz_terminal(&two_files);
+    const input_count: usize = smith.valueRangeAtMost(u8, 1, 2);
+    var input_storage: [2][1024]u8 = undefined;
+    var files: [2][]const u8 = undefined;
+    var versions: [2]ltx.FormatVersion = undefined;
+    for (0..input_count) |index| {
+        versions[index] = if (smith.value(bool)) .v2 else .v3;
+        const input_length: usize = smith.slice(&input_storage[index]);
+        files[index] = input_storage[index][0..input_length];
     }
+    try expect_fuzz_terminal(files[0..input_count], versions[0..input_count]);
 }
 
-fn expect_fuzz_terminal(files: []const []const u8) !void {
+fn expect_fuzz_terminal(
+    files: []const []const u8,
+    versions: []const ltx.FormatVersion,
+) !void {
+    if (files.len != versions.len or files.len > max_inputs) return error.InvalidTestInput;
     var input_workspaces: [max_inputs]InputWorkspace = undefined;
     var inputs: [max_inputs]ltx.CompactionInput = undefined;
-    for (files, 0..) |bytes, index| inputs[index] = input_workspaces[index].input(bytes);
+    for (files, versions, 0..) |bytes, version, index| {
+        inputs[index] = input_workspaces[index].input_versioned(version, bytes);
+    }
     var output: [max_output_bytes]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
     var compressed: [max_compressed_bytes]u8 = undefined;
@@ -787,9 +804,13 @@ fn expect_fuzz_terminal(files: []const []const u8) !void {
     const verified = compactor.compact() catch {
         try std.testing.expectEqual(ltx.CompactorState.failed, compactor.current_state());
         try std.testing.expectError(error.InvalidState, compactor.compact());
+        try std.testing.expect(sink.written().len <= max_output_bytes);
+        if (sink.written().len != 0) try expect_not_verified(sink.written());
         return;
     };
     try std.testing.expectEqual(ltx.CompactorState.finished, compactor.current_state());
+    try std.testing.expectEqual(ltx.FormatVersion.v3, verified.format_version);
+    try std.testing.expect(sink.written().len <= max_output_bytes);
     const decoded = try decode_file(sink.written());
     try std.testing.expectEqualDeep(verified, decoded.verified);
     try std.testing.expectError(error.InvalidState, compactor.compact());
@@ -1098,13 +1119,37 @@ fn make_failure_pair(kind: FailurePairKind) !FailurePair {
     return pair;
 }
 
-fn indexed_slice_seed(
-    comptime selector: u64,
+fn compactor_single_seed(
+    comptime use_v2: bool,
     comptime bytes: []const u8,
-) [12 + bytes.len]u8 {
-    var result: [12 + bytes.len]u8 = undefined;
-    std.mem.writeInt(u64, result[0..8], selector, .little);
-    std.mem.writeInt(u32, result[8..12], bytes.len, .little);
-    @memcpy(result[12..], bytes);
+) [20 + bytes.len]u8 {
+    var result: [20 + bytes.len]u8 = undefined;
+    std.mem.writeInt(u64, result[0..8], 1, .little);
+    std.mem.writeInt(u64, result[8..16], @intFromBool(use_v2), .little);
+    std.mem.writeInt(u32, result[16..20], bytes.len, .little);
+    @memcpy(result[20..], bytes);
+    return result;
+}
+
+fn compactor_pair_seed(
+    comptime first_v2: bool,
+    comptime first: []const u8,
+    comptime second_v2: bool,
+    comptime second: []const u8,
+) [32 + first.len + second.len]u8 {
+    var result: [32 + first.len + second.len]u8 = undefined;
+    std.mem.writeInt(u64, result[0..8], 2, .little);
+    std.mem.writeInt(u64, result[8..16], @intFromBool(first_v2), .little);
+    std.mem.writeInt(u32, result[16..20], first.len, .little);
+    @memcpy(result[20..][0..first.len], first);
+    const second_offset = 20 + first.len;
+    std.mem.writeInt(
+        u64,
+        result[second_offset..][0..8],
+        @intFromBool(second_v2),
+        .little,
+    );
+    std.mem.writeInt(u32, result[second_offset + 8 ..][0..4], second.len, .little);
+    @memcpy(result[second_offset + 12 ..], second);
     return result;
 }
