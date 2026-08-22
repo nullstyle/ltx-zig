@@ -28,6 +28,98 @@ const celld_fixture = @embedFile("fixtures/celld_v052_two_page_snapshot.ltx");
 const empty_fixture = @embedFile("fixtures/go_v3_empty_snapshot.ltx");
 const no_checksum_fixture = @embedFile("fixtures/go_v3_no_checksum.ltx");
 
+const CelldLitestreamCapture = struct {
+    bytes: []const u8,
+    artifact_sha256: []const u8,
+    database_sha256: []const u8,
+    timestamp_ms: i64,
+    wal_size: i64,
+    wal_salt_1: u32,
+    wal_salt_2: u32,
+    file_checksum: u64,
+};
+
+const celld_litestream_captures = [_]CelldLitestreamCapture{
+    .{
+        .bytes = @embedFile(
+            "fixtures/celld_litestream_v0511/replica/ltx/0/" ++
+                "0000000000000001-0000000000000001.ltx",
+        ),
+        .artifact_sha256 = "7c94a5482497ffe04fea81e595a714496526d886a0771e1747427509a3dcc7d4",
+        .database_sha256 = "75950c90007de1e7ee56e22ddf9d6d89d32eb12842f6deb0c9f623bfe086261b",
+        .timestamp_ms = 1_780_109_201_091,
+        .wal_size = 16_480,
+        .wal_salt_1 = 0xd3d4_9fd8,
+        .wal_salt_2 = 0x8fd4_7bf0,
+        .file_checksum = 0xc32b_58ca_29a2_beac,
+    },
+    .{
+        .bytes = @embedFile(
+            "fixtures/celld_litestream_v0511/replica/ltx/0/" ++
+                "0000000000000002-0000000000000002.ltx",
+        ),
+        .artifact_sha256 = "b51b20e62a6bee6a73f699edcdc029a148eb5b4dcc1293f279fa4b2f8f6af87a",
+        .database_sha256 = "91c4e7cd5d2d5bc3ae85530719aabf3085fde037a9c0beb61b624dc8bc191f30",
+        .timestamp_ms = 1_780_109_201_246,
+        .wal_size = 4_120,
+        .wal_salt_1 = 0x2d53_7b0a,
+        .wal_salt_2 = 0xede7_c119,
+        .file_checksum = 0x90eb_8841_39e4_9ce1,
+    },
+    .{
+        .bytes = @embedFile(
+            "fixtures/celld_litestream_v0511/replica/ltx/0/" ++
+                "0000000000000003-0000000000000003.ltx",
+        ),
+        .artifact_sha256 = "21d8ee050b708671d0ec81951b5233dc7377ef3714e073671c7a76179f9e64d8",
+        .database_sha256 = "f48d034fb60ca741f268b5ec52305f97c8cec1cbbbcc8064006094d0b81967af",
+        .timestamp_ms = 1_780_109_201_278,
+        .wal_size = 4_120,
+        .wal_salt_1 = 0x8514_499d,
+        .wal_salt_2 = 0x5448_ecf6,
+        .file_checksum = 0xfbd7_4afa_05ab_48aa,
+    },
+    .{
+        .bytes = @embedFile(
+            "fixtures/celld_litestream_v0511/replica/ltx/0/" ++
+                "0000000000000004-0000000000000004.ltx",
+        ),
+        .artifact_sha256 = "e07ac074da97eba4f589ecb12f2b5ca4d2f75961b129b37383180acaae3dbf58",
+        .database_sha256 = "27d2e8ad59731445c4798eec1c76146e85bd931383728d89fbd96f91d97b0f6a",
+        .timestamp_ms = 1_780_109_201_308,
+        .wal_size = 4_120,
+        .wal_salt_1 = 0x367c_5406,
+        .wal_salt_2 = 0x20b2_488b,
+        .file_checksum = 0xa96f_7117_e2df_5699,
+    },
+    .{
+        .bytes = @embedFile(
+            "fixtures/celld_litestream_v0511/replica/ltx/0/" ++
+                "0000000000000005-0000000000000005.ltx",
+        ),
+        .artifact_sha256 = "3a7df36075b697884c3bc7e20a42449bb8a7479e2ef6e8152e2f724a955a8a36",
+        .database_sha256 = "a7e0ac305a281beb14c07d8ecce95e7a81369dfaa9f2c67bd168c016c8408261",
+        .timestamp_ms = 1_780_109_201_339,
+        .wal_size = 4_120,
+        .wal_salt_1 = 0xbeef_8709,
+        .wal_salt_2 = 0xa732_4451,
+        .file_checksum = 0xb45c_5913_6317_01de,
+    },
+    .{
+        .bytes = @embedFile(
+            "fixtures/celld_litestream_v0511/replica/ltx/0/" ++
+                "0000000000000006-0000000000000006.ltx",
+        ),
+        .artifact_sha256 = "63ae1bd243decb488f8a704afd3c5cc726ff05efa70d4b53d960a49fe9f5a2bd",
+        .database_sha256 = "ee705e74c9788b64f5dc63b9c3dc028ae05aae34f240bad1362d9436c65150e0",
+        .timestamp_ms = 1_780_109_201_370,
+        .wal_size = 4_120,
+        .wal_salt_1 = 0x0b0b_91fc,
+        .wal_salt_2 = 0x79df_829a,
+        .file_checksum = 0xbc73_6f92_bff4_6d6a,
+    },
+};
+
 const BackendFailure = enum {
     none,
     begin,
@@ -73,7 +165,7 @@ const MemoryBackend = struct {
     publish_count: u8 = 0,
     abort_count: u8 = 0,
     call_count: u8 = 0,
-    calls: [32]BackendCall = @splat(.begin),
+    calls: [64]BackendCall = @splat(.begin),
 
     const zero_position = ltx.Position{
         .txid = .init(0),
@@ -281,6 +373,56 @@ const ApplyHarness = struct {
         );
     }
 };
+
+test "real Litestream v0.5.11 capture chain reconstructs each Celld golden database" {
+    var backend = MemoryBackend{};
+    for (celld_litestream_captures, 0..) |capture, index| {
+        try expect_sha256(capture.bytes, capture.artifact_sha256);
+        try std.testing.expectEqualSlices(
+            u8,
+            "\x00\x00\x00\x01\x00\x00\x04\x22\x4d\x18",
+            capture.bytes[ltx.header_size .. ltx.header_size + 10],
+        );
+
+        var harness: ApplyHarness = undefined;
+        const mode: ltx.ApplyMode = if (index == 0) .replace_snapshot else .contiguous;
+        try harness.init(capture.bytes, backend.backend(), mode, apply_limits);
+        const verified = try harness.applier.apply();
+        const txid: u64 = @intCast(index + 1);
+
+        try std.testing.expectEqual(ltx.FormatVersion.v3, verified.format_version);
+        try std.testing.expectEqual(ltx.header_flag_no_checksum, verified.header.flags);
+        try std.testing.expectEqual(@as(u32, 4096), verified.header.page_size);
+        try std.testing.expectEqual(@as(u32, 5), verified.header.commit);
+        try std.testing.expectEqual(txid, verified.header.min_txid.value);
+        try std.testing.expectEqual(txid, verified.header.max_txid.value);
+        try std.testing.expectEqual(capture.timestamp_ms, verified.header.timestamp_ms);
+        try std.testing.expectEqual(@as(u64, 0), verified.header.pre_apply_checksum.value);
+        try std.testing.expectEqual(@as(i64, 32), verified.header.wal_offset);
+        try std.testing.expectEqual(capture.wal_size, verified.header.wal_size);
+        try std.testing.expectEqual(capture.wal_salt_1, verified.header.wal_salt_1);
+        try std.testing.expectEqual(capture.wal_salt_2, verified.header.wal_salt_2);
+        try std.testing.expectEqual(@as(u64, 0), verified.header.node_id);
+        try std.testing.expectEqual(@as(u64, 0), verified.trailer.post_apply_checksum.value);
+        try std.testing.expectEqual(capture.file_checksum, verified.trailer.file_checksum.value);
+        try std.testing.expectEqual(@as(u32, 5), verified.page_count);
+        try std.testing.expectEqual(@as(u64, @intCast(capture.bytes.len)), verified.byte_count);
+
+        try std.testing.expectEqual(@as(usize, 5 * 4096), backend.published_length_bytes);
+        try expect_sha256(
+            backend.published[0..backend.published_length_bytes],
+            capture.database_sha256,
+        );
+        try std.testing.expectEqual(txid, backend.position.txid.value);
+        try std.testing.expectEqual(@as(u64, 0), backend.position.post_apply_checksum.value);
+        try std.testing.expectEqual(@as(?u32, 4096), backend.page_size);
+        try std.testing.expectEqual(@as(u8, @intCast(index + 1)), backend.publish_count);
+        try std.testing.expectEqual(@as(u8, 0), backend.read_count);
+        try std.testing.expectEqual(@as(u8, 0), backend.abort_count);
+    }
+
+    try expect_counts(&backend, 6, 30, 0, 6, 0);
+}
 
 test "verified Celld snapshot replaces privately and publishes copied pages once" {
     var backend = MemoryBackend{};
@@ -833,6 +975,16 @@ fn seed_fuzz_position(backend: *MemoryBackend, input: []const u8) void {
         .txid = .init(min_txid - 1),
         .post_apply_checksum = .init(std.mem.readInt(u64, input[40..48], .big)),
     };
+}
+
+fn expect_sha256(input: []const u8, expected_hex: []const u8) !void {
+    var expected: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    if (expected_hex.len != expected.len * 2) return error.InvalidTestHash;
+    const decoded = try std.fmt.hexToBytes(&expected, expected_hex);
+    if (decoded.len != expected.len) return error.InvalidTestHash;
+    var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(input, &actual, .{});
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
 }
 
 fn expect_counts(

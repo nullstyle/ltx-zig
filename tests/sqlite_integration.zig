@@ -85,6 +85,50 @@ const codec_limits = ltx.Limits{
     .max_transaction_span = 1,
 };
 
+const captured_codec_limits = ltx.Limits{
+    .max_input_bytes = 4096,
+    .max_output_bytes = 8 * 4096,
+    .max_pages = 8,
+    .max_page_size = 4096,
+    .max_compressed_page_size = 4200,
+    .max_page_index_bytes = 4096,
+    .max_page_index_entries = 8,
+    .max_varint_bytes = 10,
+    .max_transaction_span = 1,
+};
+
+const captured_apply_limits = ltx.ApplyLimits{
+    .max_database_pages = 8,
+    .max_database_bytes = 8 * 4096,
+};
+
+const celld_litestream_captures = [_][]const u8{
+    @embedFile(
+        "fixtures/celld_litestream_v0511/replica/ltx/0/" ++
+            "0000000000000001-0000000000000001.ltx",
+    ),
+    @embedFile(
+        "fixtures/celld_litestream_v0511/replica/ltx/0/" ++
+            "0000000000000002-0000000000000002.ltx",
+    ),
+    @embedFile(
+        "fixtures/celld_litestream_v0511/replica/ltx/0/" ++
+            "0000000000000003-0000000000000003.ltx",
+    ),
+    @embedFile(
+        "fixtures/celld_litestream_v0511/replica/ltx/0/" ++
+            "0000000000000004-0000000000000004.ltx",
+    ),
+    @embedFile(
+        "fixtures/celld_litestream_v0511/replica/ltx/0/" ++
+            "0000000000000005-0000000000000005.ltx",
+    ),
+    @embedFile(
+        "fixtures/celld_litestream_v0511/replica/ltx/0/" ++
+            "0000000000000006-0000000000000006.ltx",
+    ),
+};
+
 const DatabaseImage = struct {
     bytes: [max_database_bytes]u8 = undefined,
     length_bytes: u32 = 0,
@@ -394,6 +438,49 @@ test "real SQLite checksummed incrementals grow and shrink generations" {
         encoded_bytes[0..encoded_c.length_bytes],
         encoded_c,
     );
+}
+
+test "real Litestream capture chain publishes the expected SQLite database" {
+    try std.testing.expect(sqlite3_libversion_number() >= 3_022_000);
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+
+    var lifecycle: ManagedLifecycle = .{};
+    defer lifecycle.close() catch {};
+    var copy_workspace: [4096]u8 = undefined;
+    var store = try sqlite_store.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &copy_workspace,
+        lifecycle.lifecycle(),
+        .{},
+    );
+    for (celld_litestream_captures, 0..) |capture, index| {
+        const mode: ltx.ApplyMode = if (index == 0) .replace_snapshot else .contiguous;
+        const verified = try apply_captured(&store, capture, mode);
+        try std.testing.expectEqual(@as(u64, @intCast(index + 1)), verified.header.max_txid.value);
+        try std.testing.expectEqual(@as(u64, 0), verified.trailer.post_apply_checksum.value);
+    }
+
+    var access_storage: sqlite_store.GenerationAccessStorage = .{};
+    var access_workspace: sqlite_store.GenerationAccessWorkspace = .{};
+    const current = try lifecycle.open_generation(
+        &store,
+        &access_storage,
+        &access_workspace,
+    );
+    try std.testing.expectEqual(@as(u64, 6), current.position.txid.value);
+    try std.testing.expectEqual(@as(u64, 0), current.position.post_apply_checksum.value);
+    const database = lifecycle.database orelse return error.ExpectedGeneration;
+    try expect_integer_query(database, "SELECT count(*) FROM kv", 8);
+    try expect_text_query(database, "SELECT v FROM kv WHERE k='a'", "upd5");
+    try expect_text_query(
+        database,
+        "SELECT group_concat(k || '=' || v, ',') FROM (SELECT k, v FROM kv ORDER BY k)",
+        "a=upd5,b=2,c=3,k1=v1,k2=v2,k3=v3,k4=v4,k5=v5",
+    );
+    try expect_text_query(database, "PRAGMA integrity_check", "ok");
+    try lifecycle.close();
 }
 
 test "real SQLite images recover atomically across publication process crashes" {
@@ -1311,6 +1398,29 @@ fn apply_encoded(
             .max_database_pages = max_pages,
             .max_database_bytes = max_database_bytes,
         },
+        mode,
+        source.reader(),
+        store.backend(),
+        &page_workspace,
+        &compressed_workspace,
+        &index_workspace,
+    );
+    return applier.apply();
+}
+
+fn apply_captured(
+    store: *sqlite_store.Store,
+    encoded: []const u8,
+    mode: ltx.ApplyMode,
+) !ltx.VerifiedLTX {
+    var source = ltx.SliceReader.init(encoded);
+    var page_workspace: [4096]u8 = undefined;
+    var compressed_workspace: [4200]u8 = undefined;
+    var index_workspace: [8]ltx.PageIndexEntry = undefined;
+    var applier = try ltx.StagedApplier.init(
+        .v3,
+        captured_codec_limits,
+        captured_apply_limits,
         mode,
         source.reader(),
         store.backend(),

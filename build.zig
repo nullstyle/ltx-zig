@@ -270,6 +270,9 @@ pub fn build(b: *std.Build) void {
     const run_release_check = b.addRunArtifact(release_check);
     run_release_check.addFileArg(b.path("build.zig.zon"));
     run_release_check.addFileArg(b.path("CHANGELOG.md"));
+    run_release_check.addFileArg(b.path("LICENSE"));
+    run_release_check.addFileArg(b.path("LICENSE.pierrec-lz4"));
+    run_release_check.addFileArg(b.path("LICENSE.celld-litestream-apache-2.0"));
     if (b.option([]const u8, "release-tag", "Release tag expected for package version")) |tag| {
         run_release_check.addArg(tag);
     }

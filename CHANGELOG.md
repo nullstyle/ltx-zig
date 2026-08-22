@@ -25,7 +25,10 @@ All notable changes to this project are documented here. The format follows
   recovery qualification over real database images.
 - Pinned Go and Celld interoperability fixtures, mutation and fuzz suites, and
   byte-for-byte Go-oracle compaction checks.
-- MIT licensing with the required separate BSD-3-Clause LZ4 attribution.
+- An immutable real-Litestream v0.5.11 six-transition capture chain with exact
+  artifact and restored-image hashes plus final read-only SQLite qualification.
+- MIT licensing with the required separate BSD-3-Clause LZ4 and Apache-2.0
+  Celld/Litestream attributions.
 
 ### Changed
 

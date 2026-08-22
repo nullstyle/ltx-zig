@@ -10,7 +10,8 @@ authority.
 2. Set `.version` in `build.zig.zon`, add the matching version section to
    `CHANGELOG.md`, and update versioned command examples in `README.md` and this
    checklist.
-3. Review `LICENSE` and `LICENSE.pierrec-lz4`; both notices must remain in the
+3. Review `LICENSE`, `LICENSE.pierrec-lz4`, and
+   `LICENSE.celld-litestream-apache-2.0`; all notices must remain in the
    package.
 4. Validate the intended tag, including its leading `v`:
 
@@ -19,7 +20,8 @@ authority.
    ```
 
 The release checker rejects a malformed package version, a missing changelog
-section, and any tag other than `v${package_version}`.
+section, any tag other than `v${package_version}`, a missing license package
+path, or a changed license notice digest.
 
 ## Run the local gates
 

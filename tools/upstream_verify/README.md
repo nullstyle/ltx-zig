@@ -52,3 +52,9 @@ After reviewing changes to the hex mirrors, regenerate all directly consumable
 binary fixtures with `mise exec -- zig build materialize-fixtures`. Confirm the
 committed pairs without modifying them with `mise exec -- zig build
 check-fixtures`.
+
+The materializer also covers the nested
+`tests/fixtures/celld_litestream_v0511/replica/ltx/0` corpus. Those six files
+were captured by the real Litestream v0.5.11 binary and copied from the pinned
+Celld golden tree; no local generator is an authority for their contents.
+Their provenance and hashes are documented in that fixture directory.

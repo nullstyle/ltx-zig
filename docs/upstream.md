@@ -13,6 +13,8 @@ exact revisions:
   `ceabe1fe1b3076094805244ee6a3acff4d43d1e8`
 - [`denoland/celld` LTX crate](https://github.com/denoland/celld/tree/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx):
   `89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9`
+- [`benbjohnson/litestream` v0.5.11](https://github.com/benbjohnson/litestream/tree/016c368704e63db0088b9b61e2e96c0019f11832):
+  `016c368704e63db0088b9b61e2e96c0019f11832`
 - [`pierrec/lz4` v4.1.23](https://github.com/pierrec/lz4/tree/cd9d7a4f66405a92f4881933816b828b0f7d5fe2):
   `cd9d7a4f66405a92f4881933816b828b0f7d5fe2`
 - [SQLite 3.53.4 source mirror](https://github.com/sqlite/sqlite/tree/b09c88c14082339b66c7b7158d609a771e64ca69):
@@ -50,14 +52,18 @@ whole-block LZ4 framing, and no page index.
 For `denoland/celld`: `crates/ltx/README.md`, `Cargo.toml`,
 `reference/ltx-format.md`, `src/codec.rs`, `src/ltx.rs`, `src/lz4_block.rs`,
 `src/compactor.rs`, `src/replica_compactor.rs`, `src/replica.rs`,
-`src/faults_inject.rs`, and `tests/differential_xtool.rs`. Celld is a secondary
-interoperability and deployment reference, not the valid-output oracle. Its
-crate pins Go LTX v0.5.2 and provides a byte-exact port of Go's block compressor
-plus a dual reader for current flagged raw blocks and legacy unflagged LZ4
-frames. It also validates exact decompressed length, the declared index size,
-and the trailer. Its `Vec`, `BTreeMap`, `HashMap`, and read-to-end design is
-intentionally not a memory model for this allocation-free Zig core, and it does
-not perform Zig's exact one-to-one index/frame cross-check.
+`src/faults_inject.rs`, `tests/differential_xtool.rs`, the golden-fixture
+manifest and capture script, the low-level reader assertions, and the
+file-restore integration test. Celld's writer remains a secondary
+interoperability and deployment reference rather than the valid-output oracle.
+Its immutable golden replica is separately a real-Litestream reader oracle.
+The crate pins Go LTX v0.5.2 and provides a byte-exact port of Go's block
+compressor plus a dual reader for current flagged raw blocks and legacy
+unflagged LZ4 frames. It also validates exact decompressed length, the declared
+index size, and the trailer. Its `Vec`, `BTreeMap`, `HashMap`, and
+read-to-end design is intentionally not a memory model for this
+allocation-free Zig core, and it does not perform Zig's exact one-to-one
+index/frame cross-check.
 
 For raw-block compression: the current Go oracle pins
 `github.com/pierrec/lz4/v4 v4.1.23` with module content hash
@@ -143,6 +149,46 @@ and its restore path does not define coordination with open SQLite connections,
 WAL files, or SHM files. The Zig backend contract additionally requires the
 authoritative position check, complete image publication, and position advance
 to be atomic.
+
+## Real Litestream capture evidence
+
+Celld's immutable
+[golden manifest](https://github.com/denoland/celld/blob/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx/tests/fixtures/golden/MANIFEST.md)
+records a replica tree produced by `litestream replicate -once` using
+Litestream v0.5.11 from commit
+`016c368704e63db0088b9b61e2e96c0019f11832` and SQLite 3.51.0. Its
+[capture script](https://github.com/denoland/celld/blob/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx/scripts/capture-golden.sh)
+creates a WAL-mode `kv` table, captures a snapshot, then flushes five distinct
+insert/update transactions into five more L0 files. The script restores the
+full tree with the real Litestream binary and requires logical equality with
+the source database.
+
+The six exact L0 files under
+`tests/fixtures/celld_litestream_v0511/replica/ltx/0/` are copied from that
+pinned tree. Each uses LTX v3, 4096-byte pages, no database checksums, nonzero
+WAL size and salts, and legacy unflagged LZ4 frames. The first is a snapshot at
+TXID 1; the remaining files are single-transaction incrementals through TXID 6.
+The hermetic staged-apply test pins each artifact SHA-256, every header and
+trailer value, and the exact database-image SHA-256 after each prefix. The host
+SQLite integration test publishes the same chain through the generation store,
+opens the final image using a typed immutable read-only lease, verifies the
+expected eight rows, and runs `PRAGMA integrity_check`.
+
+For the import qualification, every prefix was also restored independently
+with the checksum-verified official
+[Litestream v0.5.11 release](https://github.com/benbjohnson/litestream/releases/tag/v0.5.11);
+all six output hashes matched the committed known answers. This external oracle
+run is intentionally not part of normal CI.
+
+Celld's
+[reader assertions](https://github.com/denoland/celld/blob/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx/src/ltx.rs#L578-L614)
+and
+[file restore test](https://github.com/denoland/celld/blob/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx/tests/integration_file.rs#L271-L315)
+provide upstream context for the same corpus. This evidence qualifies reader
+and apply compatibility with a real capture; it does not turn the normal test
+suite into a Litestream build, validate live follow mode, or replace the
+separate checked-current-writer, sparse-transition, growth, shrink, and
+crash-publication tests.
 
 ## SQLite publication evidence
 
@@ -284,6 +330,15 @@ binary artifacts are:
 - legacy unflagged fixture: `cebdc979fea5b00f51eacdcdeef579f6b87a5b5fb901f4fb952d857eef19da1f`
 - legacy mixed fixture: `42c81f74ae54b11cf22768223b99a6c2f271e06559ccb619bc8b553533fcb2c5`
 - `celld_v052_two_page_snapshot`: `b7c4c3d21a1c009c297934723f737199cbe392164a95f05a2a3763dda059eecb`
+
+The real Litestream capture's six artifact hashes and six prefix database-image
+hashes are catalogued beside the corpus in
+[`tests/fixtures/celld_litestream_v0511/README.md`](../tests/fixtures/celld_litestream_v0511/README.md).
+Those files are immutable captured input, not output from either local fixture
+generator. The binaries are mechanically materializable from reviewed hex
+mirrors, and CI's separate `check-fixtures` gate requires every pair to match.
+Normal tests directly embed the checked-in binaries and never build or invoke
+Litestream.
 
 The 211-byte Celld vector is copied from the pinned crate's byte-exact
 compressor test, where it is asserted equal to Go LTX v0.5.2

@@ -48,6 +48,16 @@ The Zig encoder also reproduces the complete
 snapshot equality test, this pins match selection and compressor state reset
 independently of Zig's decoder.
 
+## Real Litestream capture chain
+
+`celld_litestream_v0511/` contains the six-file L0 replica chain captured by
+the pinned Celld tree using the real Litestream v0.5.11 binary and SQLite
+3.51.0. The snapshot and five contiguous incrementals are immutable upstream
+reader fixtures, not output synthesized by this project. Their complete
+provenance, artifact and database-image hashes, semantic final state, scope,
+and Apache-2.0 attribution are in the
+[capture manifest](celld_litestream_v0511/README.md).
+
 ## Malformed corpus
 
 `tests/malformed.zig` derives malformed checksum, truncated-header,

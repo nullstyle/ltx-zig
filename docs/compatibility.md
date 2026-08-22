@@ -9,6 +9,7 @@ check is manual; pinned upstream vectors are identified in the evidence.
 | Explicit format selection | Tested | `.v3` succeeds; v2 returns `UnsupportedFormatVersion` |
 | Decode current Go output | Tested | Byte-exact snapshot, incremental, no-checksum, maximum-page, and near-lock fixtures |
 | Decode Celld/Go v0.5.2 vector | Tested | Pinned byte-exact two-page, multi-index-entry fixture |
+| Real Litestream capture chain | Tested | Immutable v0.5.11 L0 snapshot plus five incrementals from Celld; exact artifact and per-prefix database hashes, nonzero WAL metadata, legacy frames, and final SQLite integrity/row checks |
 | Go decodes Zig output | Tested | Optional `zig build interop` uses the exact pinned Go module for a fresh snapshot plus byte-exact compaction outputs for checked merge, checked deletion, and a no-checksum chain |
 | Flagged raw LZ4 block frames | Tested | Zig reproduces complete pinned Go and Celld match-compressed files byte for byte |
 | Normal compressed matches | Tested | Exact pierrec/Celld vectors cover overlap, extension lengths, workspace reset, and 512..65536-byte pages |
@@ -25,7 +26,7 @@ check is manual; pinned upstream vectors are identified in the evidence.
 | Decoder and compactor fuzzing | Tested | Checked-in valid corpus, deterministic mutations, bounded termination, exact error/state checks, contiguous-versus-short-read equivalence, and terminal compactor states |
 | Raw LZ4 fuzzing | Tested | Guarded decoder outputs through 65,536 bytes; deterministic fast and literal encoders round trip dirty-workspace inputs through 4,096 bytes |
 | Position contiguity | Tested | Exact TXID and enabled-checksum equality |
-| Staged apply orchestration | Tested | Private staging, explicit transition modes, page-size compatibility, full-image checksum verification, abort-on-error, and atomic publish contract |
+| Staged apply orchestration | Tested | Private staging, explicit transition modes, page-size compatibility, full-image checksum verification, abort-on-error, atomic publish contract, and exact reconstruction of all six real Litestream capture prefixes |
 | Compaction | Tested | Allocation-free oldest-to-newest merge; current and legacy inputs, exact TXID/checksum continuity, consistent checksum mode, newest-page precedence, final-commit shrink and deletion, zeroed source metadata, caller bounds, partial-output rejection, and pinned-Go byte equality |
 | Quiescent SQLite generation store | Tested | Optional `ltx_sqlite`; durable empty baseline, host-owned connection gate, canonical immutable read-only URI, sidecar rejection, exclusive indeterminate recovery, retained and stale-epoch lease qualification, and SQLite-produced checksummed A-to-B-to-C crash replay at every publication durability boundary with growth, shrink, slot reuse, exact active/retained bytes, and semantic integrity checks |
 | Fixed-path replacement under open SQLite handles | Unsupported | Unsafe pathname/journal association; exact Online Backup output differs from verified LTX bytes |

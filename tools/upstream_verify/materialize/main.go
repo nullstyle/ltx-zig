@@ -10,6 +10,12 @@ import (
 
 var fixtureNames = []string{
 	"celld_v052_two_page_snapshot",
+	"celld_litestream_v0511/replica/ltx/0/0000000000000001-0000000000000001",
+	"celld_litestream_v0511/replica/ltx/0/0000000000000002-0000000000000002",
+	"celld_litestream_v0511/replica/ltx/0/0000000000000003-0000000000000003",
+	"celld_litestream_v0511/replica/ltx/0/0000000000000004-0000000000000004",
+	"celld_litestream_v0511/replica/ltx/0/0000000000000005-0000000000000005",
+	"celld_litestream_v0511/replica/ltx/0/0000000000000006-0000000000000006",
 	"go_v3_empty_snapshot",
 	"go_v3_incremental",
 	"go_v3_legacy_mixed",
