@@ -45,8 +45,9 @@
   as current flagged blocks. V2 and fixed-path replacement beneath open SQLite
   connections are not currently supported. The optional
   `ltx_sqlite` store requires a host-owned quiescence gate, a durable empty
-  manifest before first slot creation, and leased active generations opened
-  with SQLite URI `mode=ro&immutable=1` plus `query_only`.
+  manifest before first slot creation, and typed active-generation access that
+  holds the shared store lock until SQLite closes. Open only the access URI with
+  `mode=ro&immutable=1`, explicit read-only/URI flags, and verified `query_only`.
 - Run `mise exec -- zig build fmt-check` and `mise exec -- zig build test`
   before handing off changes. Run `mise exec -- zig build interop` for encoder
   compactor, or wire-format changes when Go is available; normal tests stay

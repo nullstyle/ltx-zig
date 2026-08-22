@@ -28,6 +28,10 @@ extern fn sqlite3_column_int64(statement: *Statement, column: c_int) i64;
 extern fn sqlite3_column_text(statement: *Statement, column: c_int) ?[*:0]const u8;
 extern fn sqlite3_column_bytes(statement: *Statement, column: c_int) c_int;
 extern fn sqlite3_db_readonly(database: *SQLite, schema_name: [*:0]const u8) c_int;
+extern fn sqlite3_db_filename(
+    database: *SQLite,
+    schema_name: [*:0]const u8,
+) ?[*:0]const u8;
 extern fn sqlite3_file_control(
     database: *SQLite,
     schema_name: [*:0]const u8,
@@ -43,6 +47,7 @@ extern fn sqlite3_wal_checkpoint_v2(
 ) c_int;
 
 const sqlite_ok: c_int = 0;
+const sqlite_readonly: c_int = 8;
 const sqlite_row: c_int = 100;
 const sqlite_done: c_int = 101;
 const sqlite_open_readonly: c_int = 0x0000_0001;
@@ -57,8 +62,8 @@ const database_name = "seed.sqlite";
 const database_wal_name = database_name ++ "-wal";
 const database_shm_name = database_name ++ "-shm";
 const database_journal_name = database_name ++ "-journal";
-const sqlite_uri_prefix = "file:";
-const sqlite_uri_query = "?mode=ro&immutable=1";
+const adversarial_directory_name = "db ?mode=rw&immutable=0#x%2F\xc3\xa9";
+const encoded_directory_name = "db%20%3Fmode%3Drw%26immutable%3D0%23x%252F%C3%A9";
 const page_size: u32 = 1024;
 const max_pages: u32 = 32;
 const max_database_bytes = max_pages * page_size;
@@ -83,18 +88,24 @@ const DatabasePath = struct {
 
     fn init(dir: std.Io.Dir, name: []const u8) !DatabasePath {
         var result: DatabasePath = .{};
-        const reserve_bytes = name.len + 2;
-        if (reserve_bytes > result.bytes.len) return error.NameTooLong;
         const directory_length = try dir.realPath(
             std.testing.io,
-            result.bytes[0 .. result.bytes.len - reserve_bytes],
+            &result.bytes,
         );
+        if (directory_length >= result.bytes.len) return error.NameTooLong;
         const separator_length: usize = @intFromBool(
             directory_length == 0 or result.bytes[directory_length - 1] != '/',
         );
-        const end = directory_length + separator_length + name.len;
+        const name_offset = std.math.add(
+            usize,
+            directory_length,
+            separator_length,
+        ) catch return error.NameTooLong;
+        const end = std.math.add(usize, name_offset, name.len) catch
+            return error.NameTooLong;
+        if (end >= result.bytes.len) return error.NameTooLong;
         if (separator_length == 1) result.bytes[directory_length] = '/';
-        @memcpy(result.bytes[directory_length + separator_length .. end], name);
+        @memcpy(result.bytes[name_offset..end], name);
         result.bytes[end] = 0;
         result.length = end;
         return result;
@@ -105,54 +116,10 @@ const DatabasePath = struct {
     }
 };
 
-const DatabaseUri = struct {
-    bytes: [sqlite_uri_prefix.len + std.Io.Dir.max_path_bytes * 3 + sqlite_uri_query.len + 1]u8 =
-        undefined,
-    length: usize = 0,
-
-    fn init(path: []const u8) !DatabaseUri {
-        if (path.len == 0 or path[0] != '/') return error.InvalidDatabasePath;
-        if (path.len > std.Io.Dir.max_path_bytes) return error.NameTooLong;
-        var result: DatabaseUri = .{};
-        @memcpy(result.bytes[0..sqlite_uri_prefix.len], sqlite_uri_prefix);
-        var output_index: usize = sqlite_uri_prefix.len;
-        var path_index: usize = 0;
-        while (path_index < path.len) : (path_index += 1) {
-            const byte = path[path_index];
-            if (is_uri_path_byte(byte)) {
-                result.bytes[output_index] = byte;
-                output_index += 1;
-            } else {
-                result.bytes[output_index] = '%';
-                result.bytes[output_index + 1] = uri_hex[byte >> 4];
-                result.bytes[output_index + 2] = uri_hex[byte & 0x0f];
-                output_index += 3;
-            }
-        }
-        @memcpy(result.bytes[output_index .. output_index + sqlite_uri_query.len], sqlite_uri_query);
-        output_index += sqlite_uri_query.len;
-        result.bytes[output_index] = 0;
-        result.length = output_index;
-        return result;
-    }
-
-    fn sentinel(self: *const DatabaseUri) [:0]const u8 {
-        return self.bytes[0..self.length :0];
-    }
-};
-
-const uri_hex = "0123456789ABCDEF";
-
-fn is_uri_path_byte(byte: u8) bool {
-    return switch (byte) {
-        'a'...'z', 'A'...'Z', '0'...'9', '-', '.', '_', '~', '/' => true,
-        else => false,
-    };
-}
-
 const ManagedLifecycle = struct {
     database: ?*SQLite = null,
     held_statement: ?*Statement = null,
+    generation_access: ?sqlite_store.GenerationAccess = null,
     admission_closed: bool = false,
     quiesce_count: u32 = 0,
     release_count: u32 = 0,
@@ -178,6 +145,10 @@ const ManagedLifecycle = struct {
             if (sqlite3_close(database) != sqlite_ok) return error.QuiesceFailure;
             self.database = null;
         }
+        if (self.generation_access) |*access| {
+            access.release() catch return error.QuiesceFailure;
+            self.generation_access = null;
+        }
         self.quiesce_count += 1;
     }
 
@@ -188,18 +159,40 @@ const ManagedLifecycle = struct {
         self.release_count += 1;
     }
 
-    fn open_read_only(self: *ManagedLifecycle, uri: [:0]const u8) !void {
-        if (self.admission_closed or self.database != null) return error.AdmissionClosed;
-        self.database = try open_database(
-            uri,
-            sqlite_open_readonly | sqlite_open_uri | sqlite_open_fullmutex,
-        );
-        errdefer {
-            _ = sqlite3_close(self.database);
-            self.database = null;
+    fn open_generation(
+        self: *ManagedLifecycle,
+        store: *sqlite_store.Store,
+        storage: *sqlite_store.GenerationAccessStorage,
+        workspace: *sqlite_store.GenerationAccessWorkspace,
+    ) !sqlite_store.Current {
+        if (self.admission_closed or
+            self.database != null or
+            self.generation_access != null)
+        {
+            return error.AdmissionClosed;
         }
-        try execute(self.database.?, "PRAGMA query_only=ON");
-        try std.testing.expectEqual(@as(c_int, 1), sqlite3_db_readonly(self.database.?, "main"));
+        var access = (try store.acquire_generation(storage, workspace)) orelse
+            return error.ExpectedGeneration;
+        errdefer access.release() catch {};
+        const current = try access.current();
+        const spec = try access.sqlite_open_spec();
+        const required_flags: u32 = @intCast(spec.required_flags);
+        try std.testing.expectEqual(
+            @as(u32, sqlite_open_readonly | sqlite_open_uri),
+            required_flags,
+        );
+        try std.testing.expectEqualStrings("PRAGMA query_only=ON", spec.query_only_sql);
+        const database = try open_database(
+            spec.uri,
+            @as(c_int, @intCast(required_flags)) | sqlite_open_fullmutex,
+        );
+        errdefer _ = sqlite3_close(database);
+        try execute(database, spec.query_only_sql);
+        try expect_integer_query(database, "PRAGMA query_only", 1);
+        try std.testing.expectEqual(@as(c_int, 1), sqlite3_db_readonly(database, "main"));
+        self.database = database;
+        self.generation_access = access;
+        return current;
     }
 
     fn hold_read_transaction(self: *ManagedLifecycle) !void {
@@ -222,6 +215,10 @@ const ManagedLifecycle = struct {
             try std.testing.expectEqual(sqlite_ok, sqlite3_close(database));
             self.database = null;
         }
+        if (self.generation_access) |*access| {
+            try access.release();
+            self.generation_access = null;
+        }
     }
 };
 
@@ -229,67 +226,155 @@ test "real SQLite WAL lifecycle and checksummed generation apply" {
     try std.testing.expect(sqlite3_libversion_number() >= 3_022_000);
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
-    const seed_path = try DatabasePath.init(temporary.dir, database_name);
+    try temporary.dir.createDir(
+        std.testing.io,
+        adversarial_directory_name,
+        .default_dir,
+    );
+    var database_dir = try temporary.dir.openDir(
+        std.testing.io,
+        adversarial_directory_name,
+        .{},
+    );
+    defer database_dir.close(std.testing.io);
+    const seed_path = try DatabasePath.init(database_dir, database_name);
 
-    try create_and_drain_wal_database(temporary.dir, seed_path.sentinel());
-    try std.testing.expect(!try path_exists(temporary.dir, database_wal_name));
-    try std.testing.expect(!try path_exists(temporary.dir, database_shm_name));
-    try std.testing.expect(!try path_exists(temporary.dir, database_journal_name));
-    try expect_wal_header(temporary.dir, database_name);
+    try create_and_drain_wal_database(database_dir, seed_path.sentinel());
+    try std.testing.expect(!try path_exists(database_dir, database_wal_name));
+    try std.testing.expect(!try path_exists(database_dir, database_shm_name));
+    try std.testing.expect(!try path_exists(database_dir, database_journal_name));
+    try expect_wal_header(database_dir, database_name);
 
     var encoded_ltx: [max_ltx_bytes]u8 = undefined;
-    const encoded_length = try encode_seed_snapshot(temporary.dir, &encoded_ltx);
+    const encoded_length = try encode_seed_snapshot(database_dir, &encoded_ltx);
     var lifecycle: ManagedLifecycle = .{};
     var copy_workspace: [4096]u8 = undefined;
     var store = try sqlite_store.Store.init(
         std.testing.io,
-        temporary.dir,
+        database_dir,
         &copy_workspace,
         lifecycle.lifecycle(),
         .{},
     );
-    const verified = try apply_snapshot(&store, encoded_ltx[0..encoded_length]);
-    const current = (try store.current()).?;
+    const verified = try apply_snapshot(
+        &store,
+        encoded_ltx[0..encoded_length],
+        .contiguous,
+    );
+    var access_storage: sqlite_store.GenerationAccessStorage = .{};
+    var access_workspace: sqlite_store.GenerationAccessWorkspace = .{};
+    const current = try lifecycle.open_generation(
+        &store,
+        &access_storage,
+        &access_workspace,
+    );
     try std.testing.expectEqual(verified.post_apply_position(), current.position);
-    try expect_wal_header(temporary.dir, current.database_name());
-    try expect_no_slot_sidecars(temporary.dir, current.slot);
+    try expect_wal_header(database_dir, current.database_name());
+    try expect_no_slot_sidecars(database_dir, current.slot);
+    try expect_open_generation(&lifecycle, database_dir, current);
+    try recover_held_generation(&store, &lifecycle, database_dir, current);
+    try exercise_competing_publication(
+        &store,
+        &lifecycle,
+        &access_storage,
+        &access_workspace,
+        database_dir,
+        current,
+        encoded_ltx[0..encoded_length],
+    );
+}
 
-    const active_path = try DatabasePath.init(temporary.dir, current.database_name());
-    const active_uri = try DatabaseUri.init(active_path.sentinel());
-    try lifecycle.open_read_only(active_uri.sentinel());
-    try expect_no_slot_sidecars(temporary.dir, current.slot);
-    try expect_integer_query(lifecycle.database.?, "SELECT count(*) FROM items", 3);
-    try expect_integer_query(lifecycle.database.?, "SELECT sum(id) FROM items", 6);
-    try expect_text_query(lifecycle.database.?, "PRAGMA integrity_check", "ok");
+fn expect_open_generation(
+    lifecycle: *ManagedLifecycle,
+    database_dir: std.Io.Dir,
+    current: sqlite_store.Current,
+) !void {
+    const access = if (lifecycle.generation_access) |*value|
+        value
+    else
+        return error.ExpectedGeneration;
+    const spec = try access.sqlite_open_spec();
+    try std.testing.expect(std.mem.indexOf(u8, spec.uri, encoded_directory_name) != null);
+    try std.testing.expect(std.mem.endsWith(u8, spec.uri, "?mode=ro&immutable=1"));
+    const active_path = try DatabasePath.init(database_dir, current.database_name());
+    const database = lifecycle.database orelse return error.ExpectedDatabase;
+    const sqlite_path = sqlite3_db_filename(database, "main") orelse
+        return error.ExpectedDatabaseFilename;
+    try std.testing.expectEqualStrings(active_path.sentinel(), std.mem.span(sqlite_path));
+    try expect_integer_query(database, "SELECT count(*) FROM items", 3);
+    try expect_integer_query(database, "SELECT sum(id) FROM items", 6);
+    try expect_text_query(database, "PRAGMA integrity_check", "ok");
+    try expect_read_only_statement(database, "INSERT INTO items VALUES(4,'forbidden')");
+    try expect_integer_query(database, "SELECT count(*) FROM items", 3);
+}
+
+fn recover_held_generation(
+    store: *sqlite_store.Store,
+    lifecycle: *ManagedLifecycle,
+    database_dir: std.Io.Dir,
+    current: sqlite_store.Current,
+) !void {
     try lifecycle.hold_read_transaction();
-    try expect_no_slot_sidecars(temporary.dir, current.slot);
-
+    try expect_no_slot_sidecars(database_dir, current.slot);
     const recovered = (try store.recover()).?;
     try std.testing.expectEqual(current, recovered);
     try std.testing.expectEqual(@as(u32, 2), lifecycle.quiesce_count);
     try std.testing.expectEqual(lifecycle.quiesce_count, lifecycle.release_count);
     try std.testing.expect(lifecycle.database == null);
     try std.testing.expect(lifecycle.held_statement == null);
-    try expect_no_slot_sidecars(temporary.dir, current.slot);
+    try std.testing.expect(lifecycle.generation_access == null);
+    try expect_no_slot_sidecars(database_dir, current.slot);
+}
 
-    try lifecycle.open_read_only(active_uri.sentinel());
-    try expect_no_slot_sidecars(temporary.dir, current.slot);
+fn exercise_competing_publication(
+    store: *sqlite_store.Store,
+    lifecycle: *ManagedLifecycle,
+    access_storage: *sqlite_store.GenerationAccessStorage,
+    access_workspace: *sqlite_store.GenerationAccessWorkspace,
+    database_dir: std.Io.Dir,
+    current: sqlite_store.Current,
+    encoded_ltx: []const u8,
+) !void {
+    const reopened = try lifecycle.open_generation(store, access_storage, access_workspace);
+    try std.testing.expectEqual(current, reopened);
+    try expect_no_slot_sidecars(database_dir, current.slot);
+    const database = lifecycle.database orelse return error.ExpectedDatabase;
     try expect_text_query(
-        lifecycle.database.?,
+        database,
         "SELECT group_concat(value, ',') FROM (SELECT value FROM items ORDER BY id)",
         "alpha,beta,gamma",
     );
-    try expect_text_query(lifecycle.database.?, "PRAGMA integrity_check", "ok");
-    try lifecycle.close();
-    try expect_no_slot_sidecars(temporary.dir, current.slot);
-}
+    try lifecycle.hold_read_transaction();
 
-test "immutable SQLite URI percent-encodes path delimiters" {
-    const uri = try DatabaseUri.init("/tmp/space ?hash#percent%utf8\xc3\xa9.sqlite");
-    try std.testing.expectEqualStrings(
-        "file:/tmp/space%20%3Fhash%23percent%25utf8%C3%A9.sqlite?mode=ro&immutable=1",
-        uri.sentinel(),
+    var competing_lifecycle: ManagedLifecycle = .{};
+    var competing_copy_workspace: [4096]u8 = undefined;
+    var competing_store = try sqlite_store.Store.init(
+        std.testing.io,
+        database_dir,
+        &competing_copy_workspace,
+        competing_lifecycle.lifecycle(),
+        .{},
     );
+    try std.testing.expectEqual(current, (try competing_store.current()).?);
+    try std.testing.expectError(
+        error.ApplyBeginFailure,
+        apply_snapshot(&competing_store, encoded_ltx, .replace_snapshot),
+    );
+    try std.testing.expectEqual(.store_busy, competing_store.last_failure());
+    try expect_integer_query(database, "SELECT count(*) FROM items", 3);
+    try expect_no_slot_sidecars(database_dir, current.slot);
+
+    try lifecycle.close();
+    try expect_no_slot_sidecars(database_dir, current.slot);
+    _ = try apply_snapshot(&competing_store, encoded_ltx, .replace_snapshot);
+    const replaced = (try competing_store.current()).?;
+    try std.testing.expectEqual(current.generation + 1, replaced.generation);
+    try std.testing.expect(current.slot != replaced.slot);
+    const final_access = try lifecycle.open_generation(store, access_storage, access_workspace);
+    try std.testing.expectEqual(replaced, final_access);
+    try expect_integer_query(lifecycle.database.?, "SELECT count(*) FROM items", 3);
+    try lifecycle.close();
+    try expect_no_slot_sidecars(database_dir, replaced.slot);
 }
 
 fn create_and_drain_wal_database(dir: std.Io.Dir, path: [:0]const u8) !void {
@@ -394,7 +479,11 @@ fn encode_seed_snapshot(dir: std.Io.Dir, output: []u8) !usize {
     return sink.written().len;
 }
 
-fn apply_snapshot(store: *sqlite_store.Store, encoded: []const u8) !ltx.VerifiedLTX {
+fn apply_snapshot(
+    store: *sqlite_store.Store,
+    encoded: []const u8,
+    mode: ltx.ApplyMode,
+) !ltx.VerifiedLTX {
     var source = ltx.SliceReader.init(encoded);
     var page_workspace: [page_size]u8 = undefined;
     var compressed_workspace: [max_compressed_bytes]u8 = undefined;
@@ -406,7 +495,7 @@ fn apply_snapshot(store: *sqlite_store.Store, encoded: []const u8) !ltx.Verified
             .max_database_pages = max_pages,
             .max_database_bytes = max_database_bytes,
         },
-        .contiguous,
+        mode,
         source.reader(),
         store.backend(),
         &page_workspace,
@@ -486,6 +575,12 @@ fn expect_text_query(database: *SQLite, sql: [*:0]const u8, expected: []const u8
     if (length < 0) return error.SQLiteInvalidText;
     try std.testing.expectEqualStrings(expected, text[0..@intCast(length)]);
     try expect_result(database, sqlite3_step(statement), sqlite_done);
+}
+
+fn expect_read_only_statement(database: *SQLite, sql: [*:0]const u8) !void {
+    const statement = try prepare(database, sql);
+    defer _ = sqlite3_finalize(statement);
+    try std.testing.expectEqual(sqlite_readonly, sqlite3_step(statement));
 }
 
 fn expect_wal_header(dir: std.Io.Dir, name: []const u8) !void {

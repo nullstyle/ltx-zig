@@ -24,6 +24,15 @@ const manifest_reserved_b_offset = 44;
 const manifest_database_size_offset = 48;
 const manifest_digest_offset = 56;
 const sqlite_magic = "SQLite format 3\x00";
+const sqlite_uri_prefix = "file:";
+const sqlite_uri_query = "?mode=ro&immutable=1";
+const sqlite_query_only_sql: [:0]const u8 = "PRAGMA query_only=ON";
+const sqlite_open_readonly: c_int = 0x0000_0001;
+const sqlite_open_uri: c_int = 0x0000_0040;
+
+pub const max_generation_path_bytes = std.Io.Dir.max_path_bytes;
+pub const max_generation_uri_bytes = sqlite_uri_prefix.len +
+    (max_generation_path_bytes - 1) * 3 + sqlite_uri_query.len + 1;
 
 comptime {
     std.debug.assert(manifest_magic.len == 8);
@@ -31,11 +40,13 @@ comptime {
     std.debug.assert(manifest_digest_offset + @sizeOf(u64) == manifest_size);
     std.debug.assert(manifest_generation_offset - manifest_reserved_a_offset == 3);
     std.debug.assert(manifest_database_size_offset - manifest_reserved_b_offset == 4);
+    std.debug.assert(max_generation_uri_bytes == 3 * std.Io.Dir.max_path_bytes + 23);
 }
 
 pub const Error = error{
     InvalidWorkspace,
     InvalidState,
+    InvalidDatabasePath,
     UnsupportedPlatform,
     StoreBusy,
     QuiesceFailure,
@@ -54,6 +65,7 @@ pub const Error = error{
 pub const Failure = enum {
     none,
     invalid_state,
+    invalid_database_path,
     unsupported_platform,
     store_busy,
     quiesce_failure,
@@ -147,6 +159,88 @@ pub const Current = struct {
 
     fn apply_current(self: Current) ltx.ApplyCurrent {
         return .{ .position = self.position, .page_size = self.page_size };
+    }
+};
+
+/// Caller-owned, fixed-capacity scratch for resolving and encoding one active
+/// generation. It must remain address-stable, exclusive, and live until the
+/// corresponding `GenerationAccess.release` succeeds.
+pub const GenerationAccessWorkspace = struct {
+    path_bytes: [max_generation_path_bytes]u8 = undefined,
+    uri_bytes: [max_generation_uri_bytes]u8 = undefined,
+};
+
+/// SQLite connection requirements carried by a held generation access. Hosts
+/// may add threading flags, but must open the supplied URI with at least
+/// `required_flags` and execute `query_only_sql` before exposing the connection.
+pub const SQLiteOpenSpec = struct {
+    uri: [:0]const u8,
+    required_flags: c_int = sqlite_open_readonly | sqlite_open_uri,
+    query_only_sql: [:0]const u8 = sqlite_query_only_sql,
+};
+
+const GenerationAccessPhase = enum { available, held };
+
+/// Address-stable authority for one generation lease. Reusing storage after a
+/// release is supported. The checked epoch makes copied, stale access handles
+/// unable to inspect or release a later lease held by the same storage. Never
+/// copy or move this storage while it is held. The `std.Io` provider and its
+/// backing context must remain live until release succeeds.
+pub const GenerationAccessStorage = struct {
+    phase: GenerationAccessPhase = .available,
+    epoch: u64 = 0,
+    io: ?std.Io = null,
+    lock_file: ?std.Io.File = null,
+    current_value: ?Current = null,
+    workspace: ?*GenerationAccessWorkspace = null,
+    uri_length: usize = 0,
+};
+
+/// A lightweight handle to a manifest-selected generation protected by a
+/// shared store lock. Copies share one authoritative storage record and are
+/// invalidated together when the lease is released or its storage is reused.
+/// Copy only for single-owner handoff, not for concurrent independent use.
+pub const GenerationAccess = struct {
+    storage: *GenerationAccessStorage,
+    epoch: u64,
+
+    pub fn current(self: *const GenerationAccess) Error!Current {
+        const storage = try self.require_held();
+        return storage.current_value orelse error.InvalidState;
+    }
+
+    pub fn sqlite_open_spec(self: *const GenerationAccess) Error!SQLiteOpenSpec {
+        const storage = try self.require_held();
+        const access_workspace = storage.workspace orelse return error.InvalidState;
+        if (storage.uri_length >= access_workspace.uri_bytes.len) return error.InvalidState;
+        return .{
+            .uri = access_workspace.uri_bytes[0..storage.uri_length :0],
+        };
+    }
+
+    /// Release only after every SQLite statement, BLOB, backup handle, and
+    /// connection using this generation has closed. A stale or repeated
+    /// release returns `InvalidState` without touching a possibly reused file
+    /// descriptor.
+    pub fn release(self: *GenerationAccess) Error!void {
+        const storage = try self.require_held();
+        const io = storage.io orelse return error.InvalidState;
+        const file = storage.lock_file orelse return error.InvalidState;
+        file.unlock(io);
+        file.close(io);
+        storage.lock_file = null;
+        storage.current_value = null;
+        storage.workspace = null;
+        storage.uri_length = 0;
+        storage.io = null;
+        storage.phase = .available;
+    }
+
+    fn require_held(self: *const GenerationAccess) Error!*GenerationAccessStorage {
+        if (self.storage.phase != .held or self.storage.epoch != self.epoch) {
+            return error.InvalidState;
+        }
+        return self.storage;
     }
 };
 
@@ -337,12 +431,64 @@ test "manifest wire encoding has one canonical empty state" {
     try std.testing.expectError(error.ManifestCorrupt, Manifest.decode(&noncanonical));
 }
 
+test "SQLite generation URI encoding is canonical and delimiter-safe" {
+    var destination: [max_generation_uri_bytes]u8 = undefined;
+    const uri = try encode_sqlite_uri(
+        "/tmp/space ?hash#percent%utf8\xc3\xa9.sqlite",
+        &destination,
+    );
+    try std.testing.expectEqualStrings(
+        "file:/tmp/space%20%3Fhash%23percent%25utf8%C3%A9.sqlite?mode=ro&immutable=1",
+        uri,
+    );
+}
+
+test "SQLite generation URI rejects ambiguous or non-UTF8 paths" {
+    var destination: [max_generation_uri_bytes]u8 = undefined;
+    const invalid_paths = [_][]const u8{
+        "",
+        "relative.sqlite",
+        "//authority/database.sqlite",
+        "/tmp/nul\x00database.sqlite",
+        "/tmp/non-utf8-\xff.sqlite",
+    };
+    for (invalid_paths) |path| {
+        try std.testing.expectError(
+            error.InvalidDatabasePath,
+            encode_sqlite_uri(path, &destination),
+        );
+    }
+}
+
+test "SQLite generation URI workspace covers the maximum valid path" {
+    var path: [max_generation_path_bytes - 1]u8 = undefined;
+    path[0] = '/';
+    var index: usize = 1;
+    while (index + 1 < path.len) : (index += 2) {
+        path[index] = 0xc2;
+        path[index + 1] = 0x80;
+    }
+    if (index < path.len) path[index] = 'a';
+    var destination: [max_generation_uri_bytes]u8 = undefined;
+    const uri = try encode_sqlite_uri(&path, &destination);
+    try std.testing.expect(uri.len < destination.len);
+    try std.testing.expectEqual(@as(u8, 0), destination[uri.len]);
+
+    var overlong: [max_generation_path_bytes]u8 = @splat('a');
+    overlong[0] = '/';
+    try std.testing.expectError(
+        error.InvalidDatabasePath,
+        encode_sqlite_uri(&overlong, &destination),
+    );
+}
+
 const Phase = enum { idle, acquiring, staging, recovery_required };
 
 /// Allocation-free, quiescent two-generation SQLite storage. The directory is
-/// borrowed, and `copy_workspace` must remain valid for the store's lifetime.
-/// This is a stateful, single-owner value: never copy or concurrently operate
-/// through copies after initialization.
+/// borrowed; the `std.Io` provider, its backing context, and `copy_workspace`
+/// must remain valid for the store's lifetime and until every generation access
+/// releases. This is a stateful, single-owner value: never copy or concurrently
+/// operate through copies after initialization.
 pub const Store = struct {
     io: std.Io,
     dir: std.Io.Dir,
@@ -400,12 +546,61 @@ pub const Store = struct {
     /// database image; use `recover` when publication was indeterminate.
     pub fn current(self: *Store) Error!?Current {
         try self.require_idle();
-        self.acquire_lock() catch |err| return self.record(err);
+        self.acquire_lock(.shared) catch |err| return self.record(err);
         defer self.release_lock();
         const manifest = self.read_manifest() catch |err| return self.record(err);
         if (manifest == null) self.require_fresh_store() catch |err| return self.record(err);
         self.failure = .none;
         return if (manifest) |value| value.current else null;
+    }
+
+    /// Resolves the selected generation while acquiring a shared store lock.
+    /// The returned access keeps that lock until `release`, so a cooperating
+    /// writer cannot replace or reuse its slot. The host must close every
+    /// SQLite resource using the generation before releasing the access.
+    pub fn acquire_generation(
+        self: *Store,
+        storage: *GenerationAccessStorage,
+        access_workspace: *GenerationAccessWorkspace,
+    ) Error!?GenerationAccess {
+        try self.require_idle();
+        self.validate_access_workspace(storage, access_workspace) catch |err|
+            return self.record(err);
+        if (storage.phase != .available) return self.record(error.InvalidState);
+        const next_epoch = std.math.add(u64, storage.epoch, 1) catch
+            return self.record(error.GenerationOverflow);
+
+        const file = self.obtain_lock(.shared) catch |err| return self.record(err);
+        var transferred = false;
+        defer if (!transferred) {
+            file.unlock(self.io);
+            file.close(self.io);
+        };
+        const manifest = self.read_manifest() catch |err| return self.record(err);
+        if (manifest == null) self.require_fresh_store() catch |err| return self.record(err);
+        const current_value = if (manifest) |value| value.current else null;
+        if (current_value == null) {
+            self.failure = .none;
+            return null;
+        }
+        self.validate_current_for_access(current_value.?) catch |err| return self.record(err);
+        const path = self.resolve_generation_path(
+            current_value.?,
+            &access_workspace.path_bytes,
+        ) catch |err| return self.record(err);
+        const uri = encode_sqlite_uri(path, &access_workspace.uri_bytes) catch |err|
+            return self.record(err);
+
+        storage.phase = .held;
+        storage.epoch = next_epoch;
+        storage.io = self.io;
+        storage.lock_file = file;
+        storage.current_value = current_value.?;
+        storage.workspace = access_workspace;
+        storage.uri_length = uri.len;
+        transferred = true;
+        self.failure = .none;
+        return .{ .storage = storage, .epoch = next_epoch };
     }
 
     /// Resolves an indeterminate commit by validating the manifest-selected
@@ -424,8 +619,9 @@ pub const Store = struct {
             .recovery_required => std.debug.assert(self.gate_held),
             else => return self.record(error.InvalidState),
         }
-        self.acquire_lock() catch |err| return self.record(err);
-        errdefer self.release_lock();
+        if (self.lock_file == null) {
+            self.acquire_lock(.exclusive) catch |err| return self.record(err);
+        }
         self.reject_all_sidecars() catch |err| return self.record(err);
         const manifest = self.load_or_initialize_manifest() catch |err| return self.record(err);
         if (manifest.current) |current_value| {
@@ -515,7 +711,7 @@ pub const Store = struct {
         errdefer self.phase = .idle;
         try self.acquire_gate();
         errdefer self.release_gate();
-        try self.acquire_lock();
+        try self.acquire_lock(.exclusive);
         errdefer self.release_lock();
         try self.reject_all_sidecars();
         const manifest = try self.load_or_initialize_manifest();
@@ -816,6 +1012,84 @@ pub const Store = struct {
         return baseline;
     }
 
+    fn validate_access_workspace(
+        self: *Store,
+        storage: *GenerationAccessStorage,
+        access_workspace: *GenerationAccessWorkspace,
+    ) Error!void {
+        const store_bytes = std.mem.asBytes(self);
+        const storage_bytes = std.mem.asBytes(storage);
+        const access_bytes = std.mem.asBytes(access_workspace);
+        if (slices_overlap(store_bytes, storage_bytes) or
+            slices_overlap(store_bytes, access_bytes) or
+            slices_overlap(storage_bytes, access_bytes) or
+            slices_overlap(self.copy_workspace, storage_bytes) or
+            slices_overlap(self.copy_workspace, access_bytes) or
+            slices_overlap(
+                &access_workspace.path_bytes,
+                &access_workspace.uri_bytes,
+            ))
+        {
+            return error.InvalidWorkspace;
+        }
+    }
+
+    fn validate_current_for_access(self: *Store, current_value: Current) Error!void {
+        try self.reject_sidecars(current_value.slot);
+        var file = self.dir.openFile(
+            self.io,
+            current_value.database_name(),
+            .{
+                .mode = .read_only,
+                .allow_directory = false,
+                .follow_symlinks = false,
+                .resolve_beneath = true,
+            },
+        ) catch |err| return open_database_error(err);
+        defer file.close(self.io);
+        try self.validate_sqlite_file(
+            file,
+            current_value.page_size,
+            current_value.database_size_bytes,
+        );
+    }
+
+    fn resolve_generation_path(
+        self: *Store,
+        current_value: Current,
+        path_workspace: *[max_generation_path_bytes]u8,
+    ) Error![]const u8 {
+        const name = current_value.database_name();
+        const directory_length = self.dir.realPath(
+            self.io,
+            path_workspace,
+        ) catch |err| switch (err) {
+            error.NameTooLong => return error.InvalidDatabasePath,
+            else => return error.IOFailure,
+        };
+        if (directory_length == 0 or directory_length >= path_workspace.len) {
+            return error.InvalidDatabasePath;
+        }
+        const separator_length: usize = @intFromBool(
+            path_workspace[directory_length - 1] != '/',
+        );
+        const name_offset = std.math.add(
+            usize,
+            directory_length,
+            separator_length,
+        ) catch return error.InvalidDatabasePath;
+        const end = std.math.add(
+            usize,
+            name_offset,
+            name.len,
+        ) catch return error.InvalidDatabasePath;
+        if (end >= path_workspace.len) return error.InvalidDatabasePath;
+        if (separator_length == 1) path_workspace[directory_length] = '/';
+        @memcpy(path_workspace[name_offset..end], name);
+        path_workspace[end] = 0;
+        return path_workspace[0..end];
+    }
+
     fn validate_current(self: *Store, current_value: Current) Error!void {
         try self.reject_sidecars(current_value.slot);
         var file = self.dir.openFile(
@@ -959,26 +1233,31 @@ pub const Store = struct {
         if (try self.path_exists(name)) return error.SidecarPresent;
     }
 
-    fn acquire_lock(self: *Store) Error!void {
+    fn acquire_lock(self: *Store, lock: std.Io.File.Lock) Error!void {
         std.debug.assert(self.lock_file == null);
+        self.lock_file = try self.obtain_lock(lock);
+    }
+
+    fn obtain_lock(self: *Store, lock: std.Io.File.Lock) Error!std.Io.File {
         var attempt: u8 = 0;
         while (attempt < 2) : (attempt += 1) {
-            const file = self.open_or_create_lock() catch |err| switch (err) {
+            return self.open_or_create_lock(lock) catch |err| switch (err) {
                 error.PathAlreadyExists, error.FileNotFound => continue,
                 error.WouldBlock => return error.StoreBusy,
                 else => return error.IOFailure,
             };
-            self.lock_file = file;
-            return;
         }
         return error.StoreBusy;
     }
 
-    fn open_or_create_lock(self: *Store) std.Io.File.OpenError!std.Io.File {
+    fn open_or_create_lock(
+        self: *Store,
+        lock: std.Io.File.Lock,
+    ) std.Io.File.OpenError!std.Io.File {
         return self.dir.openFile(self.io, lock_name, .{
             .mode = .read_only,
             .allow_directory = false,
-            .lock = .exclusive,
+            .lock = lock,
             .lock_nonblocking = true,
             .follow_symlinks = false,
             .resolve_beneath = true,
@@ -987,7 +1266,7 @@ pub const Store = struct {
                 .read = true,
                 .truncate = false,
                 .exclusive = true,
-                .lock = .exclusive,
+                .lock = lock,
                 .lock_nonblocking = true,
                 .resolve_beneath = true,
             }),
@@ -1027,13 +1306,12 @@ pub const Store = struct {
     }
 
     fn enter_recovery_required(self: *Store) void {
-        std.debug.assert(self.gate_held and self.commit_crossed);
+        std.debug.assert(self.gate_held and self.commit_crossed and self.lock_file != null);
         if (self.stage_file) |file| file.close(self.io);
         self.stage_file = null;
         self.captured_manifest = null;
         self.stage_plan = null;
         self.commit_crossed = false;
-        self.release_lock();
         self.phase = .recovery_required;
     }
 
@@ -1101,6 +1379,77 @@ fn empty_apply_current() ltx.ApplyCurrent {
     };
 }
 
+fn encode_sqlite_uri(
+    path: []const u8,
+    destination: *[max_generation_uri_bytes]u8,
+) Error![:0]const u8 {
+    try validate_database_path(path);
+    var encoded_path_bytes: usize = 0;
+    var path_index: usize = 0;
+    while (path_index < path.len) : (path_index += 1) {
+        encoded_path_bytes += if (is_uri_path_byte(path[path_index])) 1 else 3;
+    }
+    const suffix_bytes = sqlite_uri_query.len + 1;
+    const required_bytes = std.math.add(
+        usize,
+        sqlite_uri_prefix.len + encoded_path_bytes,
+        suffix_bytes,
+    ) catch return error.InvalidDatabasePath;
+    if (required_bytes > destination.len) return error.InvalidDatabasePath;
+
+    @memcpy(destination[0..sqlite_uri_prefix.len], sqlite_uri_prefix);
+    var output_index = sqlite_uri_prefix.len;
+    path_index = 0;
+    while (path_index < path.len) : (path_index += 1) {
+        const byte = path[path_index];
+        if (is_uri_path_byte(byte)) {
+            destination[output_index] = byte;
+            output_index += 1;
+        } else {
+            destination[output_index] = '%';
+            destination[output_index + 1] = uri_hex[byte >> 4];
+            destination[output_index + 2] = uri_hex[byte & 0x0f];
+            output_index += 3;
+        }
+    }
+    @memcpy(destination[output_index .. output_index + sqlite_uri_query.len], sqlite_uri_query);
+    output_index += sqlite_uri_query.len;
+    destination[output_index] = 0;
+    return destination[0..output_index :0];
+}
+
+fn validate_database_path(path: []const u8) Error!void {
+    if (path.len == 0 or path.len >= max_generation_path_bytes) {
+        return error.InvalidDatabasePath;
+    }
+    if (path[0] != '/' or (path.len > 1 and path[1] == '/')) {
+        return error.InvalidDatabasePath;
+    }
+    if (std.mem.indexOfScalar(u8, path, 0) != null or
+        !std.unicode.utf8ValidateSlice(path))
+    {
+        return error.InvalidDatabasePath;
+    }
+}
+
+const uri_hex = "0123456789ABCDEF";
+
+fn is_uri_path_byte(byte: u8) bool {
+    return switch (byte) {
+        'a'...'z', 'A'...'Z', '0'...'9', '-', '.', '_', '~', '/' => true,
+        else => false,
+    };
+}
+
+fn slices_overlap(left: []const u8, right: []const u8) bool {
+    if (left.len == 0 or right.len == 0) return false;
+    const left_start = @intFromPtr(left.ptr);
+    const right_start = @intFromPtr(right.ptr);
+    const left_end = std.math.add(usize, left_start, left.len) catch unreachable;
+    const right_end = std.math.add(usize, right_start, right.len) catch unreachable;
+    return left_start < right_end and right_start < left_end;
+}
+
 fn validate_plan(plan: ltx.ApplyPlan) Error!void {
     if (plan.format_version != .v3 or !valid_page_size(plan.header.page_size)) {
         return error.InvalidState;
@@ -1142,6 +1491,7 @@ fn open_database_error(err: std.Io.File.OpenError) Error {
 fn failure_for_error(err: Error) Failure {
     return switch (err) {
         error.InvalidWorkspace, error.InvalidState => .invalid_state,
+        error.InvalidDatabasePath => .invalid_database_path,
         error.UnsupportedPlatform => .unsupported_platform,
         error.StoreBusy => .store_busy,
         error.QuiesceFailure => .quiesce_failure,

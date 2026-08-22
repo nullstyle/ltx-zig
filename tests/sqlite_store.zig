@@ -159,6 +159,66 @@ fn abort(store: *sqlite.Store) void {
     backend.abort_fn(backend.context);
 }
 
+fn publish_empty_generation(store: *sqlite.Store, txid: u64) !sqlite.Current {
+    const header = make_header(txid, txid, 0);
+    const expected = try begin(store, make_plan(.contiguous, header));
+    try publish(store, expected, make_verified(header));
+    return (try store.current()).?;
+}
+
+fn expected_generation_uri(
+    dir: std.Io.Dir,
+    database_name: []const u8,
+    output: []u8,
+) ![:0]const u8 {
+    var path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var path_length = try dir.realPath(std.testing.io, &path);
+    const separator_length: usize = @intFromBool(
+        path_length == 0 or path[path_length - 1] != '/',
+    );
+    const final_length = path_length + separator_length + database_name.len;
+    if (final_length > path.len) return error.NameTooLong;
+    if (separator_length == 1) {
+        path[path_length] = '/';
+        path_length += 1;
+    }
+    @memcpy(path[path_length..final_length], database_name);
+    return encode_expected_sqlite_uri(path[0..final_length], output);
+}
+
+fn encode_expected_sqlite_uri(path: []const u8, output: []u8) ![:0]const u8 {
+    const prefix = "file:";
+    const query = "?mode=ro&immutable=1";
+    if (output.len < prefix.len + query.len + 1) return error.NoSpaceLeft;
+    @memcpy(output[0..prefix.len], prefix);
+    var output_index = prefix.len;
+    for (path) |byte| {
+        const encoded_length: usize = if (is_expected_uri_path_byte(byte)) 1 else 3;
+        if (output_index + encoded_length + query.len + 1 > output.len) {
+            return error.NoSpaceLeft;
+        }
+        if (encoded_length == 1) {
+            output[output_index] = byte;
+        } else {
+            output[output_index] = '%';
+            output[output_index + 1] = "0123456789ABCDEF"[byte >> 4];
+            output[output_index + 2] = "0123456789ABCDEF"[byte & 0x0f];
+        }
+        output_index += encoded_length;
+    }
+    @memcpy(output[output_index .. output_index + query.len], query);
+    output_index += query.len;
+    output[output_index] = 0;
+    return output[0..output_index :0];
+}
+
+fn is_expected_uri_path_byte(byte: u8) bool {
+    return switch (byte) {
+        'a'...'z', 'A'...'Z', '0'...'9', '-', '.', '_', '~', '/' => true,
+        else => false,
+    };
+}
+
 fn read_exact(file: std.Io.File, bytes: []u8, offset: u64) !void {
     const read = try file.readPositionalAll(std.testing.io, bytes, offset);
     try std.testing.expectEqual(bytes.len, read);
@@ -607,6 +667,9 @@ test "missing manifest with a generation fails closed" {
     try std.testing.expectError(error.ManifestCorrupt, store.recover());
     try std.testing.expectEqual(sqlite.Failure.manifest_corrupt, store.last_failure());
     try std.testing.expect(gate.held);
+    try temporary.dir.deleteFile(std.testing.io, sqlite.database_a_name);
+    try std.testing.expectEqual(null, try store.recover());
+    try std.testing.expect(!gate.held);
 }
 
 test "StagedApplier publishes and recovery detects checksummed database mutation" {
@@ -654,4 +717,450 @@ test "StagedApplier publishes and recovery detects checksummed database mutation
     try std.testing.expectError(error.DatabaseChecksumMismatch, store.recover());
     try std.testing.expectEqual(sqlite.Failure.database_checksum_mismatch, store.last_failure());
     try std.testing.expect(gate.held);
+    var repaired = try temporary.dir.openFile(
+        std.testing.io,
+        recovered.database_name(),
+        .{ .mode = .read_write, .follow_symlinks = false },
+    );
+    try repaired.writePositionalAll(std.testing.io, &[_]u8{0x42}, 200);
+    repaired.close(std.testing.io);
+    try std.testing.expectEqual(recovered, (try store.recover()).?);
+    try std.testing.expect(!gate.held);
+}
+
+test "generation access returns null for empty state and unwinds for reuse" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var gate: Gate = .{};
+    var copy_workspace: [31]u8 = undefined;
+    var store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &copy_workspace,
+        gate.lifecycle(),
+        .{},
+    );
+    var access_storage: sqlite.GenerationAccessStorage = .{};
+    var access_workspace: sqlite.GenerationAccessWorkspace = .{};
+
+    try std.testing.expectEqual(
+        null,
+        try store.acquire_generation(&access_storage, &access_workspace),
+    );
+    try std.testing.expectEqual(null, try store.current());
+    try std.testing.expectEqual(@as(u32, 0), gate.quiesce_count);
+
+    var orphan = try temporary.dir.createFile(std.testing.io, sqlite.database_a_name, .{});
+    orphan.close(std.testing.io);
+    try std.testing.expectError(
+        error.ManifestCorrupt,
+        store.acquire_generation(&access_storage, &access_workspace),
+    );
+    try std.testing.expectEqual(sqlite.Failure.manifest_corrupt, store.last_failure());
+    try temporary.dir.deleteFile(std.testing.io, sqlite.database_a_name);
+
+    try std.testing.expectEqual(
+        null,
+        try store.acquire_generation(&access_storage, &access_workspace),
+    );
+    try std.testing.expectEqual(null, try store.recover());
+    try std.testing.expectEqual(
+        null,
+        try store.acquire_generation(&access_storage, &access_workspace),
+    );
+    try std.testing.expectEqual(gate.quiesce_count, gate.release_count);
+}
+
+test "generation access rejects an absolute slot path beyond the OS bound" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var absolute_path: [sqlite.max_generation_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(std.testing.io, &absolute_path);
+    const target_length = sqlite.max_generation_path_bytes - sqlite.database_a_name.len;
+    if (root_length + 2 >= target_length) return error.SkipZigTest;
+
+    var current_dir = temporary.dir;
+    var current_dir_owned = false;
+    defer if (current_dir_owned) current_dir.close(std.testing.io);
+    var current_length = root_length;
+    const component_bytes: [200]u8 = @splat('d');
+    var depth: usize = 0;
+    while (current_length < target_length and
+        depth < sqlite.max_generation_path_bytes) : (depth += 1)
+    {
+        const remaining = target_length - current_length;
+        if (remaining < 2) return error.TestUnexpectedResult;
+        var component_length = @min(component_bytes.len, remaining - 1);
+        if (remaining - (component_length + 1) == 1) component_length -= 1;
+        const component = component_bytes[0..component_length];
+        try current_dir.createDir(std.testing.io, component, .default_dir);
+        const next_dir = try current_dir.openDir(std.testing.io, component, .{});
+        if (current_dir_owned) current_dir.close(std.testing.io);
+        current_dir = next_dir;
+        current_dir_owned = true;
+        current_length = try current_dir.realPath(std.testing.io, &absolute_path);
+    }
+    try std.testing.expectEqual(target_length, current_length);
+
+    var gate: Gate = .{};
+    var copy_workspace: [31]u8 = undefined;
+    var store = try sqlite.Store.init(
+        std.testing.io,
+        current_dir,
+        &copy_workspace,
+        gate.lifecycle(),
+        .{},
+    );
+    const current = try publish_empty_generation(&store, 1);
+    try std.testing.expectEqual(sqlite.Slot.a, current.slot);
+    var access_storage: sqlite.GenerationAccessStorage = .{};
+    var access_workspace: sqlite.GenerationAccessWorkspace = .{};
+    try std.testing.expectError(
+        error.InvalidDatabasePath,
+        store.acquire_generation(&access_storage, &access_workspace),
+    );
+    try std.testing.expectEqual(
+        sqlite.Failure.invalid_database_path,
+        store.last_failure(),
+    );
+    try std.testing.expectEqual(current, (try store.current()).?);
+}
+
+test "generation access exposes exact SQLite spec and copied handles release once" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const special_name = "access space?#%utf8\xc3\xa9";
+    try temporary.dir.createDir(std.testing.io, special_name, .default_dir);
+    var generation_dir = try temporary.dir.openDir(std.testing.io, special_name, .{});
+    defer generation_dir.close(std.testing.io);
+    var gate: Gate = .{};
+    var copy_workspace: [37]u8 = undefined;
+    var store = try sqlite.Store.init(
+        std.testing.io,
+        generation_dir,
+        &copy_workspace,
+        gate.lifecycle(),
+        .{},
+    );
+    const first = try publish_empty_generation(&store, 1);
+    var access_storage: sqlite.GenerationAccessStorage = .{};
+    var access_workspace: sqlite.GenerationAccessWorkspace = .{};
+    var access = (try store.acquire_generation(&access_storage, &access_workspace)).?;
+    var copied = access;
+
+    try std.testing.expectEqual(first, try access.current());
+    const spec = try access.sqlite_open_spec();
+    var expected_bytes: [std.Io.Dir.max_path_bytes * 3 + 32]u8 = undefined;
+    const expected = try expected_generation_uri(
+        generation_dir,
+        first.database_name(),
+        &expected_bytes,
+    );
+    try std.testing.expectEqualStrings(expected, spec.uri);
+    try std.testing.expectEqual(@as(c_int, 0x0000_0001 | 0x0000_0040), spec.required_flags);
+    try std.testing.expectEqualStrings("PRAGMA query_only=ON", spec.query_only_sql);
+    try std.testing.expectEqual(@as(u8, 0), access_workspace.uri_bytes[spec.uri.len]);
+    try std.testing.expectError(
+        error.InvalidState,
+        store.acquire_generation(&access_storage, &access_workspace),
+    );
+    try std.testing.expectEqual(first, try access.current());
+
+    try access.release();
+    try std.testing.expectError(error.InvalidState, access.release());
+    try std.testing.expectError(error.InvalidState, copied.release());
+    try std.testing.expectError(error.InvalidState, copied.current());
+    try std.testing.expectError(error.InvalidState, copied.sqlite_open_spec());
+
+    var reacquired = (try store.acquire_generation(&access_storage, &access_workspace)).?;
+    try std.testing.expectError(error.InvalidState, copied.release());
+    try std.testing.expectEqual(first, try reacquired.current());
+    try reacquired.release();
+
+    const second = try publish_empty_generation(&store, 2);
+    var newest = (try store.acquire_generation(&access_storage, &access_workspace)).?;
+    try std.testing.expectEqual(second, try newest.current());
+    try std.testing.expectError(error.InvalidState, copied.release());
+    try newest.release();
+}
+
+test "shared generation accesses coexist and block exclusive store operations" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var first_gate: Gate = .{};
+    var first_copy: [41]u8 = undefined;
+    var first_store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &first_copy,
+        first_gate.lifecycle(),
+        .{},
+    );
+    const first = try publish_empty_generation(&first_store, 1);
+    var second_gate: Gate = .{};
+    var second_copy: [43]u8 = undefined;
+    var second_store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &second_copy,
+        second_gate.lifecycle(),
+        .{},
+    );
+    var first_storage: sqlite.GenerationAccessStorage = .{};
+    var second_storage: sqlite.GenerationAccessStorage = .{};
+    var first_uri: sqlite.GenerationAccessWorkspace = .{};
+    var second_uri: sqlite.GenerationAccessWorkspace = .{};
+    var first_access = (try first_store.acquire_generation(&first_storage, &first_uri)).?;
+    var second_access = (try first_store.acquire_generation(&second_storage, &second_uri)).?;
+
+    try std.testing.expectEqual(first, try first_store.current());
+    try std.testing.expectEqual(first, try second_store.current());
+    try std.testing.expectEqual(first, try first_access.current());
+    try std.testing.expectEqual(first, try second_access.current());
+    const next_header = make_header(2, 2, 0);
+    try std.testing.expectError(
+        error.ApplyBeginFailure,
+        begin(&second_store, make_plan(.contiguous, next_header)),
+    );
+    try std.testing.expectEqual(sqlite.Failure.store_busy, second_store.last_failure());
+    try std.testing.expect(!second_gate.held);
+
+    try std.testing.expectError(error.StoreBusy, second_store.recover());
+    try std.testing.expect(second_gate.held);
+    try first_access.release();
+    try std.testing.expectError(error.StoreBusy, second_store.recover());
+    try second_access.release();
+    try std.testing.expectEqual(first, (try second_store.recover()).?);
+    try std.testing.expect(!second_gate.held);
+
+    const expected = try begin(&second_store, make_plan(.contiguous, next_header));
+    try std.testing.expectEqual(first.position, expected.position);
+    abort(&second_store);
+}
+
+test "generation access rejects active sidecars and invalid selected databases" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var gate: Gate = .{};
+    var copy_workspace: [47]u8 = undefined;
+    var store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &copy_workspace,
+        gate.lifecycle(),
+        .{},
+    );
+    const header = make_header(1, 1, 1);
+    const initial = try begin(&store, make_plan(.contiguous, header));
+    const page = make_sqlite_page(0x51);
+    try stage(&store, 1, 0, &page);
+    try publish(&store, initial, make_verified(header));
+    const current = (try store.current()).?;
+    const sidecar_name = if (current.slot == .a) "ltx.sqlite.a-wal" else "ltx.sqlite.b-wal";
+    var sidecar = try temporary.dir.createFile(std.testing.io, sidecar_name, .{});
+    sidecar.close(std.testing.io);
+    var access_storage: sqlite.GenerationAccessStorage = .{};
+    var access_workspace: sqlite.GenerationAccessWorkspace = .{};
+
+    try std.testing.expectError(
+        error.SidecarPresent,
+        store.acquire_generation(&access_storage, &access_workspace),
+    );
+    try std.testing.expectEqual(sqlite.Failure.sidecar_present, store.last_failure());
+    try temporary.dir.deleteFile(std.testing.io, sidecar_name);
+    var access = (try store.acquire_generation(&access_storage, &access_workspace)).?;
+    try std.testing.expectEqual(current, try access.current());
+    try access.release();
+
+    const saved_database_name = "saved-generation.sqlite";
+    try temporary.dir.rename(
+        current.database_name(),
+        temporary.dir,
+        saved_database_name,
+        std.testing.io,
+    );
+    try std.testing.expectError(
+        error.DatabaseMissing,
+        store.acquire_generation(&access_storage, &access_workspace),
+    );
+    try temporary.dir.rename(
+        saved_database_name,
+        temporary.dir,
+        current.database_name(),
+        std.testing.io,
+    );
+
+    var database = try temporary.dir.openFile(std.testing.io, current.database_name(), .{
+        .mode = .read_write,
+        .follow_symlinks = false,
+    });
+    try database.writePositionalAll(std.testing.io, "X", 0);
+    database.close(std.testing.io);
+    try std.testing.expectError(
+        error.InvalidSQLiteDatabase,
+        store.acquire_generation(&access_storage, &access_workspace),
+    );
+    database = try temporary.dir.openFile(std.testing.io, current.database_name(), .{
+        .mode = .read_write,
+        .follow_symlinks = false,
+    });
+    try database.writePositionalAll(std.testing.io, "S", 0);
+    database.close(std.testing.io);
+    access = (try store.acquire_generation(&access_storage, &access_workspace)).?;
+    try access.release();
+}
+
+test "generation access rejects state and output workspace aliasing" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var gate: Gate = .{};
+    var copy_workspace: [61]u8 = undefined;
+    const StoreWorkspaceAlias = union {
+        store: sqlite.Store,
+        workspace: sqlite.GenerationAccessWorkspace,
+    };
+    var aliased: StoreWorkspaceAlias = undefined;
+    aliased.store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &copy_workspace,
+        gate.lifecycle(),
+        .{},
+    );
+    var storage: sqlite.GenerationAccessStorage = .{};
+    const aliased_workspace: *sqlite.GenerationAccessWorkspace = @ptrCast(&aliased);
+    try std.testing.expectError(
+        error.InvalidWorkspace,
+        aliased.store.acquire_generation(&storage, aliased_workspace),
+    );
+
+    var valid_workspace: sqlite.GenerationAccessWorkspace = .{};
+    const store_storage: *sqlite.GenerationAccessStorage = @ptrCast(@alignCast(&aliased.store));
+    try std.testing.expectError(
+        error.InvalidWorkspace,
+        aliased.store.acquire_generation(store_storage, &valid_workspace),
+    );
+
+    var overlap_bytes: [
+        @max(
+            @sizeOf(sqlite.GenerationAccessStorage),
+            @sizeOf(sqlite.GenerationAccessWorkspace),
+        )
+    ]u8 align(@max(
+        @alignOf(sqlite.GenerationAccessStorage),
+        @alignOf(sqlite.GenerationAccessWorkspace),
+    )) = undefined;
+    const overlap_storage: *sqlite.GenerationAccessStorage = @ptrCast(&overlap_bytes);
+    const overlap_workspace: *sqlite.GenerationAccessWorkspace = @ptrCast(&overlap_bytes);
+    overlap_workspace.* = .{};
+    try std.testing.expectError(
+        error.InvalidWorkspace,
+        aliased.store.acquire_generation(overlap_storage, overlap_workspace),
+    );
+
+    try std.testing.expectEqual(
+        null,
+        try aliased.store.acquire_generation(&storage, &valid_workspace),
+    );
+}
+
+test "generation access rejects overlap with the store copy workspace" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var storage_backing: sqlite.GenerationAccessStorage = .{};
+    var first_gate: Gate = .{};
+    var first_store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        std.mem.asBytes(&storage_backing),
+        first_gate.lifecycle(),
+        .{},
+    );
+    var first_workspace: sqlite.GenerationAccessWorkspace = .{};
+    try std.testing.expectError(
+        error.InvalidWorkspace,
+        first_store.acquire_generation(&storage_backing, &first_workspace),
+    );
+    var valid_storage: sqlite.GenerationAccessStorage = .{};
+    try std.testing.expectEqual(
+        null,
+        try first_store.acquire_generation(&valid_storage, &first_workspace),
+    );
+
+    var workspace_backing: sqlite.GenerationAccessWorkspace = .{};
+    var second_gate: Gate = .{};
+    var second_store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        std.mem.asBytes(&workspace_backing),
+        second_gate.lifecycle(),
+        .{},
+    );
+    var second_storage: sqlite.GenerationAccessStorage = .{};
+    try std.testing.expectError(
+        error.InvalidWorkspace,
+        second_store.acquire_generation(&second_storage, &workspace_backing),
+    );
+    var valid_workspace: sqlite.GenerationAccessWorkspace = .{};
+    try std.testing.expectEqual(
+        null,
+        try second_store.acquire_generation(&second_storage, &valid_workspace),
+    );
+}
+
+test "indeterminate publication retains exclusive lock until recovery" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var first_gate: Gate = .{};
+    var first_copy: [53]u8 = undefined;
+    var faults: sqlite.FaultInjection = .{ .fail_at = .manifest_rename };
+    var first_store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &first_copy,
+        first_gate.lifecycle(),
+        .{ .fault_injection = &faults },
+    );
+    const header = make_header(1, 1, 0);
+    const initial = try begin(&first_store, make_plan(.contiguous, header));
+    try std.testing.expectError(
+        error.ApplyPublishIndeterminate,
+        publish(&first_store, initial, make_verified(header)),
+    );
+    try std.testing.expect(first_gate.held);
+    var first_storage: sqlite.GenerationAccessStorage = .{};
+    var first_uri: sqlite.GenerationAccessWorkspace = .{};
+    try std.testing.expectError(
+        error.InvalidState,
+        first_store.acquire_generation(&first_storage, &first_uri),
+    );
+
+    var second_gate: Gate = .{};
+    var second_copy: [59]u8 = undefined;
+    var second_store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &second_copy,
+        second_gate.lifecycle(),
+        .{},
+    );
+    var second_storage: sqlite.GenerationAccessStorage = .{};
+    var second_uri: sqlite.GenerationAccessWorkspace = .{};
+    try std.testing.expectError(
+        error.StoreBusy,
+        second_store.acquire_generation(&second_storage, &second_uri),
+    );
+    try std.testing.expectError(error.StoreBusy, second_store.current());
+    try std.testing.expectError(error.StoreBusy, second_store.recover());
+    try std.testing.expect(second_gate.held);
+
+    faults.fail_at = null;
+    const recovered = (try first_store.recover()).?;
+    try std.testing.expectEqual(@as(u64, 1), recovered.generation);
+    try std.testing.expect(!first_gate.held);
+    try std.testing.expectEqual(recovered, (try second_store.recover()).?);
+    try std.testing.expect(!second_gate.held);
+    var access = (try second_store.acquire_generation(&second_storage, &second_uri)).?;
+    try std.testing.expectEqual(recovered, try access.current());
+    try access.release();
 }

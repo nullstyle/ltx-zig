@@ -276,10 +276,13 @@ The optional `ltx_sqlite` adapter implements private filesystem staging and
 atomically combines the expected-position comparison, complete-image selection,
 page-size metadata, and position advance in one checksummed manifest. It
 installs a durable empty manifest before first publication, requires
-application-owned SQLite quiescence and immutable read-only active generations,
-and is exercised at each durability boundary by a separate crash process. The
-core itself remains filesystem- and SQLite-independent. The exact durability
-and recovery protocol is in
+application-owned SQLite quiescence, and grants immutable read-only active
+generations through typed accesses that hold a shared advisory lock across
+manifest resolution and connection lifetime. Publication and recovery hold the
+same lock exclusively, including through indeterminate recovery. The adapter is
+exercised at each durability boundary by a separate crash process. The core
+itself remains filesystem- and SQLite-independent. The exact durability and
+recovery protocol is in
 [`sqlite-store.md`](sqlite-store.md).
 
 Fixed-path publication beneath open SQLite handles remains unsupported because
