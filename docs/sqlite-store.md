@@ -123,6 +123,10 @@ Before `begin` returns, its quiesce callback must:
 7. keep admission closed until the store invokes the infallible release
    callback; an indeterminate publication retains that gate through recovery.
 
+Quiescence is transactional. If the callback returns `QuiesceFailure`, it must
+restore admission and retain no lifecycle ownership that would require the
+release callback; the store invokes `release` only after `quiesce` succeeds.
+
 The store then requires the active and staging slot names to have no `-wal`,
 `-shm`, or `-journal` sibling. It does not delete those files: their presence
 means SQLite recovery or connection draining is incomplete, so apply fails
@@ -179,6 +183,46 @@ that ownership, retries the directory sync, and releases both only after a valid
 manifest-selected generation is durable. Image and position remain paired even
 when the original publication caller could not know which generation survived.
 
+### Operational state and failure inspection
+
+`Store.current_state()` exposes the adapter's ownership state without changing
+it:
+
+| State | Meaning | Permitted next operation |
+| --- | --- | --- |
+| `idle` | The store owns no lifecycle gate, exclusive lock, or private stage. | Read `current()`, acquire a generation, start a new staged apply, or call `recover()`. |
+| `acquiring` | A synchronous `begin` or `recover` call is acquiring ownership. | None; the store is single-owner and non-reentrant. |
+| `staging` | A `StagedApplier` owns the private inactive-slot image and closed admission gate. | Continue that applier only. Its ordinary failure calls `abort` and returns the store to `idle`. |
+| `recovery_required` | Quiescence succeeded but publication or recovery has not reached a known durable state. | Retry `recover()` on the same `Store`, or terminate the process. |
+
+`Store.last_failure()` supplies the SQLite-store cause hidden behind generic
+backend errors such as `ApplyBeginFailure` and `ApplyPublishFailure`. Every
+recorded store error overwrites it. A successful `current()`,
+`acquire_generation()`, `recover()`, `begin`, or `publish` clears it to `none`.
+An ordinary staged-apply abort intentionally does not clear it, so the cause is
+still available after `StagedApplier.apply()` returns. Decoder, transition, and
+other applier errors that did not originate in the store do not synthesize a
+store failure. Errors on a `GenerationAccess` handle likewise do not mutate a
+`Store`.
+
+Use the returned error, state, and failure together:
+
+| Result | Store state after return | Required action |
+| --- | --- | --- |
+| `ApplyBeginFailure` after an apply starts in `idle`, or `ApplyStageFailure`, `ApplyReadFailure`, or ordinary `ApplyPublishFailure` after begin succeeds | `idle` after `StagedApplier` has unwound | Inspect `last_failure()`, repair the cause, construct a new one-shot applier, and retry. The old manifest remains authoritative. |
+| An applier that starts in `idle` returns a decoding, transition, or image-check error | `idle` after any required abort | Repair or replace the LTX input and construct a new applier. `last_failure()` is not an applier-error channel. |
+| `ApplyPublishIndeterminate` | `recovery_required` | Inspect `last_failure()` and call `recover()` on this exact `Store` until it succeeds. Do not reopen SQLite. |
+| `recover()` returns `QuiesceFailure` | `idle` | The callback must already have restored admission and retained no lifecycle ownership; the store does not invoke `release`. Repair the callback cause and retry. |
+| `recover()` returns any error after quiescence, including `StoreBusy` | `recovery_required` | Keep admission closed, repair the cause or wait for the shared lease owner, then retry `recover()` on this exact `Store`. |
+| `current()` or `acquire_generation()` starts in `idle` and returns an error | `idle` | Inspect `last_failure()`, repair the cause, and retry. Any attempted shared lock was unwound. |
+| A direct operation forbidden by the current state returns `InvalidState`, or a new apply reports `ApplyBeginFailure` for that cause | Unchanged | Inspect `current_state()` and follow that state's permitted path; the rejected call records `invalid_state` but releases no retained ownership. |
+
+`Store.init()` errors have no initialized store on which to query a failure.
+`FaultPoint` and `FaultInjection` are intentionally exposed only so durability
+tests can terminate or fail at exact barriers. They are an unstable testing
+surface, not a production integration contract; production callers must leave
+`Options.fault_injection` null.
+
 ## Recovery rules
 
 Recovery runs behind the same closed admission gate and exclusive store lock.
@@ -220,6 +264,14 @@ read-only through a typed access and checked semantically. These tests prove
 resource abandonment, lock release, and deterministic visible old/new selection
 after an application crash. They do not simulate a machine power loss; the
 sync/rename ordering and filesystem contract are the basis for that guarantee.
+
+A separate synchronized child holds a live shared generation lease while the
+parent proves that other shared readers remain admissible but publication and
+recovery cannot acquire exclusive ownership. The parent then terminates that
+child without release, retries the already fail-closed recovery store, verifies
+the exact generation, and publishes the next generation. This qualifies actual
+cross-process advisory-lock ownership and operating-system cleanup rather than
+inferring it from same-process handles.
 
 `zig build sqlite-integration` also creates three bounded database images using
 the host SQLite library in WAL mode. It publishes A as a checksummed snapshot,

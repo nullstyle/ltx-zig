@@ -311,6 +311,9 @@ is not permission to open that filename. If apply returns
 lifecycle gate and exclusive store lock held; call `store.recover()` until it
 succeeds before opening SQLite or starting another apply. Full deployment
 constraints and crash outcomes are in [the SQLite store guide](docs/sqlite-store.md).
+`store.current_state()` reports whether the store is idle, acquiring, staging,
+or recovery-required, while `store.last_failure()` exposes the adapter-specific
+cause hidden behind a generic staged-apply backend error.
 
 Store changes are qualified with real child-process termination at every
 baseline and publication sync/rename boundary. `zig build sqlite-integration`

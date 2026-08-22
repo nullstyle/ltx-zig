@@ -232,6 +232,376 @@ fn expect_missing(dir: std.Io.Dir, name: []const u8) !void {
     return error.TestUnexpectedResult;
 }
 
+const ReturnedFaultClass = enum {
+    baseline,
+    loaded_manifest,
+    publish_precommit,
+    publish_postcommit,
+};
+
+const returned_fault_cases = [_]struct {
+    point: sqlite.FaultPoint,
+    class: ReturnedFaultClass,
+}{
+    .{ .point = .baseline_manifest_sync, .class = .baseline },
+    .{ .point = .baseline_directory_sync, .class = .baseline },
+    .{ .point = .baseline_manifest_rename, .class = .baseline },
+    .{ .point = .baseline_commit_directory_sync, .class = .baseline },
+    .{ .point = .loaded_manifest_directory_sync, .class = .loaded_manifest },
+    .{ .point = .database_sync, .class = .publish_precommit },
+    .{ .point = .database_directory_sync, .class = .publish_precommit },
+    .{ .point = .manifest_sync, .class = .publish_precommit },
+    .{ .point = .manifest_directory_sync, .class = .publish_precommit },
+    .{ .point = .manifest_rename, .class = .publish_postcommit },
+    .{ .point = .commit_directory_sync, .class = .publish_postcommit },
+};
+
+comptime {
+    const point_count = std.meta.fields(sqlite.FaultPoint).len;
+    var seen: [point_count]bool = @splat(false);
+    for (returned_fault_cases) |case| {
+        mark_returned_fault_covered(&seen, case.point);
+    }
+    for (seen) |covered| {
+        if (!covered) @compileError("SQLite returned fault point lacks coverage");
+    }
+}
+
+fn mark_returned_fault_covered(seen: []bool, point: sqlite.FaultPoint) void {
+    const index = @intFromEnum(point);
+    if (seen[index]) @compileError("duplicate SQLite returned fault point");
+    seen[index] = true;
+}
+
+fn seed_page_generation(
+    store: *sqlite.Store,
+    txid: u64,
+    page: *const [page_size]u8,
+) !sqlite.Current {
+    const header = make_header(txid, txid, 1);
+    const expected = try begin(store, make_plan(.contiguous, header));
+    try stage(store, 1, 0, page);
+    try publish(store, expected, make_verified(header));
+    return (try store.current()).?;
+}
+
+fn expect_database_page(
+    dir: std.Io.Dir,
+    current: sqlite.Current,
+    expected_page: *const [page_size]u8,
+) !void {
+    var file = try dir.openFile(std.testing.io, current.database_name(), .{
+        .mode = .read_only,
+        .follow_symlinks = false,
+    });
+    defer file.close(std.testing.io);
+
+    var actual_page: [page_size]u8 = undefined;
+    try read_exact(file, &actual_page, 0);
+    try std.testing.expectEqualSlices(u8, expected_page, &actual_page);
+    const stat = try file.stat(std.testing.io);
+    try std.testing.expectEqual(@as(u64, page_size), stat.size);
+}
+
+fn expect_exclusive_store_lock_held(dir: std.Io.Dir) !void {
+    var observer_gate: Gate = .{};
+    var observer_workspace: [47]u8 = undefined;
+    var observer = try sqlite.Store.init(
+        std.testing.io,
+        dir,
+        &observer_workspace,
+        observer_gate.lifecycle(),
+        .{},
+    );
+    try std.testing.expectError(error.StoreBusy, observer.current());
+    try std.testing.expectEqual(sqlite.Failure.store_busy, observer.last_failure());
+}
+
+fn expected_page_current(slot: sqlite.Slot, generation: u64, txid: u64) sqlite.Current {
+    return .{
+        .position = .{ .txid = .init(txid), .post_apply_checksum = .init(0) },
+        .page_size = page_size,
+        .database_size_bytes = page_size,
+        .generation = generation,
+        .slot = slot,
+    };
+}
+
+fn exercise_baseline_recovery_fault(point: sqlite.FaultPoint) !void {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var gate: Gate = .{};
+    var workspace: [47]u8 = undefined;
+    var faults: sqlite.FaultInjection = .{ .fail_at = point };
+    var store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &workspace,
+        gate.lifecycle(),
+        .{ .fault_injection = &faults },
+    );
+
+    try std.testing.expectEqual(sqlite.StoreState.idle, store.current_state());
+    try std.testing.expectError(error.FaultInjected, store.recover());
+    try std.testing.expectEqual(sqlite.StoreState.recovery_required, store.current_state());
+    try std.testing.expect(gate.held);
+    try std.testing.expectEqual(@as(u32, 1), gate.quiesce_count);
+    try std.testing.expectEqual(@as(u32, 0), gate.release_count);
+    try std.testing.expectEqual(sqlite.Failure.fault_injected, store.last_failure());
+    try expect_exclusive_store_lock_held(temporary.dir);
+
+    faults.fail_at = null;
+    try std.testing.expectEqual(null, try store.recover());
+    try std.testing.expectEqual(sqlite.StoreState.idle, store.current_state());
+    try std.testing.expect(!gate.held);
+    try std.testing.expectEqual(gate.quiesce_count, gate.release_count);
+    try std.testing.expectEqual(sqlite.Failure.none, store.last_failure());
+    try std.testing.expectEqual(null, try store.current());
+    const manifest_stat = try temporary.dir.statFile(
+        std.testing.io,
+        sqlite.manifest_name,
+        .{ .follow_symlinks = false },
+    );
+    try std.testing.expectEqual(@as(u64, 64), manifest_stat.size);
+    try expect_missing(temporary.dir, sqlite.manifest_temporary_name);
+    try expect_missing(temporary.dir, sqlite.database_a_name);
+    try expect_missing(temporary.dir, sqlite.database_b_name);
+}
+
+fn exercise_baseline_begin_fault(point: sqlite.FaultPoint) !void {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var gate: Gate = .{};
+    var workspace: [47]u8 = undefined;
+    var faults: sqlite.FaultInjection = .{ .fail_at = point };
+    var store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &workspace,
+        gate.lifecycle(),
+        .{ .fault_injection = &faults },
+    );
+    const page = make_sqlite_page(0x31);
+    const header = make_header(1, 1, 1);
+
+    try std.testing.expectError(
+        error.ApplyBeginFailure,
+        begin(&store, make_plan(.contiguous, header)),
+    );
+    try std.testing.expectEqual(sqlite.StoreState.idle, store.current_state());
+    try std.testing.expect(!gate.held);
+    try std.testing.expectEqual(@as(u32, 1), gate.quiesce_count);
+    try std.testing.expectEqual(gate.quiesce_count, gate.release_count);
+    try std.testing.expectEqual(sqlite.Failure.fault_injected, store.last_failure());
+
+    faults.fail_at = null;
+    const current = try seed_page_generation(&store, 1, &page);
+    try std.testing.expectEqual(expected_page_current(.a, 1, 1), current);
+    try std.testing.expectEqual(sqlite.StoreState.idle, store.current_state());
+    try std.testing.expect(!gate.held);
+    try std.testing.expectEqual(gate.quiesce_count, gate.release_count);
+    try std.testing.expectEqual(sqlite.Failure.none, store.last_failure());
+    try expect_database_page(temporary.dir, current, &page);
+    try expect_missing(temporary.dir, sqlite.manifest_temporary_name);
+}
+
+fn exercise_loaded_manifest_recovery_fault(point: sqlite.FaultPoint) !void {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var gate: Gate = .{};
+    var workspace: [47]u8 = undefined;
+    var faults: sqlite.FaultInjection = .{};
+    var store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &workspace,
+        gate.lifecycle(),
+        .{ .fault_injection = &faults },
+    );
+    const old_page = make_sqlite_page(0x11);
+    const old_current = try seed_page_generation(&store, 1, &old_page);
+
+    faults.fail_at = point;
+    try std.testing.expectError(error.FaultInjected, store.recover());
+    try std.testing.expectEqual(sqlite.StoreState.recovery_required, store.current_state());
+    try std.testing.expect(gate.held);
+    try std.testing.expectEqual(sqlite.Failure.fault_injected, store.last_failure());
+    try expect_exclusive_store_lock_held(temporary.dir);
+
+    faults.fail_at = null;
+    try std.testing.expectEqual(old_current, (try store.recover()).?);
+    try std.testing.expectEqual(sqlite.StoreState.idle, store.current_state());
+    try std.testing.expect(!gate.held);
+    try std.testing.expectEqual(gate.quiesce_count, gate.release_count);
+    try std.testing.expectEqual(sqlite.Failure.none, store.last_failure());
+    try expect_database_page(temporary.dir, old_current, &old_page);
+}
+
+fn exercise_loaded_manifest_begin_fault(point: sqlite.FaultPoint) !void {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var gate: Gate = .{};
+    var workspace: [47]u8 = undefined;
+    var faults: sqlite.FaultInjection = .{};
+    var store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &workspace,
+        gate.lifecycle(),
+        .{ .fault_injection = &faults },
+    );
+    const old_page = make_sqlite_page(0x41);
+    const new_page = make_sqlite_page(0x42);
+    const old_current = try seed_page_generation(&store, 1, &old_page);
+    const header = make_header(2, 2, 1);
+
+    faults.fail_at = point;
+    try std.testing.expectError(
+        error.ApplyBeginFailure,
+        begin(&store, make_plan(.contiguous, header)),
+    );
+    try std.testing.expectEqual(sqlite.StoreState.idle, store.current_state());
+    try std.testing.expect(!gate.held);
+    try std.testing.expectEqual(gate.quiesce_count, gate.release_count);
+    try std.testing.expectEqual(sqlite.Failure.fault_injected, store.last_failure());
+
+    var observer_gate: Gate = .{};
+    var observer_workspace: [47]u8 = undefined;
+    var observer = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &observer_workspace,
+        observer_gate.lifecycle(),
+        .{},
+    );
+    try std.testing.expectEqual(old_current, (try observer.current()).?);
+    try expect_database_page(temporary.dir, old_current, &old_page);
+    try std.testing.expectEqual(sqlite.Failure.fault_injected, store.last_failure());
+
+    faults.fail_at = null;
+    const current = try seed_page_generation(&store, 2, &new_page);
+    try std.testing.expectEqual(expected_page_current(.b, 2, 2), current);
+    try std.testing.expectEqual(sqlite.StoreState.idle, store.current_state());
+    try std.testing.expectEqual(gate.quiesce_count, gate.release_count);
+    try std.testing.expectEqual(sqlite.Failure.none, store.last_failure());
+    try expect_database_page(temporary.dir, current, &new_page);
+}
+
+fn exercise_publish_fault(point: sqlite.FaultPoint, postcommit: bool) !void {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var gate: Gate = .{};
+    var workspace: [47]u8 = undefined;
+    var faults: sqlite.FaultInjection = .{};
+    var store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &workspace,
+        gate.lifecycle(),
+        .{ .fault_injection = &faults },
+    );
+    const old_page = make_sqlite_page(0x11);
+    const new_page = make_sqlite_page(0x22);
+    const old_current = try seed_page_generation(&store, 1, &old_page);
+
+    faults.fail_at = point;
+    const header = make_header(2, 2, 1);
+    const expected = try begin(&store, make_plan(.contiguous, header));
+    try std.testing.expectEqual(sqlite.StoreState.staging, store.current_state());
+    try stage(&store, 1, 0, &new_page);
+    const verified = make_verified(header);
+
+    if (!postcommit) {
+        try std.testing.expectError(error.ApplyPublishFailure, publish(&store, expected, verified));
+        try std.testing.expectEqual(sqlite.StoreState.staging, store.current_state());
+        try std.testing.expect(gate.held);
+        try std.testing.expectEqual(sqlite.Failure.fault_injected, store.last_failure());
+        try expect_exclusive_store_lock_held(temporary.dir);
+        abort(&store);
+        try std.testing.expectEqual(sqlite.StoreState.idle, store.current_state());
+        try std.testing.expect(!gate.held);
+        try std.testing.expectEqual(gate.quiesce_count, gate.release_count);
+        try std.testing.expectEqual(sqlite.Failure.fault_injected, store.last_failure());
+
+        var observer_gate: Gate = .{};
+        var observer_workspace: [47]u8 = undefined;
+        var observer = try sqlite.Store.init(
+            std.testing.io,
+            temporary.dir,
+            &observer_workspace,
+            observer_gate.lifecycle(),
+            .{},
+        );
+        try std.testing.expectEqual(old_current, (try observer.current()).?);
+        try expect_database_page(temporary.dir, old_current, &old_page);
+        try std.testing.expectEqual(sqlite.Failure.fault_injected, store.last_failure());
+        return;
+    }
+
+    try std.testing.expectError(error.ApplyPublishIndeterminate, publish(&store, expected, verified));
+    try std.testing.expectEqual(sqlite.StoreState.recovery_required, store.current_state());
+    try std.testing.expect(gate.held);
+    try std.testing.expectEqual(@as(u32, 2), gate.quiesce_count);
+    try std.testing.expectEqual(@as(u32, 1), gate.release_count);
+    try std.testing.expectEqual(sqlite.Failure.fault_injected, store.last_failure());
+    try expect_exclusive_store_lock_held(temporary.dir);
+
+    faults.fail_at = null;
+    const expected_new = expected_page_current(.b, 2, 2);
+    const recovered = (try store.recover()).?;
+    try std.testing.expectEqual(expected_new, recovered);
+    try std.testing.expectEqual(sqlite.StoreState.idle, store.current_state());
+    try std.testing.expect(!gate.held);
+    try std.testing.expectEqual(gate.quiesce_count, gate.release_count);
+    try std.testing.expectEqual(sqlite.Failure.none, store.last_failure());
+    try expect_database_page(temporary.dir, recovered, &new_page);
+}
+
+test "returned faults preserve canonical SQLite store state" {
+    for (returned_fault_cases) |case| {
+        switch (case.class) {
+            .baseline => {
+                try exercise_baseline_recovery_fault(case.point);
+                try exercise_baseline_begin_fault(case.point);
+            },
+            .loaded_manifest => {
+                try exercise_loaded_manifest_recovery_fault(case.point);
+                try exercise_loaded_manifest_begin_fault(case.point);
+            },
+            .publish_precommit => try exercise_publish_fault(case.point, false),
+            .publish_postcommit => try exercise_publish_fault(case.point, true),
+        }
+    }
+}
+
+test "publish outside staging records invalid state" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var gate: Gate = .{};
+    var workspace: [31]u8 = undefined;
+    var store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &workspace,
+        gate.lifecycle(),
+        .{},
+    );
+    const header = make_header(1, 1, 0);
+    const empty = ltx.ApplyCurrent{
+        .position = .{ .txid = .init(0), .post_apply_checksum = .init(0) },
+        .page_size = null,
+    };
+
+    try std.testing.expectError(
+        error.ApplyPublishFailure,
+        publish(&store, empty, make_verified(header)),
+    );
+    try std.testing.expectEqual(sqlite.StoreState.idle, store.current_state());
+    try std.testing.expectEqual(sqlite.Failure.invalid_state, store.last_failure());
+    try std.testing.expectEqual(null, try store.current());
+    try std.testing.expectEqual(sqlite.Failure.none, store.last_failure());
+}
+
 test "recovery durably initializes a pristine store" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -460,11 +830,15 @@ test "store lock and lifecycle failures do not leak ownership" {
     try std.testing.expectEqual(sqlite.Failure.store_busy, second.last_failure());
     try std.testing.expectError(error.ApplyBeginFailure, begin(&second, plan));
     try std.testing.expectEqual(sqlite.Failure.store_busy, second.last_failure());
+    try std.testing.expectEqual(sqlite.StoreState.idle, second.current_state());
+    try std.testing.expectEqual(second_gate.quiesce_count, second_gate.release_count);
     abort(&first);
 
     second_gate.fail = true;
     try std.testing.expectError(error.ApplyBeginFailure, begin(&second, plan));
     try std.testing.expectEqual(sqlite.Failure.quiesce_failure, second.last_failure());
+    try std.testing.expectEqual(sqlite.StoreState.idle, second.current_state());
+    try std.testing.expectEqual(second_gate.quiesce_count, second_gate.release_count);
     second_gate.fail = false;
     _ = try begin(&first, plan);
     abort(&first);
@@ -1039,6 +1413,7 @@ test "generation access rejects state and output workspace aliasing" {
         error.InvalidWorkspace,
         aliased.store.acquire_generation(&storage, aliased_workspace),
     );
+    try std.testing.expectEqual(sqlite.Failure.invalid_workspace, aliased.store.last_failure());
 
     var valid_workspace: sqlite.GenerationAccessWorkspace = .{};
     const store_storage: *sqlite.GenerationAccessStorage = @ptrCast(@alignCast(&aliased.store));
@@ -1046,6 +1421,7 @@ test "generation access rejects state and output workspace aliasing" {
         error.InvalidWorkspace,
         aliased.store.acquire_generation(store_storage, &valid_workspace),
     );
+    try std.testing.expectEqual(sqlite.Failure.invalid_workspace, aliased.store.last_failure());
 
     var overlap_bytes: [
         @max(
@@ -1063,11 +1439,13 @@ test "generation access rejects state and output workspace aliasing" {
         error.InvalidWorkspace,
         aliased.store.acquire_generation(overlap_storage, overlap_workspace),
     );
+    try std.testing.expectEqual(sqlite.Failure.invalid_workspace, aliased.store.last_failure());
 
     try std.testing.expectEqual(
         null,
         try aliased.store.acquire_generation(&storage, &valid_workspace),
     );
+    try std.testing.expectEqual(sqlite.Failure.none, aliased.store.last_failure());
 }
 
 test "generation access rejects overlap with the store copy workspace" {

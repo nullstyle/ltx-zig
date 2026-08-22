@@ -139,6 +139,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "ltx", .module = host_ltx },
                 .{ .name = "ltx_sqlite", .module = host_sqlite_store },
                 .{ .name = "crash_options", .module = crash_options_module },
             },

@@ -9,6 +9,8 @@ const real_max_pages: u32 = 64;
 const real_max_database_bytes = real_max_pages * real_page_size;
 const real_max_compressed_bytes: u32 = 1100;
 const real_max_ltx_bytes: u32 = 128 * 1024;
+const hold_generation_scenario = "hold-generation";
+const ready_message = "READY\n";
 
 const real_codec_limits = ltx.Limits{
     .max_input_bytes = real_max_ltx_bytes,
@@ -62,6 +64,11 @@ const Crash = struct {
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len == 3 and std.mem.eql(u8, args[1], hold_generation_scenario)) {
+        var dir = try std.Io.Dir.openDirAbsolute(init.io, args[2], .{});
+        defer dir.close(init.io);
+        return hold_generation(init.io, dir);
+    }
     if (args.len != 4) return error.InvalidArguments;
     const scenario = std.meta.stringToEnum(protocol.Scenario, args[1]) orelse
         return error.InvalidArguments;
@@ -80,6 +87,32 @@ pub fn main(init: std.process.Init) !void {
         .real_reuse_publication => try crash_real_reuse_publication(init.io, dir, point),
     }
     return error.CrashPointNotReached;
+}
+
+fn hold_generation(io: std.Io, dir: std.Io.Dir) !void {
+    var gate: Gate = .{};
+    var copy_workspace: [73]u8 = undefined;
+    var store = try sqlite.Store.init(
+        io,
+        dir,
+        &copy_workspace,
+        gate.lifecycle(),
+        .{},
+    );
+    var storage: sqlite.GenerationAccessStorage = .{};
+    var access_workspace: sqlite.GenerationAccessWorkspace = .{};
+    var access = (try store.acquire_generation(&storage, &access_workspace)) orelse
+        return error.ExpectedGeneration;
+    const current = try access.current();
+    if (current.generation != 1 or current.position.txid.value != 1 or current.slot != .a) {
+        return error.UnexpectedGeneration;
+    }
+
+    try std.Io.File.stdout().writeStreamingAll(io, ready_message);
+    var control: [1]u8 = undefined;
+    _ = try std.Io.File.stdin().readStreaming(io, &.{&control});
+    _ = try access.current();
+    return error.UnexpectedLeaseRelease;
 }
 
 fn crash_baseline(io: std.Io, dir: std.Io.Dir, point: sqlite.FaultPoint) !void {

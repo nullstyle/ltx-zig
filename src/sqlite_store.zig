@@ -62,8 +62,15 @@ pub const Error = error{
     IOFailure,
 };
 
+/// Adapter-specific cause retained when a public store operation fails or an
+/// `ApplyBackend` callback must collapse that cause into a generic `ltx` apply
+/// error. The outer apply error still determines the failed phase and whether
+/// recovery is mandatory; this value supplies only the SQLite-store cause.
+/// Other than `none`, tags mirror `Error` one-for-one. See `Store.last_failure`
+/// for reset and overwrite rules.
 pub const Failure = enum {
     none,
+    invalid_workspace,
     invalid_state,
     invalid_database_path,
     unsupported_platform,
@@ -79,6 +86,24 @@ pub const Failure = enum {
     generation_overflow,
     fault_injected,
     io_failure,
+};
+
+/// Observable lifecycle of one `Store`.
+pub const StoreState = enum {
+    /// No stage, lifecycle gate, or exclusive store lock is retained. Public
+    /// reads, generation acquisition, apply begin, and recovery may start.
+    idle,
+    /// The store is synchronously acquiring application quiescence and the
+    /// exclusive store lock. Callbacks are non-reentrant, so callers normally
+    /// cannot observe this transient state.
+    acquiring,
+    /// An `ApplyBackend.begin` succeeded and owns a private database stage.
+    /// Publication or abort must end it.
+    staging,
+    /// Publication may have crossed its commit point, or recovery progressed
+    /// past quiescence and then failed. Only `Store.recover` may advance this
+    /// store; the lifecycle gate and possibly the exclusive lock remain held.
+    recovery_required,
 };
 
 pub const Slot = enum(u8) {
@@ -104,7 +129,11 @@ pub const Slot = enum(u8) {
 /// stops new opens, checkpoints and closes all owned connections, and returns
 /// only after neither database generation has live SQLite users. `release` reopens
 /// the gate; reopening a connection is the application's responsibility. The
-/// host must hold its generation lease and open the active generation through
+/// operation is transactional: on `QuiesceFailure`, `quiesce` must restore
+/// admission and retain no ownership that requires `release`, because the store
+/// calls `release` only after a successful `quiesce`.
+///
+/// The host must hold its generation lease and open the active generation through
 /// SQLite read-only (including `query_only`; WAL-header images also need the
 /// `immutable=1` URI option) because no-checksum positions cannot detect
 /// outside writes.
@@ -114,7 +143,9 @@ pub const Lifecycle = struct {
     release_fn: *const fn (context: *anyopaque) void,
 };
 
-/// Exact durability boundaries exposed to deterministic crash tests.
+/// Testing-only, unstable durability boundaries exposed to deterministic crash
+/// tests. These names are not part of the supported production API and may
+/// change during any 0.x release.
 pub const FaultPoint = enum {
     baseline_manifest_sync,
     baseline_directory_sync,
@@ -129,9 +160,10 @@ pub const FaultPoint = enum {
     commit_directory_sync,
 };
 
-/// Deterministic fault injection for durability tests. `hit_fn` runs at every
-/// boundary and may terminate the process. Production callers should leave
-/// `Options.fault_injection` null.
+/// Testing-only, unstable fault injection for durability tests. `hit_fn` runs
+/// at every boundary and may terminate the process. This type is outside the
+/// supported production API and may change during any 0.x release. Production
+/// callers must leave `Options.fault_injection` null.
 pub const FaultInjection = struct {
     /// Compatibility controls retained for callers of the original test API.
     /// Prefer `fail_at` for new tests.
@@ -143,6 +175,7 @@ pub const FaultInjection = struct {
 };
 
 pub const Options = struct {
+    /// Testing-only and unstable. Production callers must leave this null.
     fault_injection: ?*const FaultInjection = null,
 };
 
@@ -482,8 +515,6 @@ test "SQLite generation URI workspace covers the maximum valid path" {
     );
 }
 
-const Phase = enum { idle, acquiring, staging, recovery_required };
-
 /// Allocation-free, quiescent two-generation SQLite storage. The directory is
 /// borrowed; the `std.Io` provider, its backing context, and `copy_workspace`
 /// must remain valid for the store's lifetime and until every generation access
@@ -495,7 +526,7 @@ pub const Store = struct {
     copy_workspace: []u8,
     lifecycle: Lifecycle,
     options: Options,
-    phase: Phase = .idle,
+    state: StoreState = .idle,
     gate_held: bool = false,
     lock_file: ?std.Io.File = null,
     stage_file: ?std.Io.File = null,
@@ -526,6 +557,10 @@ pub const Store = struct {
         };
     }
 
+    /// Returns the storage-neutral adapter. Its callback error sets intentionally
+    /// collapse platform causes; after a generic callback error, inspect
+    /// `last_failure` before another operation can overwrite it. The outer
+    /// `ltx` error remains authoritative for apply phase and recovery policy.
     pub fn backend(self: *Store) ltx.ApplyBackend {
         return .{
             .context = self,
@@ -538,12 +573,32 @@ pub const Store = struct {
         };
     }
 
+    /// Returns the store lifecycle without changing `last_failure`. This is a
+    /// diagnostic snapshot, not synchronization authority; the store remains
+    /// single-owner and its callbacks remain non-reentrant.
+    pub fn current_state(self: *const Store) StoreState {
+        return self.state;
+    }
+
+    /// Returns the most recent SQLite-store cause. Failures from `current`,
+    /// `acquire_generation`, `recover`, or a generic-failure adapter callback
+    /// overwrite it. Successful `current`, `acquire_generation`, `recover`,
+    /// apply begin, and publication clear it. Abort deliberately preserves the
+    /// callback cause that triggered it. A failed recovery may replace an
+    /// indeterminate-publication cause with the newer recovery cause, while
+    /// successful recovery clears it.
+    ///
+    /// Generic `ltx` apply errors retain their own meaning: in particular,
+    /// `ApplyPublishIndeterminate` requires `recover` regardless of this value.
+    /// Read and snapshot this value before an operation that may record or
+    /// clear it.
     pub fn last_failure(self: *const Store) Failure {
         return self.failure;
     }
 
     /// Reads the atomic pointer. It does not quiesce SQLite or inspect the
-    /// database image; use `recover` when publication was indeterminate.
+    /// database image; use `recover` when publication was indeterminate. A
+    /// non-idle call returns `InvalidState` and records `invalid_state`.
     pub fn current(self: *Store) Error!?Current {
         try self.require_idle();
         self.acquire_lock(.shared) catch |err| return self.record(err);
@@ -557,7 +612,8 @@ pub const Store = struct {
     /// Resolves the selected generation while acquiring a shared store lock.
     /// The returned access keeps that lock until `release`, so a cooperating
     /// writer cannot replace or reuse its slot. The host must close every
-    /// SQLite resource using the generation before releasing the access.
+    /// SQLite resource using the generation before releasing the access. A
+    /// non-idle call returns `InvalidState` and records `invalid_state`.
     pub fn acquire_generation(
         self: *Store,
         storage: *GenerationAccessStorage,
@@ -605,16 +661,19 @@ pub const Store = struct {
 
     /// Resolves an indeterminate commit by validating the manifest-selected
     /// generation under application quiescence. A stale pre-commit temporary
-    /// manifest is discarded.
+    /// manifest is discarded. Failure to acquire quiescence returns to `idle`.
+    /// Every later failure retains `recovery_required` and any ownership already
+    /// acquired, so the caller must repair the cause and retry on this same
+    /// store. Success returns to `idle` and clears `last_failure`.
     pub fn recover(self: *Store) Error!?Current {
-        switch (self.phase) {
+        switch (self.state) {
             .idle => {
-                self.phase = .acquiring;
+                self.state = .acquiring;
                 self.acquire_gate() catch |err| {
-                    self.phase = .idle;
+                    self.state = .idle;
                     return self.record(err);
                 };
-                self.phase = .recovery_required;
+                self.state = .recovery_required;
             },
             .recovery_required => std.debug.assert(self.gate_held),
             else => return self.record(error.InvalidState),
@@ -633,7 +692,7 @@ pub const Store = struct {
         self.sync_directory() catch |err| return self.record(err);
         self.release_lock();
         self.release_gate();
-        self.phase = .idle;
+        self.state = .idle;
         self.failure = .none;
         return manifest.current;
     }
@@ -681,7 +740,10 @@ pub const Store = struct {
         DatabasePageSizeMismatch,
     }!void {
         const self: *Store = @ptrCast(@alignCast(context));
-        try self.compare_expected(expected);
+        self.compare_expected(expected) catch |err| {
+            if (err == error.ApplyPublishFailure) self.failure = .invalid_state;
+            return err;
+        };
         self.publish(verified) catch |err| {
             self.failure = failure_for_error(err);
             if (self.commit_crossed) {
@@ -694,7 +756,7 @@ pub const Store = struct {
 
     fn abort_callback(context: *anyopaque) void {
         const self: *Store = @ptrCast(@alignCast(context));
-        std.debug.assert(self.phase == .staging);
+        std.debug.assert(self.state == .staging);
         self.dir.deleteFile(self.io, manifest_temporary_name) catch {};
         if (self.captured_manifest) |manifest| {
             if (manifest.current == null) {
@@ -707,8 +769,8 @@ pub const Store = struct {
     fn begin(self: *Store, plan: ltx.ApplyPlan) Error!ltx.ApplyCurrent {
         try self.require_idle();
         try validate_plan(plan);
-        self.phase = .acquiring;
-        errdefer self.phase = .idle;
+        self.state = .acquiring;
+        errdefer self.state = .idle;
         try self.acquire_gate();
         errdefer self.release_gate();
         try self.acquire_lock(.exclusive);
@@ -736,7 +798,7 @@ pub const Store = struct {
         self.stage_slot = slot;
         self.stage_plan = plan;
         self.commit_crossed = false;
-        self.phase = .staging;
+        self.state = .staging;
         self.failure = .none;
         return if (manifest.current) |current_value|
             current_value.apply_current()
@@ -806,7 +868,7 @@ pub const Store = struct {
     fn stage_page(self: *Store, page: ltx.StagedPage) Error!void {
         const plan = self.stage_plan orelse return error.InvalidState;
         const file = self.stage_file orelse return error.InvalidState;
-        if (self.phase != .staging or page.page_number == 0) return error.InvalidState;
+        if (self.state != .staging or page.page_number == 0) return error.InvalidState;
         if (page.data.len != plan.header.page_size) return error.InvalidState;
         const expected_offset = std.math.mul(
             u64,
@@ -823,7 +885,7 @@ pub const Store = struct {
     fn read_page(self: *Store, page_number: u32, destination: []u8) Error!void {
         const plan = self.stage_plan orelse return error.InvalidState;
         const file = self.stage_file orelse return error.InvalidState;
-        if (self.phase != .staging or page_number == 0) return error.InvalidState;
+        if (self.state != .staging or page_number == 0) return error.InvalidState;
         if (destination.len != plan.header.page_size) return error.InvalidState;
         const page_index = @as(u64, page_number - 1);
         const offset_bytes = std.math.mul(u64, page_index, plan.header.page_size) catch
@@ -841,7 +903,7 @@ pub const Store = struct {
         DivergentHistory,
         DatabasePageSizeMismatch,
     }!void {
-        if (self.phase != .staging) return error.ApplyPublishFailure;
+        if (self.state != .staging) return error.ApplyPublishFailure;
         const manifest = self.captured_manifest orelse return error.ApplyPublishFailure;
         const actual = if (manifest.current) |current_value|
             current_value.apply_current()
@@ -1302,7 +1364,7 @@ pub const Store = struct {
         self.commit_crossed = false;
         self.release_lock();
         self.release_gate();
-        self.phase = .idle;
+        self.state = .idle;
     }
 
     fn enter_recovery_required(self: *Store) void {
@@ -1312,7 +1374,7 @@ pub const Store = struct {
         self.captured_manifest = null;
         self.stage_plan = null;
         self.commit_crossed = false;
-        self.phase = .recovery_required;
+        self.state = .recovery_required;
     }
 
     fn delete_temporary_manifest(self: *Store) Error!bool {
@@ -1368,7 +1430,7 @@ pub const Store = struct {
     }
 
     fn require_idle(self: *Store) Error!void {
-        if (self.phase != .idle) return self.record(error.InvalidState);
+        if (self.state != .idle) return self.record(error.InvalidState);
     }
 
     fn record(self: *Store, err: Error) Error {
@@ -1495,7 +1557,8 @@ fn open_database_error(err: std.Io.File.OpenError) Error {
 
 fn failure_for_error(err: Error) Failure {
     return switch (err) {
-        error.InvalidWorkspace, error.InvalidState => .invalid_state,
+        error.InvalidWorkspace => .invalid_workspace,
+        error.InvalidState => .invalid_state,
         error.InvalidDatabasePath => .invalid_database_path,
         error.UnsupportedPlatform => .unsupported_platform,
         error.StoreBusy => .store_busy,
