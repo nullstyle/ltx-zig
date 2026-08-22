@@ -1,8 +1,8 @@
 # ltx-zig
 
-`ltx-zig` is an embeddable, allocation-free codec for Lite Transaction (LTX)
-files. LTX records a verified transition between two SQLite replication
-positions:
+`ltx-zig` is an embeddable, allocation-free codec and staged apply orchestrator
+for Lite Transaction (LTX) files. LTX records a verified transition between two
+SQLite replication positions:
 
 ```text
 position before + verified LTX transition = position after
@@ -32,14 +32,19 @@ also used as a secondary format and deployment reference:
 - canonical page-index emission and strict index cross-checking;
 - CRC-64/ISO page, rolling database, and logical file checksums;
 - snapshots, incrementals, no-checksum transitions, and empty databases;
-- strict terminal verification and trailing-byte rejection.
+- strict terminal verification and trailing-byte rejection;
+- storage-neutral private staging with explicit contiguous and snapshot-replace
+  modes;
+- a full staged-image checksum pass and one atomic backend publication boundary.
 
 The decoder covers both page encodings emitted across upstream v3 history. The
 encoder always emits the current flagged raw-block representation. Valid LZ4
 frame profiles that upstream LTX never emitted remain deliberately unsupported.
-LTX v2, compaction, and applying pages directly to SQLite are not implemented.
-The core API is synchronous and transport-neutral; convenience filesystem and
-allocation-owning wrappers are intentionally absent at this milestone.
+LTX v2, compaction, and a direct live SQLite backend are not implemented. The
+core API is synchronous and transport-neutral; convenience filesystem and
+allocation-owning wrappers are intentionally absent at this milestone. The
+apply core does not coordinate SQLite connections, WAL files, or shared-memory
+files.
 
 `ltx-zig` is licensed under the [MIT License](LICENSE). The fast-compressor
 algorithm includes BSD-3-Clause-licensed work whose separate notice is retained
@@ -157,9 +162,8 @@ var decoder = try ltx.Decoder.init(
     &index_workspace,
 );
 
-const event_budget = @as(u64, limits.max_pages) + 3;
 var event_count: u64 = 0;
-while (event_count < event_budget) : (event_count += 1) {
+while (event_count < decoder.event_budget()) : (event_count += 1) {
     switch (try decoder.next()) {
         .header => |header| _ = header,
         .unverified_page => |page| {
@@ -177,5 +181,5 @@ while (event_count < event_budget) : (event_count += 1) {
 ```
 
 See [docs/design.md](docs/design.md) for trust, memory, and state-machine
-details, and [docs/compatibility.md](docs/compatibility.md) for the exact
-feature matrix.
+details, [docs/apply.md](docs/apply.md) for the storage backend contract, and
+[docs/compatibility.md](docs/compatibility.md) for the exact feature matrix.

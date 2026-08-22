@@ -25,8 +25,9 @@ check is manual; pinned upstream vectors are identified in the evidence.
 | Decoder fuzzing | Tested | Checked-in valid corpus, deterministic single-bit mutations, bounded termination, exact error/state checks, and contiguous-versus-short-read equivalence |
 | Raw LZ4 fuzzing | Tested | Guarded decoder outputs through 65,536 bytes; deterministic fast and literal encoders round trip dirty-workspace inputs through 4,096 bytes |
 | Position contiguity | Tested | Exact TXID and enabled-checksum equality |
+| Staged apply orchestration | Tested | Private staging, explicit transition modes, page-size compatibility, full-image checksum verification, abort-on-error, and atomic publish contract |
 | Compaction | Unsupported | Future layer above the verified codec |
-| Direct SQLite apply | Unsupported | Future staging layer must publish only after verification |
+| Direct live SQLite backend | Planned | No SQLite connection, rollback-journal, WAL, or SHM coordination yet |
 
 The encoder uses a bounded port of the fast raw-block compressor pinned by Go
 and independently ported by Celld. With the canonical output bound it preserves

@@ -107,6 +107,12 @@ pub const Decoder = struct {
         return self.format_version;
     }
 
+    /// Maximum successful events for one complete decode: one header, at most
+    /// `max_pages` pages, one page-block boundary, and one verified result.
+    pub fn event_budget(self: *const Decoder) u64 {
+        return @as(u64, self.limits.max_pages) + 3;
+    }
+
     fn next_internal(self: *Decoder) format.Error!DecoderEvent {
         return switch (self.state) {
             .header => self.decode_header_event(),

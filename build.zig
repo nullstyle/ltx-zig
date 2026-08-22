@@ -60,6 +60,17 @@ pub fn build(b: *std.Build) void {
     const run_fuzz_decoder_tests = b.addRunArtifact(fuzz_decoder_tests);
     // Zig 0.16 does not restore discovered fuzz-test names from a cached run.
     run_fuzz_decoder_tests.has_side_effects = true;
+    const apply_tests = b.addTest(.{
+        .name = "ltx-apply-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/apply.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ltx", .module = host_ltx }},
+        }),
+    });
+    const run_apply_tests = b.addRunArtifact(apply_tests);
+    run_apply_tests.has_side_effects = true;
     const fuzz_lz4_tests = b.addTest(.{
         .name = "ltx-lz4-fuzz-tests",
         .root_module = b.createModule(.{
@@ -77,6 +88,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_interoperability.step);
     test_step.dependOn(&run_malformed.step);
     test_step.dependOn(&run_fuzz_decoder_tests.step);
+    test_step.dependOn(&run_apply_tests.step);
     test_step.dependOn(&run_fuzz_lz4_tests.step);
 
     const fuzz_step = b.step(
@@ -84,6 +96,7 @@ pub fn build(b: *std.Build) void {
         "Replay fuzz corpora; pass --fuzz[=N] to search for failures",
     );
     fuzz_step.dependOn(&run_fuzz_decoder_tests.step);
+    fuzz_step.dependOn(&run_apply_tests.step);
     fuzz_step.dependOn(&run_fuzz_lz4_tests.step);
 
     const fmt = b.addFmt(.{

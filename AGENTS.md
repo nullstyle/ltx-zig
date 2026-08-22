@@ -20,8 +20,13 @@
   features, transport failures, and checksum mismatches.
 - A page event is unverified. Never expose a trusted post-apply position before
   the full index, trailer, checksum, snapshot checksum, and EOF are verified.
-- Keep state transitions centralized and poison a decoder or encoder after a
-  processing failure. Use `finish()`, not an ambiguous `close()`.
+- Apply only through private backend staging. For checksummed files, scan the
+  complete staged database before an atomic expected-position, image, and
+  position publication; require incremental page-size compatibility even
+  without database checksums, and abort without durable mutation on failure.
+- Keep state transitions centralized and poison a decoder, encoder, or staged
+  applier after a processing failure. Use `finish()`, not an ambiguous
+  `close()`.
 - Keep functions near or below 70 lines, use `snake_case`, capitalize acronyms
   such as `TXID`, and suffix quantities with units such as `_bytes` or `_count`.
 - Canonical encoding zeros reserved bytes, uses the pinned byte-compatible fast
@@ -31,8 +36,8 @@
 - Test positive and negative boundaries. Maintain independent Go-derived known
   answers; a Zig round trip alone is not an interoperability test.
 - Preserve decoding of the canonical legacy unflagged v3 LZ4 profile as well
-  as current flagged blocks. V2, apply, and compaction are not currently
-  supported.
+  as current flagged blocks. V2, compaction, and a direct live SQLite backend
+  are not currently supported.
 - Run `mise exec -- zig build fmt-check` and `mise exec -- zig build test`
   before handing off changes. Run `mise exec -- zig build interop` for encoder
   or wire-format changes when Go is available; normal tests stay network-free.

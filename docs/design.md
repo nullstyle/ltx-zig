@@ -13,7 +13,10 @@ disagree.
 `VerifiedLTX.check_contiguous()` requires exact TXID continuity. When database
 checksums are enabled it also requires checksum equality; matching TXIDs with a
 different checksum returns `error.DivergentHistory`. No automatic history
-repair is attempted.
+repair is attempted. `StagedApplier` makes replacement explicit: `.contiguous`
+always performs that check, while `.replace_snapshot` bypasses it only for a
+snapshot. Incrementals are always contiguous and require the current database's
+tracked page size to match the validated LTX header.
 
 ## Trust boundary
 
@@ -28,9 +31,10 @@ Input bytes are hostile. Trust increases in these stages:
 7. the terminal `VerifiedLTX` value.
 
 Pages necessarily arrive before the file checksum. Their type and event name
-make that status explicit. A future apply layer must stage pages and publish
-them atomically only after the terminal verified event. This library does not
-perform authoritative in-place SQLite mutation.
+make that status explicit. `StagedApplier` copies them into backend-owned
+private storage, waits for the terminal verified event, then verifies the
+completed staged database checksum before requesting one atomic publication.
+It never performs authoritative in-place SQLite mutation.
 
 ## State machines
 
@@ -58,6 +62,19 @@ initialized -> pages -> index_written -> trailer_written -> finished
 `finish()` validates snapshot completeness and checksum contracts before
 emitting terminal metadata, then returns a verified description of the bytes
 written. There is no ambiguous `close()` operation.
+
+The staged applier is also one shot:
+
+```text
+initialized -> staging -> published
+      \            \
+       +------------+-> failed
+```
+
+It begins private staging only after a validated header and bounded final-image
+plan. A successful `begin` is followed by exactly one successful `publish` or
+one infallible `abort`. Any error poisons the session. Publication occurs only
+after `VerifiedLTX` and the applicable full staged-image checksum scan.
 
 ## Memory and transports
 
@@ -116,9 +133,21 @@ lifetime requirement and must remain non-overlapping and non-reentrant; zero
 from `read_fn` means permanent EOF.
 `at_end_fn` must be non-consuming and report the exact end of this one LTX
 object, which requires known-length framing or buffering for a shared stream.
-`Decoder` and `Encoder` are stateful, single-owner values: do not copy them or
-interleave operations through copies after initialization. Copies would share
-the transport context and workspaces while duplicating stream state.
+`Decoder`, `Encoder`, and `StagedApplier` are stateful, single-owner values: do
+not copy them or interleave operations through copies after initialization.
+Copies would share transport, workspace, and backend contexts while duplicating
+state-machine state.
+
+`StagedApplier` owns its decoder and reuses the page workspace for its final
+database scan after decoding finishes. Its backend is synchronous and
+non-reentrant. Page callbacks must copy page bytes before returning, because
+the next codec operation overwrites them. A reported backend backing range is
+checked for overlap with input and all codec workspaces. The apply core remains
+storage-neutral, performs no dynamic allocation, and requires no libc. Because
+the core cannot inspect an adapter's storage directly, `begin` reports tracked
+page-size metadata for the core to compare before staging an incremental. The
+backend separately rejects incompatible physical layout not represented by
+that metadata, including when database checksums are disabled.
 
 ## Limits and arithmetic
 
@@ -133,6 +162,11 @@ page frame and the complete sentinel/index/trailer section against configured
 bounds before the first write of either logical section. Transport failures
 can still be partial. Loops are bounded by a configured maximum, an input slice
 length, or a fixed wire width.
+
+`ApplyLimits` separately bounds final database pages and bytes. Both are
+checked after the header validates and before backend staging begins. The
+post-decode database scan is bounded by the verified commit page count and
+holds only one page at a time.
 
 ## Checksum model
 
@@ -150,6 +184,16 @@ index-size field; and the post-apply checksum. Legacy LZ4 descriptor, block,
 end-marker, and XXH32 bytes are physical framing and are excluded. The stored
 file-checksum field is also excluded.
 
+For each checksummed apply, the applier independently scans the private final
+database image and compares its rolling checksum with the verified trailer.
+This catches incorrect base-image construction and missed page writes before
+publication. Exact final length remains part of the trusted `begin`/`publish`
+backend contract because the scan reads exactly the planned pages. The SQLite
+lock page is excluded from that checksum. A snapshot backend nevertheless
+zero-fills its entire new image, including the omitted lock page, so no bytes
+survive from an older database. No-checksum files skip the database-image scan
+but still require their logical file checksum and all structural verification.
+
 ## Error taxonomy
 
 Errors remain distinguishable by cause:
@@ -164,8 +208,12 @@ Errors remain distinguishable by cause:
 - unsupported features: `UnsupportedFormatVersion`,
   `UnsupportedPageEncoding`;
 - integrity: `ChecksumMismatch`, `SnapshotChecksumMismatch`,
-  `LZ4ContentChecksumMismatch`;
+  `LZ4ContentChecksumMismatch`, `DatabaseChecksumMismatch`;
 - transition semantics: `NonContiguousTransition`, `DivergentHistory`;
+- staged apply bounds and backend failures: `DatabasePageLimitExceeded`,
+  `DatabaseSizeLimitExceeded`, `DatabasePageSizeMismatch`,
+  `ApplyBeginFailure`, `ApplyStageFailure`, `ApplyReadFailure`,
+  `ApplyPublishFailure`;
 - API misuse or poisoned terminal state: `InvalidState`.
 
 Malformed external input returns errors; assertions are reserved for internal
@@ -174,8 +222,11 @@ or initialization.
 
 ## Future layers
 
-A SQLite apply layer will consume unverified page events into private staging
-and commit only after `VerifiedLTX`. Compaction will sit above the codec and
-produce a new, independently verified transition. Storage adapters, encryption,
-Tigris transport, actor lifecycle, and scheduler coordination remain outside
-this focused library.
+A direct SQLite backend must implement private staging and atomically combine
+the expected-position and page-size comparison, complete-image publication,
+page-size metadata, and position advance. Coordination with live SQLite
+connections, rollback journals, WAL and SHM files, durability, and crash
+recovery is not implemented yet. Compaction will sit above the codec and
+produce a new, independently verified transition. Concrete storage adapters,
+encryption, Tigris transport, actor lifecycle, and scheduler coordination
+remain outside this focused library.

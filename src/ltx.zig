@@ -24,6 +24,14 @@ pub const DecoderState = @import("decoder.zig").DecoderState;
 pub const DecoderEvent = @import("decoder.zig").DecoderEvent;
 pub const Encoder = @import("encoder.zig").Encoder;
 pub const EncoderState = @import("encoder.zig").EncoderState;
+pub const ApplyLimits = @import("apply.zig").ApplyLimits;
+pub const ApplyMode = @import("apply.zig").ApplyMode;
+pub const ApplyState = @import("apply.zig").ApplyState;
+pub const ApplyPlan = @import("apply.zig").ApplyPlan;
+pub const ApplyCurrent = @import("apply.zig").ApplyCurrent;
+pub const StagedPage = @import("apply.zig").StagedPage;
+pub const ApplyBackend = @import("apply.zig").ApplyBackend;
+pub const StagedApplier = @import("apply.zig").StagedApplier;
 /// Fixed 139,264-byte match state passed by pointer to `Encoder.init`.
 pub const LZ4CompressionWorkspace = @import("lz4_block.zig").CompressionWorkspace;
 
@@ -50,5 +58,6 @@ test {
     _ = @import("page_index.zig");
     _ = @import("decoder.zig");
     _ = @import("encoder.zig");
+    _ = @import("apply.zig");
     _ = @import("workspace.zig");
 }

@@ -35,6 +35,8 @@ the compatibility target.
 For Go: `README.md`, `CLAUDE.md`, `ltx.go`, `checksum.go`, `encoder.go`,
 `decoder.go`, `file_spec.go`, all core tests, and relevant `cmd/ltx` apply,
 encode, dump, and verify code. The pinned repository passed `go test ./...`.
+The apply audit also traced page writes, decoder finalization, truncation, and
+post-apply checksum verification.
 
 For TigerStyle: `docs/TIGER_STYLE.md` at the pinned tree.
 
@@ -45,14 +47,15 @@ whole-block LZ4 framing, and no page index.
 
 For `denoland/celld`: `crates/ltx/README.md`, `Cargo.toml`,
 `reference/ltx-format.md`, `src/codec.rs`, `src/ltx.rs`, `src/lz4_block.rs`,
-and `tests/differential_xtool.rs`. Celld is a secondary interoperability and
-deployment reference, not the valid-output oracle. Its crate pins Go LTX
-v0.5.2 and provides a byte-exact port of Go's block compressor plus a dual
-reader for current flagged raw blocks and legacy unflagged LZ4 frames. It also
-validates exact decompressed length, the declared index size, and the trailer.
-Its `Vec`, `BTreeMap`, and read-to-end design is intentionally not a memory
-model for this allocation-free Zig core, and it does not perform Zig's exact
-one-to-one index/frame cross-check.
+`src/replica.rs`, `src/faults_inject.rs`, and `tests/differential_xtool.rs`.
+Celld is a secondary interoperability and deployment reference, not the
+valid-output oracle. Its crate pins Go LTX v0.5.2 and provides a byte-exact port
+of Go's block compressor plus a dual reader for current flagged raw blocks and
+legacy unflagged LZ4 frames. It also validates exact decompressed length, the
+declared index size, and the trailer. Its `Vec`, `BTreeMap`, `HashMap`, and
+read-to-end design is intentionally not a memory model for this allocation-free
+Zig core, and it does not perform Zig's exact one-to-one index/frame
+cross-check.
 
 For raw-block compression: the current Go oracle pins
 `github.com/pierrec/lz4/v4 v4.1.23` with module content hash
@@ -63,6 +66,42 @@ the independently written Celld port is a second byte-exact reference. The
 algorithm is Copyright (c) 2015 Pierre Curto under BSD-3-Clause, retained in
 [`LICENSE.pierrec-lz4`](../LICENSE.pierrec-lz4). It remains separate from and
 must accompany the project's [MIT License](../LICENSE) where applicable.
+
+## Apply-model evidence
+
+The pinned Go command's
+[`applyLTXFile`](https://github.com/superfly/ltx/blob/8cb8f8ebaf8f57c9b0e1041a27d5444032ea0643/cmd/ltx/apply.go#L69-L133)
+writes decoded pages directly into the destination before
+[`Decoder.Close()`](https://github.com/superfly/ltx/blob/8cb8f8ebaf8f57c9b0e1041a27d5444032ea0643/decoder.go#L74-L123)
+performs terminal verification. It truncates and recomputes the database
+checksum afterward. A late structural or checksum failure can therefore leave
+partial destination mutations. Its
+[`TestApplyLTXFileToExistingDB`](https://github.com/superfly/ltx/blob/8cb8f8ebaf8f57c9b0e1041a27d5444032ea0643/cmd/ltx/apply_test.go#L79-L112)
+also establishes snapshot replacement over an existing database as intended
+behavior. Zig uses Go's page placement and final-size semantics, but not this
+mutation ordering.
+
+Celld keeps decoded pages private until its
+[`decode_file_inner`](https://github.com/denoland/celld/blob/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx/src/ltx.rs#L429-L452)
+has completed decoder verification. Its database-image path
+[`build_database_image`](https://github.com/denoland/celld/blob/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx/src/replica.rs#L768-L842)
+rejects page-size mismatches, constructs private state, gives later transitions
+precedence, and applies the final commit size. Restore then writes a temporary
+file, syncs it, and renames it through
+[`write_file_atomic`](https://github.com/denoland/celld/blob/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx/src/replica.rs#L855-L875).
+Celld's snapshot image also zero-fills the omitted SQLite lock page in
+[`decode_database_image`](https://github.com/denoland/celld/blob/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx/src/ltx.rs#L470-L500).
+This private-stage, verify, construct, and single-publication ordering is the
+deployment model adopted by `StagedApplier`; Celld's allocation-heavy full
+image is not.
+
+Neither upstream is a complete live SQLite adapter model. Celld explicitly
+leaves follow-mode application
+[`unimplemented`](https://github.com/denoland/celld/blob/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx/src/replica.rs#L28-L35),
+and its restore path does not define coordination with open SQLite connections,
+WAL files, or SHM files. The Zig backend contract additionally requires the
+authoritative position check, complete image publication, and position advance
+to be atomic.
 
 ## Compatibility decisions and disagreements
 

@@ -1,0 +1,149 @@
+# Staged apply
+
+`StagedApplier` is the storage-neutral boundary between hostile LTX input and
+an authoritative database image. It owns a decoder, uses caller-owned fixed
+workspace, performs no allocation, and imports neither filesystem nor SQLite
+APIs. A caller supplies an `ApplyBackend` whose callbacks manage one private
+database image.
+
+This layer does not yet include a live SQLite adapter or coordinate SQLite
+connections, WAL files, or shared-memory files.
+
+The public entry point combines decoder and apply initialization so the
+session owns one coherent state machine:
+
+```zig
+var applier = try ltx.StagedApplier.init(
+    .v3,
+    codec_limits,
+    .{
+        .max_database_pages = 4096,
+        .max_database_bytes = 16 * 1024 * 1024,
+    },
+    .contiguous,
+    source.reader(),
+    backend,
+    &page_workspace,
+    &compressed_workspace,
+    &index_workspace,
+);
+const verified = try applier.apply();
+```
+
+## Lifecycle
+
+An apply session is one shot:
+
+```text
+initialized -> staging -> published
+      \            \
+       +------------+-> failed
+```
+
+`StagedApplier` is a stateful, single-owner value. Copying it would duplicate
+state while retaining the same transport, workspaces, and backend transaction,
+so callers must operate only through the initialized instance.
+
+`apply()` first asks the decoder for a validated header. It checks the final
+database page and byte counts against `ApplyLimits` before calling the backend.
+Only then does `begin` create private staging and return the authoritative
+position and page-size metadata observed at that boundary.
+
+The remaining sequence is:
+
+1. check the requested transition mode against the position returned by
+   `begin`;
+2. decode each `UnverifiedPage` and copy it into private staging;
+3. require the page index, trailer, logical file checksum, applicable snapshot
+   checksum, and exact EOF to produce `VerifiedLTX`;
+4. for checksummed LTX files, read every checksummed page from the completed
+   private image and compare its rolling database checksum with the verified
+   trailer;
+5. call `publish` once.
+
+No page callback authorizes publication. If any operation after a successful
+`begin` fails, `StagedApplier` calls the infallible `abort` callback exactly
+once and enters `failed`. A failed `begin` promises that it left no active
+stage, so it is not followed by `abort`. Calls after `published` or `failed`
+return `error.InvalidState` without invoking the backend again.
+
+No-checksum LTX files still require complete structural and file-checksum
+verification. Their explicit wire contract omits the final database-image
+checksum scan.
+
+## Transition modes
+
+Every session selects an `ApplyMode` explicitly:
+
+- `.contiguous` requires the backend's current TXID to equal `MinTXID - 1`.
+  When database checksums are enabled, the current checksum must also equal
+  `PreApplyChecksum`. Every incremental also requires exact page-size
+  compatibility, even when database checksums are disabled.
+- `.replace_snapshot` bypasses that pre-position check only for a snapshot.
+  Incremental files remain strictly contiguous in this mode.
+
+A matching TXID with a mismatched enabled checksum is divergent history, not a
+replacement request. Replacement is therefore visible at the call site and
+cannot happen as a hidden recovery policy.
+
+## Backend contract
+
+`ApplyPlan` carries the selected format version and mode, the validated header,
+and the overflow-checked final database byte size. The backend retains any plan
+state needed by its later callbacks.
+
+`ApplyBackend` contains a context pointer and five synchronous, non-reentrant
+callbacks:
+
+| Callback | Contract |
+| --- | --- |
+| `begin(plan)` | Open an isolated stage for exactly `plan.final_database_size_bytes`, then return the authoritative position and page-size metadata used to construct it. An error leaves no active stage. |
+| `stage_page(page)` | Copy `page.data` before returning; decoder workspace is reused by the next operation. Apply it at the supplied checked page number and byte offset. |
+| `read_page(number, destination)` | Fill the complete destination from the private staged image. This is used only for the pre-publication database checksum scan. |
+| `publish(expected_current, verified)` | Atomically recheck the authoritative position and page-size metadata, install the complete staged image and its page size, and advance the position to `verified.post_apply_position()`. An error publishes none of those changes. |
+| `abort()` | Infallibly discard the active stage without changing authoritative bytes or position. |
+
+For an incremental transition, `begin` constructs staging from the exact
+authoritative image associated with the returned position, resizes it to the
+planned final length, and then accepts page replacements. `StagedApplier`
+compares the returned page-size metadata with the validated header before any
+page is staged; this remains required when LTX database checksums are disabled.
+The backend must separately reject an incompatible database layout that is not
+represented by that metadata. `ApplyCurrent.page_size == null` means no page
+size has ever been established and is rejected for an incremental; an empty
+database produced by an earlier deletion must retain its established page-size
+metadata. For a snapshot, `begin` constructs a zero-filled image of the planned
+final length. The zero fill includes SQLite's omitted pending-byte lock page;
+snapshot LTX files never carry a page frame for that page.
+
+Publication is a storage transaction, not merely a final callback in program
+order. The current-metadata comparison, complete-image installation or
+replacement, page-size update, and position advance must share one atomic
+commit or exclusive lock. If another writer changes the state after `begin`,
+`publish` returns `NonContiguousTransition`, `DivergentHistory`, or
+`DatabasePageSizeMismatch` and leaves the authoritative state untouched.
+
+`ApplyBackend.backing_bytes`, when available, lets initialization reject
+aliasing between backend staging, input, and codec workspaces. All unreported
+backend storage and callback context must likewise remain live, address-stable,
+exclusive, and non-overlapping until the session reaches a terminal state.
+`StagedApplier` is a single-owner value and must not be copied: copies would
+share decoder storage and backend transaction context while duplicating state.
+
+## Bounds and storage adapters
+
+`ApplyLimits.max_database_pages` and `max_database_bytes` independently bound
+the completed image before staging begins. Codec limits continue to bound
+input, page count, page size, compressed data, index storage, and every decode
+loop. The full-image checksum pass uses the existing page workspace one page at
+a time; it does not allocate an image, page list, or checksum table. It cannot
+observe bytes beyond the planned final length, so exact staging length remains
+part of the backend's `begin` and atomic publication contract.
+
+A future SQLite adapter can implement the backend with a private database file
+or equivalent transaction, but it must preserve the same boundary. In
+particular, `stage_page` must never write into the live database, and publication
+must include the position compare-and-swap and complete image change. Safe live
+deployment also needs an explicit policy for SQLite connections, rollback
+journals, WAL and SHM files, file and directory durability, and crash recovery.
+Those concerns intentionally remain outside the current core.

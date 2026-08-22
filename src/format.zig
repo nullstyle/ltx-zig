@@ -75,8 +75,16 @@ pub const Error = error{
     InvalidTrailer,
     ChecksumMismatch,
     SnapshotChecksumMismatch,
+    DatabaseChecksumMismatch,
     NonContiguousTransition,
     DivergentHistory,
+    DatabasePageLimitExceeded,
+    DatabaseSizeLimitExceeded,
+    DatabasePageSizeMismatch,
+    ApplyBeginFailure,
+    ApplyStageFailure,
+    ApplyReadFailure,
+    ApplyPublishFailure,
     WorkspaceAliasing,
     InvalidState,
 };
@@ -143,6 +151,18 @@ pub const Header = struct {
             .txid = .init(self.min_txid.value - 1),
             .post_apply_checksum = self.pre_apply_checksum,
         };
+    }
+
+    pub fn check_contiguous(self: Header, current: Position) Error!void {
+        const expected = try self.pre_apply_position();
+        if (current.txid.value != expected.txid.value) {
+            return error.NonContiguousTransition;
+        }
+        if (!self.no_checksum() and
+            current.post_apply_checksum.value != expected.post_apply_checksum.value)
+        {
+            return error.DivergentHistory;
+        }
     }
 
     pub fn validate(self: Header, limits: Limits) Error!void {
@@ -267,15 +287,7 @@ pub const VerifiedLTX = struct {
     }
 
     pub fn check_contiguous(self: VerifiedLTX, current: Position) Error!void {
-        const expected = try self.pre_apply_position();
-        if (current.txid.value != expected.txid.value) {
-            return error.NonContiguousTransition;
-        }
-        if (!self.header.no_checksum() and
-            current.post_apply_checksum.value != expected.post_apply_checksum.value)
-        {
-            return error.DivergentHistory;
-        }
+        try self.header.check_contiguous(current);
     }
 };
 
