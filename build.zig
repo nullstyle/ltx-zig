@@ -83,6 +83,17 @@ pub fn build(b: *std.Build) void {
     });
     const run_apply_tests = b.addRunArtifact(apply_tests);
     run_apply_tests.has_side_effects = true;
+    const compactor_tests = b.addTest(.{
+        .name = "ltx-compactor-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/compactor.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ltx", .module = host_ltx }},
+        }),
+    });
+    const run_compactor_tests = b.addRunArtifact(compactor_tests);
+    run_compactor_tests.has_side_effects = true;
     const sqlite_store_unit_tests = b.addTest(.{
         .name = "ltx-sqlite-store-unit-tests",
         .root_module = host_sqlite_store,
@@ -171,6 +182,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_malformed.step);
     test_step.dependOn(&run_fuzz_decoder_tests.step);
     test_step.dependOn(&run_apply_tests.step);
+    test_step.dependOn(&run_compactor_tests.step);
     test_step.dependOn(&run_sqlite_store_unit_tests.step);
     test_step.dependOn(&run_sqlite_store_tests.step);
     test_step.dependOn(&run_sqlite_store_crash_tests.step);
@@ -182,6 +194,7 @@ pub fn build(b: *std.Build) void {
     );
     fuzz_step.dependOn(&run_fuzz_decoder_tests.step);
     fuzz_step.dependOn(&run_apply_tests.step);
+    fuzz_step.dependOn(&run_compactor_tests.step);
     fuzz_step.dependOn(&run_fuzz_lz4_tests.step);
 
     const fmt = b.addFmt(.{
@@ -192,6 +205,7 @@ pub fn build(b: *std.Build) void {
             "tests",
             "benchmarks",
             "tools/fixturegen",
+            "tools/compaction_fixturegen",
         },
         .check = true,
     });
@@ -211,6 +225,28 @@ pub fn build(b: *std.Build) void {
     const fixturegen_step = b.step("fixturegen", "Write a deterministic v3 fixture to stdout");
     fixturegen_step.dependOn(&run_fixturegen.step);
 
+    const compaction_fixturegen = b.addExecutable(.{
+        .name = "ltx-compaction-fixturegen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/compaction_fixturegen/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ltx", .module = host_ltx }},
+        }),
+    });
+    const compaction_fixture_name = b.option(
+        []const u8,
+        "compaction-fixture",
+        "Zig compaction fixture: merge, deletion, or no-checksum",
+    ) orelse "merge";
+    const run_compaction_fixturegen = b.addRunArtifact(compaction_fixturegen);
+    run_compaction_fixturegen.addArg(compaction_fixture_name);
+    const compaction_fixturegen_step = b.step(
+        "compaction-fixture",
+        "Write a deterministic compacted v3 fixture to stdout",
+    );
+    compaction_fixturegen_step.dependOn(&run_compaction_fixturegen.step);
+
     const interop_fixturegen = b.addRunArtifact(fixturegen);
     const generated_fixture = interop_fixturegen.captureStdOut(.{
         .basename = "ltx-zig.ltx",
@@ -221,6 +257,33 @@ pub fn build(b: *std.Build) void {
     go_verify.addFileArg(generated_fixture);
     const interop_step = b.step("interop", "Verify Zig output with pinned Go LTX");
     interop_step.dependOn(&go_verify.step);
+
+    const interop_merge_fixturegen = b.addRunArtifact(compaction_fixturegen);
+    interop_merge_fixturegen.addArg("merge");
+    const generated_merge_fixture = interop_merge_fixturegen.captureStdOut(.{
+        .basename = "ltx-zig-compacted-merge.ltx",
+    });
+    const interop_deletion_fixturegen = b.addRunArtifact(compaction_fixturegen);
+    interop_deletion_fixturegen.addArg("deletion");
+    const generated_deletion_fixture = interop_deletion_fixturegen.captureStdOut(.{
+        .basename = "ltx-zig-compacted-deletion.ltx",
+    });
+    const interop_no_checksum_fixturegen = b.addRunArtifact(compaction_fixturegen);
+    interop_no_checksum_fixturegen.addArg("no-checksum");
+    const generated_no_checksum_fixture = interop_no_checksum_fixturegen.captureStdOut(.{
+        .basename = "ltx-zig-compacted-no-checksum.ltx",
+    });
+    const go_verify_compaction = b.addSystemCommand(&.{
+        "go",
+        "run",
+        "./verify_compaction",
+    });
+    go_verify_compaction.setCwd(b.path("tools/upstream_verify"));
+    go_verify_compaction.setEnvironmentVariable("GOWORK", "off");
+    go_verify_compaction.addFileArg(generated_merge_fixture);
+    go_verify_compaction.addFileArg(generated_deletion_fixture);
+    go_verify_compaction.addFileArg(generated_no_checksum_fixture);
+    interop_step.dependOn(&go_verify_compaction.step);
 
     const benchmark_lz4 = b.createModule(.{
         .root_source_file = b.path("src/lz4_block.zig"),

@@ -35,10 +35,10 @@ the compatibility target.
 ## Files inspected
 
 For Go: `README.md`, `CLAUDE.md`, `ltx.go`, `checksum.go`, `encoder.go`,
-`decoder.go`, `file_spec.go`, all core tests, and relevant `cmd/ltx` apply,
-encode, dump, and verify code. The pinned repository passed `go test ./...`.
-The apply audit also traced page writes, decoder finalization, truncation, and
-post-apply checksum verification.
+`decoder.go`, `file_spec.go`, `compactor.go`, `compactor_test.go`, all core
+tests, and relevant `cmd/ltx` apply, encode, dump, and verify code. The pinned
+repository passed `go test ./...`. The apply audit also traced page writes,
+decoder finalization, truncation, and post-apply checksum verification.
 
 For TigerStyle: `docs/TIGER_STYLE.md` at the pinned tree.
 
@@ -49,15 +49,15 @@ whole-block LZ4 framing, and no page index.
 
 For `denoland/celld`: `crates/ltx/README.md`, `Cargo.toml`,
 `reference/ltx-format.md`, `src/codec.rs`, `src/ltx.rs`, `src/lz4_block.rs`,
-`src/replica.rs`, `src/faults_inject.rs`, and `tests/differential_xtool.rs`.
-Celld is a secondary interoperability and deployment reference, not the
-valid-output oracle. Its crate pins Go LTX v0.5.2 and provides a byte-exact port
-of Go's block compressor plus a dual reader for current flagged raw blocks and
-legacy unflagged LZ4 frames. It also validates exact decompressed length, the
-declared index size, and the trailer. Its `Vec`, `BTreeMap`, `HashMap`, and
-read-to-end design is intentionally not a memory model for this allocation-free
-Zig core, and it does not perform Zig's exact one-to-one index/frame
-cross-check.
+`src/compactor.rs`, `src/replica_compactor.rs`, `src/replica.rs`,
+`src/faults_inject.rs`, and `tests/differential_xtool.rs`. Celld is a secondary
+interoperability and deployment reference, not the valid-output oracle. Its
+crate pins Go LTX v0.5.2 and provides a byte-exact port of Go's block compressor
+plus a dual reader for current flagged raw blocks and legacy unflagged LZ4
+frames. It also validates exact decompressed length, the declared index size,
+and the trailer. Its `Vec`, `BTreeMap`, `HashMap`, and read-to-end design is
+intentionally not a memory model for this allocation-free Zig core, and it does
+not perform Zig's exact one-to-one index/frame cross-check.
 
 For raw-block compression: the current Go oracle pins
 `github.com/pierrec/lz4/v4 v4.1.23` with module content hash
@@ -68,6 +68,45 @@ the independently written Celld port is a second byte-exact reference. The
 algorithm is Copyright (c) 2015 Pierre Curto under BSD-3-Clause, retained in
 [`LICENSE.pierrec-lz4`](../LICENSE.pierrec-lz4). It remains separate from and
 must accompany the project's [MIT License](../LICENSE) where applicable.
+
+## Compaction evidence
+
+The pinned Go
+[`Compactor.Compact`](https://github.com/superfly/ltx/blob/8cb8f8ebaf8f57c9b0e1041a27d5444032ea0643/compactor.go#L79-L144)
+reads headers in caller order, takes page size, minimum TXID, and pre-apply
+checksum from the first header, and commit, maximum TXID, and timestamp from the
+last. It omits WAL offsets, WAL sizes, salts, and node ID from the new header, so
+canonical encoding zeros them. Its
+[`writePageBlock`](https://github.com/superfly/ltx/blob/8cb8f8ebaf8f57c9b0e1041a27d5444032ea0643/compactor.go#L146-L227)
+chooses the newest buffered occurrence of each lowest page number and skips
+pages beyond the final commit. It closes every decoder before closing the
+encoder, but pages can already have reached the writer when a late verification
+fails. Zig adopts these merge and output-header semantics and makes the
+scratch-output requirement explicit.
+
+Go's default range predicate
+[`IsContiguous`](https://github.com/superfly/ltx/blob/8cb8f8ebaf8f57c9b0e1041a27d5444032ea0643/ltx.go#L627-L633)
+allows an overlapping next range as long as it advances the maximum, does not
+compare database checksums, and can be disabled entirely with
+`AllowNonContiguousTXIDs`. Zig instead requires
+`next.MinTXID == previous.MaxTXID + 1`, requires the enabled checksum chain to
+match, requires one checksum mode for the full input set, and exposes no gap or
+overlap repair switch. That stricter contract prevents a compacted file from
+hiding missing or divergent history.
+
+Celld's low-level
+[`compactor.rs`](https://github.com/denoland/celld/blob/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx/src/compactor.rs#L88-L172)
+independently confirms the first/last header selection, default-zero remaining
+header metadata, newest-page precedence, and final-commit cutoff. Its
+[`compactor tests`](https://github.com/denoland/celld/blob/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx/src/compactor.rs#L242-L297)
+exercise both newest-page selection and dropping a page after shrink. Celld's
+storage-level
+[`replica_compactor.rs`](https://github.com/denoland/celld/blob/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx/src/replica_compactor.rs#L94-L217)
+adds file-count and input-byte planning bounds, emits no-checksum compacted
+levels, rejects gaps or overlaps during level verification, and deliberately
+does not delete source files. Zig's `Compactor` remains the lower-level codec
+merge: it does not copy Celld's allocation model, select levels, delete files,
+or publish storage state.
 
 ## Apply-model evidence
 
@@ -215,6 +254,12 @@ accept. These are hardening differences, not silent reinterpretations.
     fields. Standard LZ4 frame profiles that upstream never emitted remain an
     explicit `UnsupportedPageEncoding` boundary.
 
+15. **Compaction continuity and mode.** Go's compactor accepts overlapping
+    advancing TXID ranges, does not compare adjacent database checksums, and
+    offers a non-contiguous rebuild switch. Zig compaction requires exact TXID
+    and enabled-checksum continuity with one checksum mode. It will not use
+    compaction as implicit history repair.
+
 The unflagged v3 LZ4-frame encoding was introduced with v3 and later replaced
 without a version bump. Two fixtures from the last historical writer commit
 `133c1b1dba55dfb8033affedb3d400aaa3d8b807` exercise compressed and stored
@@ -279,6 +324,22 @@ With an intentionally smaller 515-byte compressed-page cap, the same input
 exercises the literal fallback and retains its prior 660-byte known answer with
 file checksum `f9b895f23744f218`.
 
-`mise exec -- zig build interop` performs that Go verification from the build
-graph. Its Go module pins the pseudo-version resolving exactly to the recorded
-Go commit; unlike the normal test suite, it may download modules.
+The Zig compaction fixture generator emits three transient interoperability
+vectors. `merge` compacts three exact checksummed transitions, selects newer
+versions of pages 1 and 2, drops pages 3 and 4 at final commit 2, carries the
+last timestamp and checksum, and proves that nonzero source WAL and node
+metadata becomes zero. `deletion` compacts a one-page snapshot followed by an
+exactly contiguous incremental deletion to commit zero, yielding no pages and
+the flagged empty-database checksum. `no-checksum` compacts two exact
+incremental transitions in the mode emitted by Celld's storage-level compactor;
+the Go oracle explicitly sets `Compactor.HeaderFlags` because Go does not derive
+the output mode from its input headers. These files are generated during the
+interop build rather than treated as committed Go-derived corpus.
+
+`mise exec -- zig build interop` performs the snapshot verification plus all
+compaction checks from the build graph. For compaction, the exact pinned Go
+module independently reconstructs inputs, runs `ltx.NewCompactor`, byte-compares
+the full output with Zig, and decodes it for semantic checks. This is pinned
+library-level interoperability, not a real Litestream deployment test. The Go
+module uses the checksum-locked pseudo-version resolving exactly to the
+recorded commit; unlike the normal test suite, it may download modules.

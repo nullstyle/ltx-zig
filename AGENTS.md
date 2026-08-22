@@ -24,9 +24,9 @@
   complete staged database before an atomic expected-position, image, and
   position publication; require incremental page-size compatibility even
   without database checksums, and abort without durable mutation on failure.
-- Keep state transitions centralized and poison a decoder, encoder, or staged
-  applier after a processing failure. Use `finish()`, not an ambiguous
-  `close()`.
+- Keep state transitions centralized and poison a decoder, encoder, compactor,
+  or staged applier after a processing failure. Use `finish()`, not an
+  ambiguous `close()`.
 - Keep functions near or below 70 lines, use `snake_case`, capitalize acronyms
   such as `TXID`, and suffix quantities with units such as `_bytes` or `_count`.
 - Canonical encoding zeros reserved bytes, uses the pinned byte-compatible fast
@@ -35,15 +35,22 @@
   `LICENSE.pierrec-lz4` attribution.
 - Test positive and negative boundaries. Maintain independent Go-derived known
   answers; a Zig round trip alone is not an interoperability test.
+- Compact only fully verified, oldest-to-newest inputs with one checksum mode.
+  Require exact TXID and enabled-checksum continuity; do not add overlap or gap
+  repair. Newest pages win, the final commit bounds output, and compacted WAL,
+  salt, and node metadata is zero. Bound input count and aggregate decoded page
+  events with caller-owned workspaces. Publish output only after `compact()`
+  returns `VerifiedLTX`; discard any partial output after an error.
 - Preserve decoding of the canonical legacy unflagged v3 LZ4 profile as well
-  as current flagged blocks. V2, compaction, and fixed-path replacement beneath
-  open SQLite connections are not currently supported. The optional
+  as current flagged blocks. V2 and fixed-path replacement beneath open SQLite
+  connections are not currently supported. The optional
   `ltx_sqlite` store requires a host-owned quiescence gate, a durable empty
   manifest before first slot creation, and leased active generations opened
   with SQLite URI `mode=ro&immutable=1` plus `query_only`.
 - Run `mise exec -- zig build fmt-check` and `mise exec -- zig build test`
   before handing off changes. Run `mise exec -- zig build interop` for encoder
-  or wire-format changes when Go is available; normal tests stay network-free.
+  compactor, or wire-format changes when Go is available; normal tests stay
+  network-free.
 - For `ltx_sqlite` store or lifecycle changes, also run `mise exec -- zig build
   sqlite-integration -Doptimize=ReleaseSafe`. This host-only test may link the
   system SQLite and libc; neither library module may do so.

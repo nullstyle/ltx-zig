@@ -46,6 +46,14 @@ prefix and one fixed single-bit mutation per byte. The 65,536-byte near-lock
 fixture remains covered by its byte-exact interoperability test; its raw
 compressed page is included in the LZ4 corpus.
 
+The compactor property accepts at most 1,024 hostile bytes as either one input
+or two halves. Every processing result must reach exactly one terminal state:
+failure poisons the compactor and success must produce an output whose decoded
+`VerifiedLTX` exactly matches the returned value. A second `compact()` call is
+always rejected. Separate deterministic tests cover aggregate page bounds,
+cross-workspace aliasing, and unverified partial output after a late checksum
+failure.
+
 The raw LZ4 decoder property accepts at most 1,024 compressed bytes and chooses
 from fixed output sizes spanning 0 through 65,536 bytes. Differently poisoned
 successful outputs must become identical, and malformed inputs must return the
@@ -63,8 +71,8 @@ coverage outside this mutation bound.
 
 Corpus entries are Zig `Smith` decision streams, not bare LTX or LZ4 files.
 They encode each selected integer before the length-prefixed byte slice. Keep
-the seed helpers in `tests/fuzz.zig` and `tests/fuzz_lz4.zig` as the canonical
-way to construct them.
+the seed helpers in `tests/fuzz.zig`, `tests/compactor.zig`, and
+`tests/fuzz_lz4.zig` as the canonical way to construct them.
 
 Zig reports learned and crashing inputs under `.zig-cache/f/`. Minimize and
 replay a failure, then promote it either to the appropriate checked-in corpus

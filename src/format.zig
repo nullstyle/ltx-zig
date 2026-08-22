@@ -86,6 +86,11 @@ pub const Error = error{
     ApplyReadFailure,
     ApplyPublishFailure,
     ApplyPublishIndeterminate,
+    CompactionInputRequired,
+    CompactionInputLimitExceeded,
+    CompactionPageLimitExceeded,
+    CompactionPageSizeMismatch,
+    CompactionChecksumModeMismatch,
     WorkspaceAliasing,
     InvalidState,
 };

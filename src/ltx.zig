@@ -24,6 +24,10 @@ pub const DecoderState = @import("decoder.zig").DecoderState;
 pub const DecoderEvent = @import("decoder.zig").DecoderEvent;
 pub const Encoder = @import("encoder.zig").Encoder;
 pub const EncoderState = @import("encoder.zig").EncoderState;
+pub const CompactionLimits = @import("compactor.zig").CompactionLimits;
+pub const CompactionInput = @import("compactor.zig").CompactionInput;
+pub const CompactorState = @import("compactor.zig").CompactorState;
+pub const Compactor = @import("compactor.zig").Compactor;
 pub const ApplyLimits = @import("apply.zig").ApplyLimits;
 pub const ApplyMode = @import("apply.zig").ApplyMode;
 pub const ApplyState = @import("apply.zig").ApplyState;
@@ -58,6 +62,7 @@ test {
     _ = @import("page_index.zig");
     _ = @import("decoder.zig");
     _ = @import("encoder.zig");
+    _ = @import("compactor.zig");
     _ = @import("apply.zig");
     _ = @import("workspace.zig");
 }

@@ -36,6 +36,11 @@ private storage, waits for the terminal verified event, then verifies the
 completed staged database checksum before requesting one atomic publication.
 It never performs authoritative in-place SQLite mutation.
 
+`Compactor` has the same late-verification constraint across every source. It
+may stream selected pages to scratch output before all input trailers and EOFs
+are verified. Only a successful terminal `VerifiedLTX` makes that output
+publishable; partial output after any error is untrusted and must be discarded.
+
 ## State machines
 
 The decoder has one central `next()` operation:
@@ -62,6 +67,20 @@ initialized -> pages -> index_written -> trailer_written -> finished
 `finish()` validates snapshot completeness and checksum contracts before
 emitting terminal metadata, then returns a verified description of the bytes
 written. There is no ambiguous `close()` operation.
+
+The compactor is a one-shot merge:
+
+```text
+initialized -> compacting -> finished
+     \             \
+      +-------------+-----> failed
+```
+
+`compact()` reads oldest-to-newest inputs, selects the newest occurrence of
+each page, omits pages beyond the final commit, terminally verifies every input,
+and finishes a canonical current-format output. TXID ranges must join exactly;
+checksummed positions must also join exactly. A processing error poisons the
+session even when bytes have already reached the output transport.
 
 The staged applier is also one shot:
 
@@ -114,6 +133,17 @@ literal bound selects a deterministic literal-only block instead. This keeps
 the configured memory bound authoritative without rejecting an otherwise safe
 configuration.
 
+Compaction receives one complete decoder workspace set per input and one
+complete encoder workspace set for output. These sets, the mutable
+`CompactionInput` slice, and output backing must remain address-stable,
+exclusively owned, and mutually non-overlapping for the operation. Immutable
+reported reader backings may overlap each other, but not mutable input state,
+workspaces, or output. Opaque transport-context extents cannot be inspected and
+remain a caller-side lifetime, aliasing, and non-reentrancy obligation. Each
+input holds at most one decompressed page while the merge selects the newest
+page at the smallest current page number. No page map or materialized database
+image is allocated.
+
 Legacy frame decoding reuses the compressed workspace for only the declared
 block payload. Its fixed descriptor, block word, and footer stay inline, so no
 extra frame-sized allocation or read-ahead is needed. The configured compressed
@@ -143,10 +173,10 @@ lifetime requirement and must remain non-overlapping and non-reentrant; zero
 from `read_fn` means permanent EOF.
 `at_end_fn` must be non-consuming and report the exact end of this one LTX
 object, which requires known-length framing or buffering for a shared stream.
-`Decoder`, `Encoder`, and `StagedApplier` are stateful, single-owner values: do
-not copy them or interleave operations through copies after initialization.
-Copies would share transport, workspace, and backend contexts while duplicating
-state-machine state.
+`Decoder`, `Encoder`, `Compactor`, and `StagedApplier` are stateful,
+single-owner values: do not copy them or interleave operations through copies
+after initialization. Copies would share transport, workspace, and backend
+contexts while duplicating state-machine state.
 
 `StagedApplier` owns its decoder and reuses the page workspace for its final
 database scan after decoding finishes. Its backend is synchronous and
@@ -177,6 +207,13 @@ length, or a fixed wire width.
 checked after the header validates and before backend staging begins. The
 post-decode database scan is bounded by the verified commit page count and
 holds only one page at a time.
+
+`CompactionLimits` separately bounds the input count and aggregate decoded page
+events. The aggregate includes duplicate and final-commit-truncated pages, so
+discarded work cannot escape the configured bound. Normal `Limits` still
+applies independently to every decoder and to the output encoder; consequently,
+the combined first-to-last output TXID span must also fit
+`Limits.max_transaction_span`.
 
 ## Checksum model
 
@@ -220,6 +257,9 @@ Errors remain distinguishable by cause:
 - integrity: `ChecksumMismatch`, `SnapshotChecksumMismatch`,
   `LZ4ContentChecksumMismatch`, `DatabaseChecksumMismatch`;
 - transition semantics: `NonContiguousTransition`, `DivergentHistory`;
+- compaction configuration and compatibility: `CompactionInputRequired`,
+  `CompactionInputLimitExceeded`, `CompactionPageLimitExceeded`,
+  `CompactionPageSizeMismatch`, `CompactionChecksumModeMismatch`;
 - staged apply bounds and backend failures: `DatabasePageLimitExceeded`,
   `DatabaseSizeLimitExceeded`, `DatabasePageSizeMismatch`,
   `ApplyBeginFailure`, `ApplyStageFailure`, `ApplyReadFailure`,
@@ -244,7 +284,9 @@ and recovery protocol is in
 
 Fixed-path publication beneath open SQLite handles remains unsupported because
 SQLite associates journals and WAL state with the pathname, and its Online
-Backup API does not preserve exact LTX page-one bytes. Compaction will sit above
-the codec and produce a new, independently verified transition. Encryption,
-Tigris transport, local-writer capture, actor lifecycle, and scheduler
-coordination remain outside this focused library.
+Backup API does not preserve exact LTX page-one bytes. The compactor produces a
+new independently verified transition but deliberately does not select storage
+levels, retire inputs, publish a replica, or coordinate a Litestream process;
+its full contract is in [`compaction.md`](compaction.md). Encryption, Tigris
+transport, local-writer capture, actor lifecycle, and scheduler coordination
+remain outside this focused library.

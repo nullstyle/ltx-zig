@@ -15,8 +15,19 @@ snapshot fixture byte for byte: 168 physical bytes, file checksum
 `eb5121d56d33a656`, and Go logical byte count 648. This exercises the Zig fast
 match compressor rather than only format-compatible literal output.
 
-This step may download Go modules. The normal Zig test suite is hermetic and
-does not invoke it.
+The same command generates three Zig compaction outputs. The verifier
+independently reconstructs their input files, runs the pinned Go
+`ltx.NewCompactor`, requires complete byte equality, and then decodes and checks
+the Zig outputs with Go. The three-input `merge` case covers newest-page
+precedence, final-commit shrinkage, current flagged blocks, and zeroed WAL/salt/
+node metadata. The `deletion` case covers a checksummed snapshot followed by an
+exactly contiguous incremental deletion to commit zero. The `no-checksum` case
+covers the mode emitted by Celld's storage-level compactor and explicitly sets
+the pinned Go compactor's output flags to match.
+
+This proves interoperability with the exact pinned Go library, not integration
+with a running Litestream deployment. The step may download Go modules. The
+normal Zig test suite is hermetic and does not invoke it.
 
 The committed current-Go snapshot-zero, empty, incremental, no-checksum, and
 near-lock-page vectors can be regenerated individually on standard output
