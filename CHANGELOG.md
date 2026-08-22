@@ -7,7 +7,7 @@ version is zero, the Zig source API is intentionally unstable.
 
 ## [Unreleased]
 
-## [0.1.0] - TBD
+## [0.1.0] - 2026-08-22
 
 ### Added
 
