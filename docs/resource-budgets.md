@@ -129,8 +129,9 @@ writer still requires the caller to provide whatever fixed capacity the chosen
 workload needs. Taking the smaller of the configured-index and coarse-varint
 bounds is a valid tighter structural capacity when both calculations succeed.
 
-The bounds describe the current flagged LZ4 representation. They are not a
-promise for legacy unflagged framing or a future format version.
+The bounds describe canonical encoder output: the current flagged LZ4 v3
+representation. They are not a wire-size promise for decoder-only v2 input,
+legacy unflagged v3 input, or a future format version.
 
 ## Informational example
 

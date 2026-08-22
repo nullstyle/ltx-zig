@@ -25,14 +25,24 @@ const no_checksum_fixture = @embedFile("fixtures/go_v3_no_checksum.ltx");
 const celld_fixture = @embedFile("fixtures/celld_v052_two_page_snapshot.ltx");
 const legacy_fixture = @embedFile("fixtures/go_v3_legacy_unflagged.ltx");
 const legacy_mixed_fixture = @embedFile("fixtures/go_v3_legacy_mixed.ltx");
+const v2_mixed_fixture = @embedFile("fixtures/go_v2_mixed_snapshot.ltx");
+const v2_empty_fixture = @embedFile("fixtures/go_v2_empty_snapshot.ltx");
+const v2_sqlite_empty_fixture = @embedFile("fixtures/go_v2_sqlite_empty.ltx");
+const v2_incremental_fixture = @embedFile("fixtures/go_v2_incremental.ltx");
+const v2_no_checksum_fixture = @embedFile("fixtures/go_v2_no_checksum.ltx");
 
-const decoder_seed_snapshot = indexed_slice_seed(1, snapshot_fixture);
-const decoder_seed_empty = indexed_slice_seed(2, empty_fixture);
-const decoder_seed_incremental = indexed_slice_seed(3, incremental_fixture);
-const decoder_seed_no_checksum = indexed_slice_seed(7, no_checksum_fixture);
-const decoder_seed_celld = indexed_slice_seed(13, celld_fixture);
-const decoder_seed_legacy = indexed_slice_seed(31, legacy_fixture);
-const decoder_seed_legacy_mixed = indexed_slice_seed(64, legacy_mixed_fixture);
+const decoder_seed_snapshot = versioned_slice_seed(false, 1, snapshot_fixture);
+const decoder_seed_empty = versioned_slice_seed(false, 2, empty_fixture);
+const decoder_seed_incremental = versioned_slice_seed(false, 3, incremental_fixture);
+const decoder_seed_no_checksum = versioned_slice_seed(false, 7, no_checksum_fixture);
+const decoder_seed_celld = versioned_slice_seed(false, 13, celld_fixture);
+const decoder_seed_legacy = versioned_slice_seed(false, 31, legacy_fixture);
+const decoder_seed_legacy_mixed = versioned_slice_seed(false, 64, legacy_mixed_fixture);
+const decoder_seed_v2_mixed = versioned_slice_seed(true, 127, v2_mixed_fixture);
+const decoder_seed_v2_empty = versioned_slice_seed(true, 255, v2_empty_fixture);
+const decoder_seed_v2_sqlite_empty = versioned_slice_seed(true, 383, v2_sqlite_empty_fixture);
+const decoder_seed_v2_incremental = versioned_slice_seed(true, 511, v2_incremental_fixture);
+const decoder_seed_v2_no_checksum = versioned_slice_seed(true, 1023, v2_no_checksum_fixture);
 const decoder_corpus = [_][]const u8{
     &decoder_seed_snapshot,
     &decoder_seed_empty,
@@ -41,16 +51,31 @@ const decoder_corpus = [_][]const u8{
     &decoder_seed_celld,
     &decoder_seed_legacy,
     &decoder_seed_legacy_mixed,
+    &decoder_seed_v2_mixed,
+    &decoder_seed_v2_empty,
+    &decoder_seed_v2_sqlite_empty,
+    &decoder_seed_v2_incremental,
+    &decoder_seed_v2_no_checksum,
 };
 
-const decoder_fixtures = [_][]const u8{
-    snapshot_fixture,
-    empty_fixture,
-    incremental_fixture,
-    no_checksum_fixture,
-    celld_fixture,
-    legacy_fixture,
-    legacy_mixed_fixture,
+const DecoderFixture = struct {
+    version: ltx.FormatVersion,
+    bytes: []const u8,
+};
+
+const decoder_fixtures = [_]DecoderFixture{
+    .{ .version = .v3, .bytes = snapshot_fixture },
+    .{ .version = .v3, .bytes = empty_fixture },
+    .{ .version = .v3, .bytes = incremental_fixture },
+    .{ .version = .v3, .bytes = no_checksum_fixture },
+    .{ .version = .v3, .bytes = celld_fixture },
+    .{ .version = .v3, .bytes = legacy_fixture },
+    .{ .version = .v3, .bytes = legacy_mixed_fixture },
+    .{ .version = .v2, .bytes = v2_mixed_fixture },
+    .{ .version = .v2, .bytes = v2_empty_fixture },
+    .{ .version = .v2, .bytes = v2_sqlite_empty_fixture },
+    .{ .version = .v2, .bytes = v2_incremental_fixture },
+    .{ .version = .v2, .bytes = v2_no_checksum_fixture },
 };
 
 const DecoderTerminal = enum { rejected, verified };
@@ -98,39 +123,46 @@ const ChunkedReader = struct {
     }
 };
 
-test "whole-file decoder fuzz corpus is transport invariant" {
+test "whole-file v2 and v3 decoder fuzz corpus is transport invariant" {
     try std.testing.fuzz({}, fuzz_decoder, .{ .corpus = &decoder_corpus });
 }
 
 fn fuzz_decoder(_: void, smith: *std.testing.Smith) !void {
+    const version: ltx.FormatVersion = if (smith.value(bool)) .v2 else .v3;
     const chunk_bytes = smith.valueRangeAtMost(u8, 1, 64);
     var input_storage: [max_decoder_input_bytes]u8 = undefined;
     const input_length: usize = smith.slice(&input_storage);
-    _ = try expect_decoder_equivalent(input_storage[0..input_length], chunk_bytes);
+    _ = try expect_decoder_equivalent(version, input_storage[0..input_length], chunk_bytes);
 }
 
 test "small fixtures and their deterministic mutations terminate consistently" {
     const chunk_sizes = [_]usize{ 1, 2, 3, 7, 64 };
     var mutated: [max_decoder_input_bytes]u8 = undefined;
     for (decoder_fixtures) |fixture| {
-        const baseline = try decode_outcome(fixture, max_decoder_input_bytes);
+        const baseline = try decode_outcome(
+            fixture.version,
+            fixture.bytes,
+            max_decoder_input_bytes,
+        );
         try std.testing.expectEqual(DecoderTerminal.verified, baseline.terminal);
         for (chunk_sizes) |chunk_bytes| {
-            const fragmented = try decode_outcome(fixture, chunk_bytes);
+            const fragmented = try decode_outcome(fixture.version, fixture.bytes, chunk_bytes);
             try std.testing.expectEqualDeep(baseline, fragmented);
         }
-        for (0..fixture.len) |prefix_length| {
+        for (0..fixture.bytes.len) |prefix_length| {
             const outcome = try expect_decoder_equivalent(
-                fixture[0..prefix_length],
+                fixture.version,
+                fixture.bytes[0..prefix_length],
                 1 + prefix_length % 64,
             );
             try std.testing.expectEqual(DecoderTerminal.rejected, outcome.terminal);
         }
-        @memcpy(mutated[0..fixture.len], fixture);
-        for (0..fixture.len) |byte_index| {
+        @memcpy(mutated[0..fixture.bytes.len], fixture.bytes);
+        for (0..fixture.bytes.len) |byte_index| {
             mutated[byte_index] ^= @as(u8, 1) << @intCast(byte_index % 8);
             _ = try expect_decoder_equivalent(
-                mutated[0..fixture.len],
+                fixture.version,
+                mutated[0..fixture.bytes.len],
                 1 + byte_index % 64,
             );
             mutated[byte_index] ^= @as(u8, 1) << @intCast(byte_index % 8);
@@ -138,14 +170,22 @@ test "small fixtures and their deterministic mutations terminate consistently" {
     }
 }
 
-fn expect_decoder_equivalent(input: []const u8, chunk_bytes: usize) !DecoderOutcome {
-    const contiguous = try decode_outcome(input, max_decoder_input_bytes);
-    const fragmented = try decode_outcome(input, chunk_bytes);
+fn expect_decoder_equivalent(
+    version: ltx.FormatVersion,
+    input: []const u8,
+    chunk_bytes: usize,
+) !DecoderOutcome {
+    const contiguous = try decode_outcome(version, input, max_decoder_input_bytes);
+    const fragmented = try decode_outcome(version, input, chunk_bytes);
     try std.testing.expectEqualDeep(contiguous, fragmented);
     return contiguous;
 }
 
-fn decode_outcome(input: []const u8, chunk_bytes: usize) !DecoderOutcome {
+fn decode_outcome(
+    version: ltx.FormatVersion,
+    input: []const u8,
+    chunk_bytes: usize,
+) !DecoderOutcome {
     if (input.len > max_decoder_input_bytes) return error.TestInputTooLarge;
     if (chunk_bytes == 0) return error.InvalidTestChunkSize;
     var source = ChunkedReader{ .bytes = input, .max_chunk_bytes = chunk_bytes };
@@ -153,7 +193,7 @@ fn decode_outcome(input: []const u8, chunk_bytes: usize) !DecoderOutcome {
     var compressed_workspace: [max_decoder_compressed_bytes]u8 = undefined;
     var index_workspace: [max_decoder_pages]ltx.PageIndexEntry = undefined;
     var decoder = try ltx.Decoder.init(
-        .v3,
+        version,
         decoder_limits,
         source.reader(),
         &page_workspace,
@@ -171,7 +211,7 @@ fn decode_outcome(input: []const u8, chunk_bytes: usize) !DecoderOutcome {
             return outcome;
         };
         outcome.event_count += 1;
-        if (try record_decoder_event(&outcome, &decoder, before, event, input.len)) {
+        if (try record_decoder_event(&outcome, &decoder, version, before, event, input.len)) {
             outcome.consumed_bytes = @intCast(source.offset_bytes);
             try std.testing.expectEqual(@as(u64, @intCast(input.len)), outcome.consumed_bytes);
             try std.testing.expectError(error.InvalidState, decoder.next());
@@ -184,6 +224,7 @@ fn decode_outcome(input: []const u8, chunk_bytes: usize) !DecoderOutcome {
 fn record_decoder_event(
     outcome: *DecoderOutcome,
     decoder: *ltx.Decoder,
+    version: ltx.FormatVersion,
     before: ltx.DecoderState,
     event: ltx.DecoderEvent,
     input_length: usize,
@@ -213,6 +254,7 @@ fn record_decoder_event(
             try std.testing.expectEqual(@as(u8, 1), outcome.page_block_complete_count);
             try std.testing.expectEqual(@as(u32, outcome.page_count), verified.page_count);
             try std.testing.expectEqual(@as(u64, @intCast(input_length)), verified.byte_count);
+            try std.testing.expectEqual(version, verified.format_version);
             try std.testing.expectEqualDeep(outcome.header.?, verified.header);
             try expect_verified_checksum(outcome, verified);
             outcome.verified = verified;
@@ -295,13 +337,15 @@ fn expect_verified_checksum(
     try std.testing.expectEqual(rolling.value, verified.trailer.post_apply_checksum.value);
 }
 
-fn indexed_slice_seed(
+fn versioned_slice_seed(
+    comptime use_v2: bool,
     comptime selector: u64,
     comptime bytes: []const u8,
-) [12 + bytes.len]u8 {
-    var result: [12 + bytes.len]u8 = undefined;
-    std.mem.writeInt(u64, result[0..8], selector, .little);
-    std.mem.writeInt(u32, result[8..12], bytes.len, .little);
-    @memcpy(result[12..], bytes);
+) [20 + bytes.len]u8 {
+    var result: [20 + bytes.len]u8 = undefined;
+    std.mem.writeInt(u64, result[0..8], @intFromBool(use_v2), .little);
+    std.mem.writeInt(u64, result[8..16], selector, .little);
+    std.mem.writeInt(u32, result[16..20], bytes.len, .little);
+    @memcpy(result[20..], bytes);
     return result;
 }

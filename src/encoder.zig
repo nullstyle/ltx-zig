@@ -41,7 +41,7 @@ pub const Encoder = struct {
         compression_workspace: *lz4_block.CompressionWorkspace,
         index_workspace: []format.PageIndexEntry,
     ) format.Error!Encoder {
-        try version.validate();
+        try version.validate_for_encoding();
         limits.validate() catch return error.InvalidLimits;
         if (limits.max_compressed_page_size < lz4_block.literal_bound(limits.max_page_size)) {
             return error.InvalidLimits;

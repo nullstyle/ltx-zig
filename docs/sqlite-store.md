@@ -6,6 +6,9 @@ without mutating a database that SQLite has open. It is a filesystem adapter to
 for its SQLite library, connection pool, statements, BLOB handles, checkpoints,
 and admission control.
 
+The source may be explicitly selected LTX v2 or v3: the store persists the
+verified database image and position, not the source wire framing.
+
 ## Why publication uses generations
 
 Replacing a conventional `main.sqlite` pathname while SQLite still has the old

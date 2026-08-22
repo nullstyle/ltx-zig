@@ -180,6 +180,7 @@ fn compact_inputs(output: []u8, encoded_inputs: []const []const u8) ![]const u8 
     for (encoded_inputs, 0..) |bytes, index| {
         readers[index] = ltx.SliceReader.init(bytes);
         inputs[index] = ltx.CompactionInput.init(
+            .v3,
             readers[index].reader(),
             &page_workspaces[index],
             &compressed_workspaces[index],

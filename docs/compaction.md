@@ -1,15 +1,17 @@
 # Compaction
 
-`Compactor` merges a chronologically ordered set of LTX files into one verified
-v3 transition without allocating. It is a codec operation, not a storage-level
-compaction service: callers still choose files, provide scratch output, publish
-the successful result, and retire source files.
+`Compactor` merges a chronologically ordered set of LTX v2 and/or v3 files into
+one verified canonical v3 transition without allocating. It is a codec
+operation, not a storage-level compaction service: callers still choose files,
+provide scratch output, publish the successful result, and retire source files.
 
 ## Merge semantics
 
 Inputs are supplied oldest to newest. A successful compaction applies these
 rules:
 
+- each input carries an explicit format version; the shared `LTX1` magic is
+  never used to infer v2 or v3;
 - every input reaches its terminal `VerifiedLTX` result;
 - all page sizes and checksum modes match;
 - each next `MinTXID` equals the previous `MaxTXID + 1` exactly;
@@ -31,8 +33,11 @@ first input, and `Commit`, `MaxTXID`, and `Timestamp` from the last. Its checksu
 flag is derived from the common input mode. `WALOffset`, `WALSize`, both WAL
 salts, and `NodeID` are zero because source-local provenance no longer describes
 the merged file; canonical encoding also zeros reserved header bytes. Output
-pages use the current flagged raw-LZ4 representation even when an input used the
-supported legacy unflagged v3 frame profile.
+pages use the current flagged raw-LZ4 representation even when an input used v2
+framing or the supported legacy unflagged v3 frame profile. The output version
+passed to `Compactor.init` must be `.v3`; `.v2` is rejected because the encoder
+is deliberately v3-only. Compaction is therefore the supported wire migration
+path rather than a v2 re-encoder.
 
 Final commit zero is meaningful. For example, compacting a checksummed snapshot
 followed by a contiguous incremental deletion produces a verified empty
@@ -48,12 +53,14 @@ borrows a writer plus the encoder's compressed bytes, fixed
 ```zig
 var inputs = [_]ltx.CompactionInput{
     ltx.CompactionInput.init(
+        .v2,
         first_reader,
         first_page_workspace,
         first_compressed_workspace,
         first_index_workspace,
     ),
     ltx.CompactionInput.init(
+        .v3,
         second_reader,
         second_page_workspace,
         second_compressed_workspace,
@@ -73,6 +80,11 @@ var compactor = try ltx.Compactor.init(
 );
 const verified = try compactor.compact();
 ```
+
+Every `CompactionInput.init` call requires the source's trusted out-of-band
+version, including an all-v3 input set. The output version is selected
+separately by `Compactor.init` and must be `.v3`; neither call discovers or
+guesses a version from input bytes.
 
 `Limits` applies independently to every input decoder and the output encoder.
 `CompactionLimits.max_inputs` bounds the number of sources, while
@@ -168,5 +180,10 @@ database images, so neither probe is a SQLite-validity claim. Normal Zig tests
 do not run Go or Litestream and never access the network; they reproduce the
 same mixed-representation chain with the bounded staged applier.
 
-The pinned Go and Celld source evidence and deliberate strictness differences
-are recorded in [`upstream.md`](upstream.md).
+The v2 input profile is anchored to `superfly/ltx` v0.4.0 at commit
+`2af9b0cb7a6eebfb59c2ca76acc4ae3adf4b6a09`. Migration uses the canonical v3
+encoder whose output is separately byte-qualified against the current Go pin;
+the exact v2 migration chain is not a new direct Go comparison. Celld provides
+secondary v3 compaction and deployment evidence but no v2 implementation. The
+pinned source evidence and deliberate strictness differences are recorded in
+[`upstream.md`](upstream.md).

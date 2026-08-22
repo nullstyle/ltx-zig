@@ -740,6 +740,40 @@ pub fn build(b: *std.Build) void {
     );
     upstream_fixture_step.dependOn(&upstream_fixture.step);
 
+    const v2_fixture_name = b.option(
+        []const u8,
+        "v2-fixture",
+        "Historical pinned-Go v2 fixture: mixed, empty, sqlite-empty, incremental, no-checksum, or near-lock",
+    ) orelse "mixed";
+    const v2_fixture = b.addSystemCommand(&.{
+        "go",
+        "run",
+        ".",
+        v2_fixture_name,
+    });
+    v2_fixture.setCwd(b.path("tools/v2_fixturegen"));
+    v2_fixture.setEnvironmentVariable("GOWORK", "off");
+    const v2_fixture_step = b.step(
+        "upstream-v2-fixture",
+        "Write a selected historical pinned-Go v2 fixture to stdout",
+    );
+    v2_fixture_step.dependOn(&v2_fixture.step);
+
+    const check_v2_fixtures = b.addSystemCommand(&.{
+        "go",
+        "run",
+        ".",
+        "--check",
+        "../../tests/fixtures",
+    });
+    check_v2_fixtures.setCwd(b.path("tools/v2_fixturegen"));
+    check_v2_fixtures.setEnvironmentVariable("GOWORK", "off");
+    const check_v2_fixtures_step = b.step(
+        "check-v2-fixtures",
+        "Check historical Go v2 output against committed fixtures",
+    );
+    check_v2_fixtures_step.dependOn(&check_v2_fixtures.step);
+
     const legacy_fixture_name = b.option(
         []const u8,
         "legacy-fixture",
@@ -814,4 +848,5 @@ pub fn build(b: *std.Build) void {
         "Check binary fixtures against reviewed hex mirrors",
     );
     check_fixtures_step.dependOn(&check_fixtures.step);
+    check_fixtures_step.dependOn(check_v2_fixtures_step);
 }

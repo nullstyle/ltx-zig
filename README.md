@@ -15,12 +15,16 @@ package is named `ltx-zig`; consumers import its public module as `ltx`.
 
 ## Status
 
-This checkpoint supports the current and historical LTX v3 page encodings
-emitted by `superfly/ltx` at the revisions pinned in
+This checkpoint supports importing LTX v2 and the current and historical LTX
+v3 page encodings emitted by `superfly/ltx` at the revisions pinned in
 [docs/upstream.md](docs/upstream.md). The pinned `denoland/celld` LTX crate is
-also used as a secondary format and deployment reference:
+also used as a secondary v3 format and deployment reference; it does not
+provide a v2 oracle:
 
-- explicit `.v3` selection on every decoder and encoder;
+- explicit `.v2` or `.v3` decoder selection because both versions use the same
+  `LTX1` magic;
+- LTX v2 four-byte page headers and independent LZ4-frame pages for bounded
+  import, staged apply, and migration;
 - current six-byte page headers with `PageHeaderFlagSize`;
 - independent raw LZ4 blocks, including normal match-compressed Go output;
 - canonical legacy unflagged LZ4 frames, including compressed and stored blocks;
@@ -35,9 +39,9 @@ also used as a secondary format and deployment reference:
 - an immutable six-file L0 chain captured by real Litestream v0.5.11, verified
   prefix by prefix against exact restored SQLite image hashes;
 - strict terminal verification and trailing-byte rejection;
-- allocation-free, oldest-to-newest compaction with exact TXID and
-  enabled-checksum continuity, latest-page precedence, and final-commit
-  truncation;
+- allocation-free, oldest-to-newest compaction with a version selected for
+  each input, exact TXID and enabled-checksum continuity, latest-page
+  precedence, final-commit truncation, and canonical v3 output;
 - outbound compaction qualification in which pinned Go byte-matches a Zig L1
   prefix and Litestream v0.5.16 restores it together with a legacy L0 tail;
 - a deterministic five-chain compaction matrix spanning checksummed growth,
@@ -53,11 +57,13 @@ also used as a secondary format and deployment reference:
   an indeterminate commit, qualified with real checksummed snapshot and
   incremental SQLite generations that grow and shrink.
 
-The decoder covers both page encodings emitted across upstream v3 history. The
-encoder always emits the current flagged raw-block representation. Valid LZ4
-frame profiles that upstream LTX never emitted remain deliberately unsupported.
-LTX v2 and fixed-path replacement beneath live SQLite connections are not
-implemented. Compaction is a codec-level merge: it does not select storage
+The decoder covers the pinned v2 import profile and both page encodings emitted
+across upstream v3 history. The encoder remains v3-only and always emits the
+current flagged raw-block representation; v2 is an import and migration format,
+not a new output option. Valid LZ4 frame profiles that upstream LTX never
+emitted remain deliberately unsupported. LTX v1 and fixed-path replacement
+beneath live SQLite connections are not implemented. Compaction is a
+codec-level merge: it does not select storage
 levels, delete source files, publish a replica, or manage a Litestream process.
 The core API remains synchronous, transport-neutral, and free of filesystem and
 SQLite dependencies. See [docs/compaction.md](docs/compaction.md) for its exact
@@ -81,8 +87,8 @@ Distributions must retain the applicable notices.
 `ltx-zig` is pre-1.0. Its Zig source API may change in any 0.x release without
 a compatibility shim or deprecation period. Development is coordinated with
 one consumer; other users should pin an exact tag or commit. Wire compatibility
-and the verification invariants above remain separately enforced by the pinned
-oracles and interoperability suites.
+and the verification invariants above remain separately governed by explicit
+version selection, the pinned oracles, and the interoperability suites.
 
 ## Using the package
 
@@ -247,6 +253,15 @@ forces no-checksum compaction during restore but retains the nonzero post-apply
 checksum. This is a Litestream v0.5.16 limitation, not a Zig/Go byte mismatch.
 The matrix images contain synthetic byte patterns and are not claimed to be
 valid SQLite databases.
+
+LTX v2 import and migration use `superfly/ltx` v0.4.0 at commit
+`2af9b0cb7a6eebfb59c2ca76acc4ae3adf4b6a09` as their independent wire oracle.
+Migration uses the same canonical v3 encoder whose output is separately
+byte-qualified against the current Go pin; the exact v2 migration chain is not
+presented as a new direct Go comparison. Celld is a secondary v3 reader, writer,
+and deployment reference only; its crate contains no v2 implementation or v2
+fixtures.
+
 Release qualification and CI use the official archive, and CI extracts and
 runs it only after checking its pinned SHA-256. Normal tests stay
 network-free, replay the checked-in fuzz corpora, and run a deterministic
@@ -305,8 +320,10 @@ caps are 65,809 and 65,794 bytes respectively.
 ## Minimal decoding example
 
 The decoder receives an explicit format version, explicit limits, a transport,
-and all variable-size workspace during initialization. Page data is explicitly
-unverified and is overwritten by the next decoder operation.
+and all variable-size workspace during initialization. Pass `.v2` for a known
+v2 object and `.v3` for a known v3 object; `LTX1` cannot distinguish them. Page
+data is explicitly unverified and is overwritten by the next decoder
+operation.
 
 ```zig
 const ltx = @import("ltx");

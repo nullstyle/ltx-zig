@@ -1518,7 +1518,11 @@ fn slices_overlap(left: []const u8, right: []const u8) bool {
 }
 
 fn validate_plan(plan: ltx.ApplyPlan) Error!void {
-    if (plan.format_version != .v3 or !valid_page_size(plan.header.page_size)) {
+    switch (plan.format_version) {
+        .v2, .v3 => {},
+        _ => return error.InvalidState,
+    }
+    if (!valid_page_size(plan.header.page_size)) {
         return error.InvalidState;
     }
     const expected_size = std.math.mul(

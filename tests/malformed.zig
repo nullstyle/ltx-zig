@@ -1,9 +1,11 @@
 const std = @import("std");
 const ltx = @import("ltx");
 
-test "unsupported versions remain explicit" {
-    const version: ltx.FormatVersion = @enumFromInt(2);
-    try std.testing.expectError(error.UnsupportedFormatVersion, version.validate());
+test "supported and unsupported versions remain explicit" {
+    try ltx.FormatVersion.v2.validate();
+    try ltx.FormatVersion.v3.validate();
+    const unknown: ltx.FormatVersion = @enumFromInt(4);
+    try std.testing.expectError(error.UnsupportedFormatVersion, unknown.validate());
 }
 
 const limits = ltx.Limits{
@@ -17,6 +19,41 @@ const limits = ltx.Limits{
     .max_varint_bytes = 10,
     .max_transaction_span = 100,
 };
+
+test "decoder and encoder initialization keep version roles explicit" {
+    const unknown: ltx.FormatVersion = @enumFromInt(4);
+    var input: [1]u8 = undefined;
+    var source = ltx.SliceReader.init(&input);
+    var page_workspace: [65_536]u8 = undefined;
+    var compressed_workspace: [66_000]u8 = undefined;
+    var index_workspace: [8]ltx.PageIndexEntry = undefined;
+    try std.testing.expectError(
+        error.UnsupportedFormatVersion,
+        ltx.Decoder.init(
+            unknown,
+            limits,
+            source.reader(),
+            &page_workspace,
+            &compressed_workspace,
+            &index_workspace,
+        ),
+    );
+
+    var output: [1]u8 = undefined;
+    var sink = ltx.SliceWriter.init(&output);
+    var lz4_workspace: ltx.LZ4CompressionWorkspace = undefined;
+    try std.testing.expectError(
+        error.UnsupportedFormatVersion,
+        ltx.Encoder.init(
+            .v2,
+            limits,
+            sink.writer(),
+            &compressed_workspace,
+            &lz4_workspace,
+            &index_workspace,
+        ),
+    );
+}
 
 test "initialization rejects undersized caller workspaces" {
     var input: [1]u8 = undefined;
@@ -218,6 +255,70 @@ test "every truncation of a legacy Go frame is rejected without panic" {
     while (prefix_length < fixture.len) : (prefix_length += 1) {
         try expect_decode_failure(fixture[0..prefix_length]);
     }
+}
+
+test "every truncation of every Go v2 fixture is rejected without panic" {
+    const fixtures = [_][]const u8{
+        @embedFile("fixtures/go_v2_mixed_snapshot.ltx"),
+        @embedFile("fixtures/go_v2_empty_snapshot.ltx"),
+        @embedFile("fixtures/go_v2_sqlite_empty.ltx"),
+        @embedFile("fixtures/go_v2_incremental.ltx"),
+        @embedFile("fixtures/go_v2_no_checksum.ltx"),
+        @embedFile("fixtures/go_v2_near_lock_page.ltx"),
+    };
+    for (fixtures) |fixture| {
+        for (0..fixture.len) |prefix_length| {
+            try expect_decode_failure_version(.v2, fixture[0..prefix_length]);
+        }
+    }
+}
+
+test "v2 and v3 page-header widths cannot be reinterpreted" {
+    const v2_fixtures = [_][]const u8{
+        @embedFile("fixtures/go_v2_mixed_snapshot.ltx"),
+        @embedFile("fixtures/go_v2_empty_snapshot.ltx"),
+        @embedFile("fixtures/go_v2_sqlite_empty.ltx"),
+        @embedFile("fixtures/go_v2_incremental.ltx"),
+        @embedFile("fixtures/go_v2_no_checksum.ltx"),
+        @embedFile("fixtures/go_v2_near_lock_page.ltx"),
+    };
+    for (v2_fixtures) |fixture| try expect_poisoned_decode_failure(.v3, fixture);
+
+    const v3_fixtures = [_][]const u8{
+        @embedFile("fixtures/go_v3_snapshot_zero_page.ltx"),
+        @embedFile("fixtures/go_v3_empty_snapshot.ltx"),
+        @embedFile("fixtures/go_v3_incremental.ltx"),
+        @embedFile("fixtures/go_v3_no_checksum.ltx"),
+        @embedFile("fixtures/go_v3_near_lock_page.ltx"),
+        @embedFile("fixtures/celld_v052_two_page_snapshot.ltx"),
+        @embedFile("fixtures/go_v3_legacy_unflagged.ltx"),
+        @embedFile("fixtures/go_v3_legacy_mixed.ltx"),
+    };
+    for (v3_fixtures) |fixture| try expect_poisoned_decode_failure(.v2, fixture);
+
+    try expect_decode_error(.v3, v2_fixtures[0], error.InvalidPageFlags);
+    try expect_decode_error(.v2, v3_fixtures[v3_fixtures.len - 1], error.InvalidLZ4Frame);
+}
+
+test "v2 LZ4, index, file checksum, and exact EOF remain trust boundaries" {
+    const fixture = @embedFile("fixtures/go_v2_mixed_snapshot.ltx");
+
+    var bad_lz4: [fixture.len]u8 = fixture[0..].*;
+    bad_lz4[104] ^= 1;
+    try expect_decode_error(.v2, &bad_lz4, error.InvalidLZ4Frame);
+
+    var bad_index: [fixture.len]u8 = fixture[0..].*;
+    bad_index[688] += 1;
+    try expect_decode_error(.v2, &bad_index, error.PageIndexMismatch);
+
+    var bad_checksum: [fixture.len]u8 = fixture[0..].*;
+    bad_checksum[bad_checksum.len - 1] ^= 1;
+    try expect_decode_error(.v2, &bad_checksum, error.ChecksumMismatch);
+
+    var trailing: [fixture.len + 1]u8 = undefined;
+    @memcpy(trailing[0..fixture.len], fixture);
+    trailing[fixture.len] = 0xa5;
+    try expect_decode_error(.v2, &trailing, error.TrailingBytes);
 }
 
 test "legacy frame corruption returns specific errors and poisons the decoder" {
@@ -784,6 +885,35 @@ test "legacy decoder accepts one-byte transport reads" {
     try std.testing.expectEqual(fixture.len, probe.read_calls);
 }
 
+test "v2 decoder accepts one-byte transport reads" {
+    const fixture = @embedFile("fixtures/go_v2_mixed_snapshot.ltx");
+    var probe = ProbeReader{ .bytes = fixture, .max_chunk = 1 };
+    var page_workspace: [65_536]u8 = undefined;
+    var compressed_workspace: [66_000]u8 = undefined;
+    var index_workspace: [8]ltx.PageIndexEntry = undefined;
+    var decoder = try ltx.Decoder.init(
+        .v2,
+        limits,
+        probe.reader(),
+        &page_workspace,
+        &compressed_workspace,
+        &index_workspace,
+    );
+    try std.testing.expectEqual(ltx.FormatVersion.v2, decoder.selected_format_version());
+    _ = try decoder.next();
+    _ = try decoder.next();
+    _ = try decoder.next();
+    _ = try decoder.next();
+    switch (try decoder.next()) {
+        .verified => |verified| {
+            try std.testing.expectEqual(ltx.FormatVersion.v2, verified.format_version);
+            try std.testing.expectEqual(@as(u64, fixture.len), verified.byte_count);
+        },
+        else => return error.ExpectedVerifiedEvent,
+    }
+    try std.testing.expectEqual(fixture.len, probe.read_calls);
+}
+
 test "reader failure inside a legacy frame poisons the decoder" {
     var fixture: [183]u8 = undefined;
     try load_fixture("fixtures/go_v3_legacy_unflagged.ltx", &fixture);
@@ -931,7 +1061,15 @@ const DecoderHarness = struct {
     decoder: ltx.Decoder,
 
     fn init(self: *DecoderHarness, input: []const u8) !void {
-        try self.init_with_limits(input, limits);
+        try self.init_version(.v3, input);
+    }
+
+    fn init_version(
+        self: *DecoderHarness,
+        version: ltx.FormatVersion,
+        input: []const u8,
+    ) !void {
+        try self.init_version_with_limits(version, input, limits);
     }
 
     fn init_with_limits(
@@ -939,9 +1077,18 @@ const DecoderHarness = struct {
         input: []const u8,
         selected_limits: ltx.Limits,
     ) !void {
+        try self.init_version_with_limits(.v3, input, selected_limits);
+    }
+
+    fn init_version_with_limits(
+        self: *DecoderHarness,
+        version: ltx.FormatVersion,
+        input: []const u8,
+        selected_limits: ltx.Limits,
+    ) !void {
         self.source = ltx.SliceReader.init(input);
         self.decoder = try ltx.Decoder.init(
-            .v3,
+            version,
             selected_limits,
             self.source.reader(),
             &self.page_workspace,
@@ -970,13 +1117,64 @@ fn expect_terminal_failure_with_limits(
 }
 
 fn expect_decode_failure(input: []const u8) !void {
+    try expect_decode_failure_version(.v3, input);
+}
+
+fn expect_decode_failure_version(
+    version: ltx.FormatVersion,
+    input: []const u8,
+) !void {
     var harness: DecoderHarness = undefined;
-    try harness.init(input);
+    try harness.init_version(version, input);
     var event_count: u8 = 0;
     while (event_count < 12) : (event_count += 1) {
         const event = harness.decoder.next() catch return;
         switch (event) {
             .verified => return error.TruncatedFileVerified,
+            else => {},
+        }
+    }
+    return error.DecoderDidNotTerminate;
+}
+
+fn expect_poisoned_decode_failure(
+    version: ltx.FormatVersion,
+    input: []const u8,
+) !void {
+    var harness: DecoderHarness = undefined;
+    try harness.init_version(version, input);
+    var event_count: u8 = 0;
+    while (event_count < 12) : (event_count += 1) {
+        const event = harness.decoder.next() catch {
+            try std.testing.expectEqual(ltx.DecoderState.failed, harness.decoder.current_state());
+            try std.testing.expectError(error.InvalidState, harness.decoder.next());
+            return;
+        };
+        switch (event) {
+            .verified => return error.InvalidFileVerified,
+            else => {},
+        }
+    }
+    return error.DecoderDidNotTerminate;
+}
+
+fn expect_decode_error(
+    version: ltx.FormatVersion,
+    input: []const u8,
+    expected_error: ltx.Error,
+) !void {
+    var harness: DecoderHarness = undefined;
+    try harness.init_version(version, input);
+    var event_count: u8 = 0;
+    while (event_count < 12) : (event_count += 1) {
+        const event = harness.decoder.next() catch |err| {
+            try std.testing.expectEqual(expected_error, err);
+            try std.testing.expectEqual(ltx.DecoderState.failed, harness.decoder.current_state());
+            try std.testing.expectError(error.InvalidState, harness.decoder.next());
+            return;
+        };
+        switch (event) {
+            .verified => return error.InvalidFileVerified,
             else => {},
         }
     }

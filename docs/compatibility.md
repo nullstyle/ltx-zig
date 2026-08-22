@@ -6,8 +6,9 @@ check is manual; pinned upstream vectors are identified in the evidence.
 
 | Capability | Status | Evidence or boundary |
 | --- | --- | --- |
-| Explicit format selection | Tested | `.v3` succeeds; v2 returns `UnsupportedFormatVersion` |
-| Decode current Go output | Tested | Byte-exact snapshot, incremental, no-checksum, maximum-page, and near-lock fixtures |
+| Explicit format selection | Supported | Callers select `.v2` or `.v3`; both use `LTX1`, so no decoder auto-detection or retry is attempted |
+| Decode Go v0.4.0 LTX v2 | Supported | Four-byte page headers, independent legacy LZ4 frames, page index, trailer, and logical checksums; pinned oracle commit `2af9b0cb7a6eebfb59c2ca76acc4ae3adf4b6a09` |
+| Decode current Go LTX v3 | Tested | Byte-exact snapshot, incremental, no-checksum, maximum-page, and near-lock fixtures |
 | Decode Celld/Go v0.5.2 vector | Tested | Pinned byte-exact two-page, multi-index-entry fixture |
 | Real Litestream capture chain | Tested | Immutable v0.5.11 L0 snapshot plus five incrementals from Celld; exact artifact and per-prefix database hashes, nonzero WAL metadata, legacy frames, and final SQLite integrity/row checks |
 | Go decodes Zig output | Tested | Optional `zig build interop` uses the exact pinned Go module for a fresh snapshot, a five-chain 512–65,536-byte differential compaction matrix, the earlier synthetic cases, and a TX1–TX4 real-capture compaction; complete output bytes and decoded database hashes are exact |
@@ -15,7 +16,11 @@ check is manual; pinned upstream vectors are identified in the evidence.
 | Flagged raw LZ4 block frames | Tested | Zig reproduces complete pinned Go and Celld match-compressed files byte for byte |
 | Normal compressed matches | Tested | Exact pierrec/Celld vectors cover overlap, extension lengths, workspace reset, and 512..65536-byte pages |
 | Legacy unflagged v3 frames | Tested | Historical Go compressed and stored-block fixtures; canonical one-block 64 KiB profile |
-| LTX v2 | Unsupported | Same magic is never auto-detected or reinterpreted |
+| Staged apply from LTX v2 | Supported | V2 pages enter the same private-stage, full-verification, optional final-image checksum, and atomic publication protocol as v3 |
+| SQLite generation publication from LTX v2 | Supported | The optional store publishes the verified database image and position, not the source framing; quiescence, durability, and recovery rules are unchanged |
+| Mixed v2/v3 migration compaction | Supported | Each input selects its version explicitly; exact continuity and common checksum mode remain required; output is canonical current v3 |
+| Canonical encoding | Supported | Encoder output is v3-only with six-byte flagged raw-LZ4 pages; `.v2` encoding returns `UnsupportedFormatVersion` |
+| LTX v1 | Unsupported | No decoder or encoder path; never inferred from `LTX1` or another version's layout |
 | Snapshots | Tested | One-page and empty pinned Go fixtures; completeness enforced |
 | Incremental transitions | Tested | Pinned Go two-page fixture plus strict order and checksum-continuity tests |
 | No-checksum files | Tested | Pinned Go fixture; pre/post database checksums zero, file checksum required |
@@ -39,3 +44,10 @@ configured cap selects deterministic literal-only blocks. The decoder accepts
 both forms. Legacy decoding is strictly scoped to the independent 64 KiB,
 content-checksummed frame profile emitted by upstream; other standard LZ4 frame
 options return `UnsupportedPageEncoding`.
+
+The stronger v3 validation policy also applies to v2 import: canonical page
+order, snapshot completeness, one-to-one page-index correspondence, canonical
+varints, trailer validation, configured bounds, checksums, and exact EOF are
+not relaxed merely because the older Go decoder accepted less canonical input.
+Celld remains a secondary v3 interoperability and deployment reference and has
+no v2 implementation or v2 corpus.

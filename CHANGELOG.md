@@ -7,6 +7,18 @@ version is zero, the Zig source API is intentionally unstable.
 
 ## [Unreleased]
 
+### Added
+
+- Explicit LTX v2 import support for decoding, staged application, and
+  crash-safe SQLite generation publication, anchored to `superfly/ltx` v0.4.0.
+- Per-input format selection for bounded compaction so verified v2 and v3
+  transitions can be migrated into one canonical v3 output.
+
+### Changed
+
+- Format selection remains out of band because LTX v2 and v3 share the `LTX1`
+  magic. The encoder remains v3-only; v1 remains unsupported.
+
 ## [0.1.0] - 2026-08-22
 
 ### Added

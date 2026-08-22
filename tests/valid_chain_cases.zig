@@ -236,6 +236,7 @@ const InputWorkspace = struct {
     fn input(self: *InputWorkspace, bytes: []const u8) ltx.CompactionInput {
         self.source = ltx.SliceReader.init(bytes);
         return ltx.CompactionInput.init(
+            .v3,
             self.source.reader(),
             &self.page,
             &self.compressed,

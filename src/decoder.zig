@@ -140,9 +140,19 @@ pub const Decoder = struct {
     fn decode_page_event(self: *Decoder) format.Error!DecoderEvent {
         const frame_offset_bytes = self.input_offset_bytes;
         var header_bytes: [format.page_header_size]u8 = undefined;
-        try self.read_exact(&header_bytes);
-        self.file_hasher.update(&header_bytes);
-        const page_header = format.decode_page_header(&header_bytes);
+        const header_size_bytes: usize = @intCast(
+            try self.format_version.page_header_size_bytes(),
+        );
+        const encoded_header = header_bytes[0..header_size_bytes];
+        try self.read_exact(encoded_header);
+        self.file_hasher.update(encoded_header);
+        const page_header = switch (self.format_version) {
+            .v2 => format.decode_v2_page_header(
+                header_bytes[0..format.v2_page_header_size],
+            ),
+            .v3 => format.decode_page_header(&header_bytes),
+            _ => unreachable,
+        };
 
         if (page_header.is_terminator()) {
             try self.validate_snapshot_complete();
@@ -151,7 +161,9 @@ pub const Decoder = struct {
             return .{ .page_block_complete = {} };
         }
         try self.validate_page_header(page_header);
-        if (page_header.flags & format.page_header_flag_size != 0) {
+        if (self.format_version == .v3 and
+            page_header.flags & format.page_header_flag_size != 0)
+        {
             return self.decode_flagged_page(page_header, frame_offset_bytes);
         }
         return self.decode_legacy_page(page_header, frame_offset_bytes);
@@ -230,7 +242,8 @@ pub const Decoder = struct {
             self.limits.max_compressed_page_size,
         );
         const physical_size = self.input_offset_bytes - frame_offset_bytes;
-        std.debug.assert(physical_size == format.page_header_size + encoded_size);
+        const header_size_bytes = self.format_version.page_header_size_bytes() catch unreachable;
+        std.debug.assert(physical_size == header_size_bytes + encoded_size);
         return self.finish_page(page_header, frame_offset_bytes, page);
     }
 

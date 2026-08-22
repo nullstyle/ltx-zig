@@ -33,6 +33,7 @@ pub const CompactorState = enum {
 /// storage it may use. The value must remain at a stable address in the input
 /// slice supplied to `Compactor.init` until compaction reaches a terminal state.
 pub const CompactionInput = struct {
+    format_version: format.FormatVersion,
     reader: Reader,
     page_workspace: []u8,
     compressed_workspace: []u8,
@@ -43,12 +44,14 @@ pub const CompactionInput = struct {
     page_number: ?u32 = null,
 
     pub fn init(
+        version: format.FormatVersion,
         reader: Reader,
         page_workspace: []u8,
         compressed_workspace: []u8,
         index_workspace: []format.PageIndexEntry,
     ) CompactionInput {
         return .{
+            .format_version = version,
             .reader = reader,
             .page_workspace = page_workspace,
             .compressed_workspace = compressed_workspace,
@@ -56,9 +59,12 @@ pub const CompactionInput = struct {
         };
     }
 
-    fn initialize_decoder(self: *CompactionInput, version: format.FormatVersion, limits: Limits) format.Error!void {
+    fn initialize_decoder(
+        self: *CompactionInput,
+        limits: Limits,
+    ) format.Error!void {
         self.decoder = try Decoder.init(
-            version,
+            self.format_version,
             limits,
             self.reader,
             self.page_workspace,
@@ -84,7 +90,7 @@ pub const Compactor = struct {
     total_page_count: u64 = 0,
 
     pub fn init(
-        version: format.FormatVersion,
+        output_version: format.FormatVersion,
         codec_limits: Limits,
         compaction_limits: CompactionLimits,
         inputs: []CompactionInput,
@@ -93,7 +99,7 @@ pub const Compactor = struct {
         output_compression_workspace: *lz4_block.CompressionWorkspace,
         output_index_workspace: []format.PageIndexEntry,
     ) format.Error!Compactor {
-        try version.validate();
+        try output_version.validate_for_encoding();
         codec_limits.validate() catch return error.InvalidLimits;
         try compaction_limits.validate();
         if (inputs.len == 0) return error.CompactionInputRequired;
@@ -108,16 +114,16 @@ pub const Compactor = struct {
         );
         try validate_global_aliasing(inputs, writer, output_ranges);
         const encoder = try Encoder.init(
-            version,
+            output_version,
             codec_limits,
             writer,
             output_compressed_workspace,
             output_compression_workspace,
             output_index_workspace,
         );
-        try initialize_inputs(version, codec_limits, inputs);
+        try initialize_inputs(codec_limits, inputs);
         return .{
-            .format_version = version,
+            .format_version = output_version,
             .compaction_limits = compaction_limits,
             .inputs = inputs,
             .encoder = encoder,
@@ -307,7 +313,7 @@ pub const Compactor = struct {
 /// the decoder to read or emit another page payload.
 const TerminalProbe = struct {
     upstream: Reader,
-    remaining_bytes: usize = format.page_header_size,
+    remaining_bytes: usize,
     blocked: bool = false,
 
     fn reader(self: *TerminalProbe) Reader {
@@ -338,7 +344,12 @@ const TerminalProbe = struct {
 };
 
 fn advance_input_at_page_limit(input: *CompactionInput) format.Error!void {
-    var probe = TerminalProbe{ .upstream = input.reader };
+    var probe = TerminalProbe{
+        .upstream = input.reader,
+        .remaining_bytes = @intCast(
+            input.decoder.selected_format_version().page_header_size_bytes() catch unreachable,
+        ),
+    };
     input.decoder.reader = probe.reader();
     const event = input.decoder.next() catch |err| {
         input.decoder.reader = input.reader;
@@ -356,14 +367,13 @@ fn advance_input_at_page_limit(input: *CompactionInput) format.Error!void {
 const WorkspaceRanges = [3][]const u8;
 
 fn initialize_inputs(
-    version: format.FormatVersion,
     limits: Limits,
     inputs: []CompactionInput,
 ) format.Error!void {
     const input_count: u32 = @intCast(inputs.len);
     var input_index: u32 = 0;
     while (input_index < input_count) : (input_index += 1) {
-        try inputs[@intCast(input_index)].initialize_decoder(version, limits);
+        try inputs[@intCast(input_index)].initialize_decoder(limits);
     }
 }
 
@@ -561,8 +571,8 @@ test "compactor merges a verified snapshot chain with newest pages winning" {
     var input_compressed: [2][600]u8 = undefined;
     var input_indexes: [2][4]format.PageIndexEntry = undefined;
     var inputs = [_]CompactionInput{
-        CompactionInput.init(first_source.reader(), &input_pages[0], &input_compressed[0], &input_indexes[0]),
-        CompactionInput.init(second_source.reader(), &input_pages[1], &input_compressed[1], &input_indexes[1]),
+        CompactionInput.init(.v3, first_source.reader(), &input_pages[0], &input_compressed[0], &input_indexes[0]),
+        CompactionInput.init(.v3, second_source.reader(), &input_pages[1], &input_compressed[1], &input_indexes[1]),
     };
     var output_bytes: [4096]u8 = undefined;
     var output_sink = transport.SliceWriter.init(&output_bytes);
@@ -630,8 +640,8 @@ test "compactor validates the aggregate output transaction span" {
     var compressed: [2][600]u8 = undefined;
     var indexes: [2][2]format.PageIndexEntry = undefined;
     var inputs = [_]CompactionInput{
-        CompactionInput.init(first_source.reader(), &pages[0], &compressed[0], &indexes[0]),
-        CompactionInput.init(second_source.reader(), &pages[1], &compressed[1], &indexes[1]),
+        CompactionInput.init(.v3, first_source.reader(), &pages[0], &compressed[0], &indexes[0]),
+        CompactionInput.init(.v3, second_source.reader(), &pages[1], &compressed[1], &indexes[1]),
     };
     var output: [4096]u8 = undefined;
     var sink = transport.SliceWriter.init(&output);
@@ -689,7 +699,7 @@ test "aggregate page limit does not read an extra page payload" {
     var compressed: [600]u8 = undefined;
     var index: [2]format.PageIndexEntry = undefined;
     var inputs = [_]CompactionInput{
-        CompactionInput.init(source.reader(), &page, &compressed, &index),
+        CompactionInput.init(.v3, source.reader(), &page, &compressed, &index),
     };
     var output: [4096]u8 = undefined;
     var sink = transport.SliceWriter.init(&output);

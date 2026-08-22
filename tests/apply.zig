@@ -27,6 +27,8 @@ const apply_limits = ltx.ApplyLimits{
 const celld_fixture = @embedFile("fixtures/celld_v052_two_page_snapshot.ltx");
 const empty_fixture = @embedFile("fixtures/go_v3_empty_snapshot.ltx");
 const no_checksum_fixture = @embedFile("fixtures/go_v3_no_checksum.ltx");
+const v2_mixed_snapshot_fixture = @embedFile("fixtures/go_v2_mixed_snapshot.ltx");
+const v2_incremental_fixture = @embedFile("fixtures/go_v2_incremental.ltx");
 
 const CelldLitestreamCapture = struct {
     bytes: []const u8,
@@ -359,9 +361,20 @@ const ApplyHarness = struct {
         mode: ltx.ApplyMode,
         limits: ltx.ApplyLimits,
     ) !void {
+        try self.init_versioned(.v3, input, backend, mode, limits);
+    }
+
+    fn init_versioned(
+        self: *ApplyHarness,
+        version: ltx.FormatVersion,
+        input: []const u8,
+        backend: ltx.ApplyBackend,
+        mode: ltx.ApplyMode,
+        limits: ltx.ApplyLimits,
+    ) !void {
         self.source = ltx.SliceReader.init(input);
         self.applier = try ltx.StagedApplier.init(
-            .v3,
+            version,
             codec_limits,
             limits,
             mode,
@@ -422,6 +435,46 @@ test "real Litestream v0.5.11 capture chain reconstructs each Celld golden datab
     }
 
     try expect_counts(&backend, 6, 30, 0, 6, 0);
+}
+
+test "v2 snapshot and incremental publish only after full image verification" {
+    var backend = MemoryBackend{};
+    var snapshot_harness: ApplyHarness = undefined;
+    try snapshot_harness.init_versioned(
+        .v2,
+        v2_mixed_snapshot_fixture,
+        backend.backend(),
+        .replace_snapshot,
+        apply_limits,
+    );
+    const snapshot = try snapshot_harness.applier.apply();
+    try std.testing.expectEqual(ltx.FormatVersion.v2, snapshot.format_version);
+    try std.testing.expectEqual(@as(u32, 2), snapshot.page_count);
+    try std.testing.expectEqual(ltx.FormatVersion.v2, backend.plan.?.format_version);
+
+    var incremental_harness: ApplyHarness = undefined;
+    try incremental_harness.init_versioned(
+        .v2,
+        v2_incremental_fixture,
+        backend.backend(),
+        .contiguous,
+        apply_limits,
+    );
+    const incremental = try incremental_harness.applier.apply();
+    try std.testing.expectEqual(ltx.FormatVersion.v2, incremental.format_version);
+    try std.testing.expectEqual(@as(u64, 4), backend.position.txid.value);
+    try std.testing.expectEqual(@as(?u32, 512), backend.page_size);
+    try std.testing.expectEqual(@as(usize, 3 * 512), backend.published_length_bytes);
+    try std.testing.expectEqualSlices(u8, &(@as([512]u8, @splat(0x31))), backend.published[0..512]);
+    const expected_second_page = xorshift_page();
+    try std.testing.expectEqualSlices(u8, &expected_second_page, backend.published[512..1024]);
+    try std.testing.expectEqualSlices(
+        u8,
+        &(@as([512]u8, @splat(0x33))),
+        backend.published[1024..1536],
+    );
+    try std.testing.expectEqual(incremental.post_apply_position(), backend.position);
+    try expect_counts(&backend, 2, 4, 5, 2, 0);
 }
 
 test "verified Celld snapshot replaces privately and publishes copied pages once" {
@@ -1045,6 +1098,18 @@ fn database_checksum(database: []const u8, page_size: usize) !ltx.Checksum {
         offset += page_size;
     }
     return rolling;
+}
+
+fn xorshift_page() [512]u8 {
+    var page: [512]u8 = undefined;
+    var state: u32 = 0x9e37_79b9;
+    for (&page) |*byte| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        byte.* = @truncate(state);
+    }
+    return page;
 }
 
 fn encode_incremental(output: *[2048]u8, initial_database: *[4 * 512]u8) !usize {

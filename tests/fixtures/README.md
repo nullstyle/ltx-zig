@@ -30,6 +30,41 @@ the exact oracle pseudo-version and `go.sum` pins transitive content hashes.
 The Zig encoder is separately required to reproduce the complete
 `go_v3_snapshot_zero_page.ltx` bytes, not merely its decoded semantics.
 
+## Historical Go v2 oracle fixtures
+
+These files come from `github.com/superfly/ltx` v0.4.0, commit
+`2af9b0cb7a6eebfb59c2ca76acc4ae3adf4b6a09`. The separate
+`tools/v2_fixturegen` module pins that release and its LZ4 dependency by Go
+module checksum. They require explicit format `.v2`: v2 and v3 both use
+`LTX1`, while v2 has a four-byte page header and no on-disk version field.
+
+Regenerate both the binary artifacts and reviewed hex mirrors, then verify
+them against the pinned writer with:
+
+```sh
+(cd tools/v2_fixturegen && GOWORK=off go run . --write ../../tests/fixtures)
+mise exec -- zig build check-v2-fixtures
+```
+
+| File / selector | Semantic pages | Header: flags, page size, commit, TXIDs, timestamp, pre-checksum | Trailer: post-checksum, file checksum | Bytes | Binary SHA-256 |
+| --- | --- | --- | --- | ---: | --- |
+| `go_v2_mixed_snapshot.ltx` / `mixed` | Snapshot page 1 = 512 zero bytes; page 2 = fixed-seed xorshift bytes; the pinned LZ4 writer emits compressed and stored frames respectively | `0`, `512`, `2`, `1..1`, `0`, `0000000000000000` | `ff273ef830778b70`, `b5434126ea96be07` | 719 | `e07e756bf683ef73eb0628177baa8f3a64f59bfbd162957189b626f1331e2eae` |
+| `go_v2_empty_snapshot.ltx` / `empty` | Empty snapshot; exercises the four-byte page terminator directly followed by the page index | `0`, `512`, `0`, `1..1`, `0`, `0000000000000000` | `8000000000000000`, `bc114ac8c457e208` | 129 | `1f518147c9c690b0494d6a9c9eb6884f6131bd6e27c739bb4fcc2f9db4971088` |
+| `go_v2_sqlite_empty.ltx` / `sqlite-empty` | Snapshot page 1 is a valid empty 512-byte SQLite 3 database with an empty table-leaf page | `0`, `512`, `1`, `1..1`, `0`, `0000000000000000` | `8c322d76563177ee`, `da434cd81503cce8` | 244 | `263808f41dda5869000e8b722efd1e8d866c6a5dbde594b4b8efbd226f35e09a` |
+| `go_v2_incremental.ltx` / `incremental` | Contiguous successor to `mixed`: pages 1 and 3 become 512 bytes of `31` and `33`; unchanged page 2 retains the xorshift bytes | `0`, `512`, `3`, `2..4`, `-1000`, `ff273ef830778b70` | `b6a0600a0173c6ad`, `9617bdbd486343c2` | 230 | `f960103ca1bf1df2475d4f9a229c7863949f9c4394b35096ae90a257f15e5224` |
+| `go_v2_no_checksum.ltx` / `no-checksum` | Page 2 = 4096 bytes of `a5` | `2`, `4096`, `2`, `5..5`, `2000`, `0000000000000000` | `0000000000000000`, `ae9072bfa9004879` | 193 | `76b3dfdaa958ad939f9adf4a2e22563452eb8480a006883a995c9cfce775d966` |
+| `go_v2_near_lock_page.ltx` / `near-lock` | 65,536-byte pages 16,384 and 16,386 = `84` and `86`; lock page 16,385 is omitted | `0`, `65536`, `16386`, `7..8`, `3000`, `8000000000000111` | `8000000000000222`, `bf1922ef87e1dd8f` | 746 | `35a89b6af9e8f5b29377ad5e904444eb62cef5cf87ae8a512aa400b5a3058e30` |
+
+The mixed snapshot and incremental form a genuine checksummed chain. Applying
+the second file over the first yields three pages and the incremental trailer's
+post-apply checksum; the 1,536-byte final image has SHA-256
+`d83e04db4d5ed75b3d5cd7d5b910690162c26cfbd24584f8f8e3bbec607aa475`.
+The SQLite fixture duplicates the byte layout constructed by
+`tests/sqlite_store.zig` for an empty database. Its decoded 512-byte database
+has SHA-256
+`2d3f4873f9cbd65802382dc11067c1e52d72cdaa464bda1f5072faac002e95f5`,
+passes `PRAGMA integrity_check`, and has an empty `sqlite_schema`.
+
 ## Secondary and historical fixtures
 
 | File | Origin and reproduction | Semantic contents and expected header | Expected trailer | Binary SHA-256 |

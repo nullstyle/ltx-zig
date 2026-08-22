@@ -33,6 +33,12 @@ var applier = try ltx.StagedApplier.init(
 const verified = try applier.apply();
 ```
 
+Select `.v2` instead when the source object's trusted metadata identifies LTX
+v2. Both versions begin with `LTX1`, so `StagedApplier` never auto-detects or
+retries another layout. V2 and v3 decode into the same uncompressed page-event
+model, but the selected version controls physical page-header and frame parsing
+and is carried through `ApplyPlan` and `VerifiedLTX`.
+
 ## Lifecycle
 
 An apply session is one shot:
@@ -83,6 +89,12 @@ again.
 No-checksum LTX files still require complete structural and file-checksum
 verification. Their explicit wire contract omits the final database-image
 checksum scan.
+
+These rules are identical for imported v2 and v3 files. V2 support does not
+weaken page ordering, snapshot completeness, index correspondence, trailer
+validation, checksum validation, configured bounds, or exact EOF. A successful
+v2 apply authorizes the same verified database image and position publication;
+it does not authorize re-emitting v2 bytes.
 
 ## Transition modes
 
@@ -167,3 +179,10 @@ manifest resolution through SQLite close. Publication and recovery take that
 lock exclusively. The publication sequence syncs the staged database, temporary
 manifest, and parent directory around the atomic rename. These policies remain
 outside the core and are documented in [`sqlite-store.md`](sqlite-store.md).
+
+The store can publish a fully verified image decoded from either v2 or v3. Its
+manifest names the authoritative image, page size, and LTX position rather than
+preserving the source wire representation, so crash recovery and immutable
+SQLite access use the same protocol for both versions. Fixed-path replacement
+under an open SQLite connection remains unsupported regardless of source
+version.

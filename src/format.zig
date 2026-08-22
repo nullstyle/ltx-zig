@@ -4,7 +4,10 @@ const wire = @import("wire.zig");
 
 pub const magic = "LTX1".*;
 pub const header_size: u32 = 100;
-pub const page_header_size: u32 = 6;
+pub const v2_page_header_size: u32 = 4;
+pub const v3_page_header_size: u32 = 6;
+/// Canonical encoder page-header size; currently identical to v3.
+pub const page_header_size: u32 = v3_page_header_size;
 pub const page_size_prefix_size: u32 = 4;
 pub const trailer_size: u32 = 16;
 pub const checksum_size: u32 = 8;
@@ -96,11 +99,31 @@ pub const Error = error{
 };
 
 pub const FormatVersion = enum(u8) {
+    v2 = 2,
     v3 = 3,
     _,
 
+    /// Validates versions accepted for decoding and verified import.
     pub fn validate(self: FormatVersion) Error!void {
+        switch (self) {
+            .v2, .v3 => {},
+            _ => return error.UnsupportedFormatVersion,
+        }
+    }
+
+    /// Validates versions accepted by the canonical encoder.
+    pub fn validate_for_encoding(self: FormatVersion) Error!void {
+        try self.validate();
         if (self != .v3) return error.UnsupportedFormatVersion;
+    }
+
+    pub fn page_header_size_bytes(self: FormatVersion) Error!u32 {
+        try self.validate();
+        return switch (self) {
+            .v2 => v2_page_header_size,
+            .v3 => v3_page_header_size,
+            _ => unreachable,
+        };
     }
 };
 
@@ -355,6 +378,13 @@ pub fn encode_page_header(header: PageHeader, destination: *[page_header_size]u8
     wire.write_u16_be(destination[4..6], header.flags);
 }
 
+pub fn decode_v2_page_header(source: *const [v2_page_header_size]u8) PageHeader {
+    return .{
+        .page_number = wire.read_u32_be(source[0..4]),
+        .flags = 0,
+    };
+}
+
 pub fn decode_page_header(source: *const [page_header_size]u8) PageHeader {
     return .{
         .page_number = wire.read_u32_be(source[0..4]),
@@ -378,7 +408,9 @@ comptime {
     std.debug.assert(@sizeOf(TXID) == 8);
     std.debug.assert(@sizeOf(Checksum) == checksum_size);
     std.debug.assert(header_size == 100);
-    std.debug.assert(page_header_size == 6);
+    std.debug.assert(v2_page_header_size == 4);
+    std.debug.assert(v3_page_header_size == 6);
+    std.debug.assert(page_header_size == v3_page_header_size);
     std.debug.assert(trailer_size == 2 * checksum_size);
     std.debug.assert(trailer_checksum_offset + checksum_size == trailer_size);
     std.debug.assert(header_magic_offset == 0);
@@ -436,6 +468,31 @@ test "header wire layout is canonical and reserved bytes are zero" {
 
     bytes[80] = 0xa5;
     try std.testing.expectEqualDeep(header, try decode_header(&bytes));
+}
+
+test "format versions keep v2 input distinct from canonical v3 output" {
+    try FormatVersion.v2.validate();
+    try FormatVersion.v3.validate();
+    try std.testing.expectEqual(v2_page_header_size, try FormatVersion.v2.page_header_size_bytes());
+    try std.testing.expectEqual(v3_page_header_size, try FormatVersion.v3.page_header_size_bytes());
+    try std.testing.expectError(
+        error.UnsupportedFormatVersion,
+        FormatVersion.v2.validate_for_encoding(),
+    );
+    try FormatVersion.v3.validate_for_encoding();
+
+    const unknown: FormatVersion = @enumFromInt(1);
+    try std.testing.expectError(error.UnsupportedFormatVersion, unknown.validate());
+    try std.testing.expectError(
+        error.UnsupportedFormatVersion,
+        unknown.page_header_size_bytes(),
+    );
+
+    const v2_bytes = [4]u8{ 0, 0, 0, 7 };
+    try std.testing.expectEqualDeep(
+        PageHeader{ .page_number = 7, .flags = 0 },
+        decode_v2_page_header(&v2_bytes),
+    );
 }
 
 test "lock page matches upstream known answers for every SQLite page size" {

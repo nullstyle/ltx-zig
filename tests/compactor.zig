@@ -29,6 +29,8 @@ const compaction_limits = ltx.CompactionLimits{
 
 const current_snapshot_fixture = @embedFile("fixtures/go_v3_snapshot_zero_page.ltx");
 const legacy_snapshot_fixture = @embedFile("fixtures/go_v3_legacy_unflagged.ltx");
+const v2_mixed_snapshot_fixture = @embedFile("fixtures/go_v2_mixed_snapshot.ltx");
+const v2_incremental_fixture = @embedFile("fixtures/go_v2_incremental.ltx");
 
 const PageSpec = struct {
     page_number: u32,
@@ -77,6 +79,22 @@ const InputWorkspace = struct {
     fn input(self: *InputWorkspace, bytes: []const u8) ltx.CompactionInput {
         self.source = ltx.SliceReader.init(bytes);
         return ltx.CompactionInput.init(
+            .v3,
+            self.source.reader(),
+            &self.page,
+            &self.compressed,
+            &self.index,
+        );
+    }
+
+    fn input_versioned(
+        self: *InputWorkspace,
+        version: ltx.FormatVersion,
+        bytes: []const u8,
+    ) ltx.CompactionInput {
+        self.source = ltx.SliceReader.init(bytes);
+        return ltx.CompactionInput.init(
+            version,
             self.source.reader(),
             &self.page,
             &self.compressed,
@@ -117,6 +135,50 @@ test "single current file compacts to the canonical bytes" {
     try std.testing.expectEqualSlices(u8, current_snapshot_fixture, result.slice());
     try std.testing.expectEqual(@as(u32, 1), result.verified.page_count);
     try std.testing.expectEqual(@as(u64, 1), result.verified.header.max_txid.value);
+}
+
+test "v2-only and mixed-version inputs migrate to identical canonical v3 bytes" {
+    const page_zero: [page_size_512]u8 = @splat(0);
+    const page_random = xorshift_page();
+    const page_31: [page_size_512]u8 = @splat(0x31);
+    const page_33: [page_size_512]u8 = @splat(0x33);
+    const snapshot_pages = [_]PageSpec{
+        .{ .page_number = 1, .data = &page_zero },
+        .{ .page_number = 2, .data = &page_random },
+    };
+    const final_pages = [_]PageSpec{
+        .{ .page_number = 1, .data = &page_31 },
+        snapshot_pages[1],
+        .{ .page_number = 3, .data = &page_33 },
+    };
+    const snapshot_checksum = try checksum_pages(&snapshot_pages);
+    const final_checksum = try checksum_pages(&final_pages);
+    const changed_pages = [_]PageSpec{ final_pages[0], final_pages[2] };
+
+    var current_incremental: EncodedFile = .{};
+    var incremental_header = make_header(512, 3, 2, 4, snapshot_checksum);
+    incremental_header.timestamp_ms = -1000;
+    try current_incremental.encode(incremental_header, &changed_pages, final_checksum);
+
+    var canonical_expected: EncodedFile = .{};
+    var canonical_header = make_header(512, 3, 1, 4, .init(0));
+    canonical_header.timestamp_ms = -1000;
+    try canonical_expected.encode(canonical_header, &final_pages, final_checksum);
+
+    const v2_files = [_][]const u8{ v2_mixed_snapshot_fixture, v2_incremental_fixture };
+    const v2_versions = [_]ltx.FormatVersion{ .v2, .v2 };
+    var v2_result: CompactResult = undefined;
+    try compact_versioned(&v2_files, &v2_versions, compaction_limits, &v2_result);
+
+    const mixed_files = [_][]const u8{ v2_mixed_snapshot_fixture, current_incremental.slice() };
+    const mixed_versions = [_]ltx.FormatVersion{ .v2, .v3 };
+    var mixed_result: CompactResult = undefined;
+    try compact_versioned(&mixed_files, &mixed_versions, compaction_limits, &mixed_result);
+
+    try std.testing.expectEqualSlices(u8, canonical_expected.slice(), v2_result.slice());
+    try std.testing.expectEqualSlices(u8, canonical_expected.slice(), mixed_result.slice());
+    try std.testing.expectEqual(ltx.FormatVersion.v3, v2_result.verified.format_version);
+    try std.testing.expectEqual(ltx.FormatVersion.v3, mixed_result.verified.format_version);
 }
 
 test "snapshot and incrementals merge newest pages and grow" {
@@ -404,6 +466,12 @@ test "late input corruption leaves only poisoned partial output" {
 
 test "compaction limits reject zero, excess inputs, and aggregate pages" {
     const files = [_][]const u8{current_snapshot_fixture};
+    try expect_init_error_version(
+        error.UnsupportedFormatVersion,
+        .v2,
+        &files,
+        compaction_limits,
+    );
     try expect_init_error(
         error.InvalidLimits,
         &files,
@@ -444,6 +512,70 @@ test "compaction limits reject zero, excess inputs, and aggregate pages" {
         &failed,
     );
     try std.testing.expectEqual(error.CompactionPageLimitExceeded, failed.failure);
+}
+
+test "v2 aggregate page limit uses the four-byte page header" {
+    const files = [_][]const u8{v2_mixed_snapshot_fixture};
+    const versions = [_]ltx.FormatVersion{.v2};
+    var exact: CompactResult = undefined;
+    try compact_versioned(
+        &files,
+        &versions,
+        .{ .max_inputs = 1, .max_total_pages = 2 },
+        &exact,
+    );
+    _ = try decode_file(exact.slice());
+
+    const second_header_offset = try page_end_offset(.v2, v2_mixed_snapshot_fixture);
+    var input_workspace: InputWorkspace = undefined;
+    var inputs = [_]ltx.CompactionInput{
+        input_workspace.input_versioned(.v2, v2_mixed_snapshot_fixture),
+    };
+    var output: [max_output_bytes]u8 = undefined;
+    var sink = ltx.SliceWriter.init(&output);
+    var compressed: [max_compressed_bytes]u8 = undefined;
+    var compression: ltx.LZ4CompressionWorkspace = undefined;
+    var index: [max_pages]ltx.PageIndexEntry = undefined;
+    var compactor = try ltx.Compactor.init(
+        .v3,
+        codec_limits,
+        .{ .max_inputs = 1, .max_total_pages = 1 },
+        &inputs,
+        sink.writer(),
+        &compressed,
+        &compression,
+        &index,
+    );
+    try std.testing.expectError(error.CompactionPageLimitExceeded, compactor.compact());
+    try std.testing.expectEqual(ltx.CompactorState.failed, compactor.current_state());
+    try std.testing.expectError(error.InvalidState, compactor.compact());
+    try std.testing.expectEqual(
+        second_header_offset + ltx.v2_page_header_size,
+        input_workspace.source.offset,
+    );
+}
+
+test "compactor rejects an unknown per-input format version" {
+    const unknown: ltx.FormatVersion = @enumFromInt(4);
+    var input_workspace: InputWorkspace = undefined;
+    var inputs = [_]ltx.CompactionInput{
+        input_workspace.input_versioned(unknown, current_snapshot_fixture),
+    };
+    var output: [max_output_bytes]u8 = undefined;
+    var sink = ltx.SliceWriter.init(&output);
+    var compressed: [max_compressed_bytes]u8 = undefined;
+    var compression: ltx.LZ4CompressionWorkspace = undefined;
+    var index: [max_pages]ltx.PageIndexEntry = undefined;
+    try std.testing.expectError(error.UnsupportedFormatVersion, ltx.Compactor.init(
+        .v3,
+        codec_limits,
+        compaction_limits,
+        &inputs,
+        sink.writer(),
+        &compressed,
+        &compression,
+        &index,
+    ));
 }
 
 test "aggregate page limit rejects before reading an extra page payload" {
@@ -512,6 +644,7 @@ test "compactor rejects per-input workspace aliasing" {
     var shared: [max_compressed_bytes]u8 = undefined;
     var input_index: [max_pages]ltx.PageIndexEntry = undefined;
     var inputs = [_]ltx.CompactionInput{ltx.CompactionInput.init(
+        .v3,
         source.reader(),
         shared[0..max_page_bytes],
         &shared,
@@ -543,8 +676,8 @@ test "compactor rejects cross-input workspace aliasing" {
     var index_a: [max_pages]ltx.PageIndexEntry = undefined;
     var index_b: [max_pages]ltx.PageIndexEntry = undefined;
     var inputs = [_]ltx.CompactionInput{
-        ltx.CompactionInput.init(source_a.reader(), &shared_page, &compressed_a, &index_a),
-        ltx.CompactionInput.init(source_b.reader(), &shared_page, &compressed_b, &index_b),
+        ltx.CompactionInput.init(.v3, source_a.reader(), &shared_page, &compressed_a, &index_a),
+        ltx.CompactionInput.init(.v3, source_b.reader(), &shared_page, &compressed_b, &index_b),
     };
     var output: [max_output_bytes]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
@@ -690,6 +823,58 @@ fn compact_files(
     result.length_bytes = sink.written().len;
 }
 
+fn compact_versioned(
+    files: []const []const u8,
+    versions: []const ltx.FormatVersion,
+    limits: ltx.CompactionLimits,
+    result: *CompactResult,
+) !void {
+    if (files.len != versions.len or files.len > max_inputs) return error.InvalidTestInput;
+    var input_workspaces: [max_inputs]InputWorkspace = undefined;
+    var inputs: [max_inputs]ltx.CompactionInput = undefined;
+    for (files, versions, 0..) |bytes, version, index| {
+        inputs[index] = input_workspaces[index].input_versioned(version, bytes);
+    }
+    var sink = ltx.SliceWriter.init(&result.bytes);
+    var compressed: [max_compressed_bytes]u8 = undefined;
+    var compression: ltx.LZ4CompressionWorkspace = undefined;
+    var index: [max_pages]ltx.PageIndexEntry = undefined;
+    var compactor = try ltx.Compactor.init(
+        .v3,
+        codec_limits,
+        limits,
+        inputs[0..files.len],
+        sink.writer(),
+        &compressed,
+        &compression,
+        &index,
+    );
+    result.verified = try compactor.compact();
+    result.length_bytes = sink.written().len;
+}
+
+fn page_end_offset(version: ltx.FormatVersion, bytes: []const u8) !usize {
+    var workspace: InputWorkspace = undefined;
+    workspace.source = ltx.SliceReader.init(bytes);
+    var decoder = try ltx.Decoder.init(
+        version,
+        codec_limits,
+        workspace.source.reader(),
+        &workspace.page,
+        &workspace.compressed,
+        &workspace.index,
+    );
+    switch (try decoder.next()) {
+        .header => {},
+        else => return error.ExpectedHeader,
+    }
+    switch (try decoder.next()) {
+        .unverified_page => {},
+        else => return error.ExpectedPage,
+    }
+    return workspace.source.offset;
+}
+
 fn compact_files_expect_failure(
     files: []const []const u8,
     limits: ltx.CompactionLimits,
@@ -727,6 +912,15 @@ fn expect_init_error(
     files: []const []const u8,
     limits: ltx.CompactionLimits,
 ) !void {
+    try expect_init_error_version(expected, .v3, files, limits);
+}
+
+fn expect_init_error_version(
+    expected: ltx.Error,
+    output_version: ltx.FormatVersion,
+    files: []const []const u8,
+    limits: ltx.CompactionLimits,
+) !void {
     var input_workspaces: [max_inputs]InputWorkspace = undefined;
     var inputs: [max_inputs]ltx.CompactionInput = undefined;
     for (files, 0..) |bytes, index| inputs[index] = input_workspaces[index].input(bytes);
@@ -736,7 +930,7 @@ fn expect_init_error(
     var compression: ltx.LZ4CompressionWorkspace = undefined;
     var index: [max_pages]ltx.PageIndexEntry = undefined;
     try std.testing.expectError(expected, ltx.Compactor.init(
-        .v3,
+        output_version,
         codec_limits,
         limits,
         inputs[0..files.len],
@@ -802,6 +996,18 @@ fn filled_page(length: usize, fill: u8) [max_page_bytes]u8 {
     std.debug.assert(length <= max_page_bytes);
     var page: [max_page_bytes]u8 = @splat(0);
     @memset(page[0..length], fill);
+    return page;
+}
+
+fn xorshift_page() [page_size_512]u8 {
+    var page: [page_size_512]u8 = undefined;
+    var state: u32 = 0x9e37_79b9;
+    for (&page) |*byte| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        byte.* = @truncate(state);
+    }
     return page;
 }
 

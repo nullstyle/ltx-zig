@@ -32,19 +32,20 @@ release-safe test step.
 
 The whole-file decoder property accepts at most 1,024 hostile bytes, eight
 pages, 4,096 bytes per page, and 4,200 compressed bytes per page. It compares
-the complete result of contiguous and 1..64-byte transport reads: event order,
-page metadata and checksums, exact rejection error and bytes consumed, terminal
-state, and verified header/trailer values must agree. Returned pages are also
-checked independently for commit, lock-page, and ordering rules; verified
-snapshot page checksums must fold to the trailer checksum. Every failure must
-poison the decoder, every success must consume exact EOF, and both paths must
-terminate within the fixed event budget.
+the complete result of contiguous and 1..64-byte transport reads under a
+structured `.v2` or `.v3` selection: event order, page metadata and checksums,
+exact rejection error and bytes consumed, terminal state, and verified
+header/trailer values must agree. Returned pages are also checked independently
+for commit, lock-page, and ordering rules; verified snapshot page checksums must
+fold to the trailer checksum. Every failure must poison the decoder, every
+success must consume exact EOF, and both paths must terminate within the fixed
+event budget.
 
-The deterministic companion test replays all seven committed fixtures whose
-pages fit that bound through several chunk sizes. It also checks every strict
-prefix and one fixed single-bit mutation per byte. The 65,536-byte near-lock
-fixture remains covered by its byte-exact interoperability test; its raw
-compressed page is included in the LZ4 corpus.
+The deterministic companion test replays all twelve committed v2/v3 fixtures
+whose pages fit that bound through several chunk sizes. It also checks every
+strict prefix and one fixed single-bit mutation per byte. The 65,536-byte v2
+and v3 near-lock fixtures remain covered by byte-exact interoperability tests;
+their raw compressed pages are covered by the LZ4 corpus.
 
 The compactor property accepts at most 1,024 hostile bytes as either one input
 or two halves. Every processing result must reach exactly one terminal state:

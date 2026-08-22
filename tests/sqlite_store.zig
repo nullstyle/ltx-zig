@@ -882,6 +882,27 @@ test "backend rejects invalid plans and inconsistent page offsets" {
     abort(&store);
 }
 
+test "backend accepts explicit v2 apply plans" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var gate: Gate = .{};
+    var copy_workspace: [32]u8 = undefined;
+    var store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &copy_workspace,
+        gate.lifecycle(),
+        .{},
+    );
+    var plan = make_plan(.contiguous, make_header(1, 1, 0));
+    plan.format_version = .v2;
+    _ = try begin(&store, plan);
+    try std.testing.expectEqual(sqlite.StoreState.staging, store.current_state());
+    abort(&store);
+    try std.testing.expectEqual(@as(u32, 1), gate.quiesce_count);
+    try std.testing.expectEqual(gate.quiesce_count, gate.release_count);
+}
+
 test "sidecars and invalid SQLite headers fail before publication" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();

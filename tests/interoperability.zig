@@ -326,6 +326,176 @@ test "decode Go v3 empty database checksum semantics" {
     }
 }
 
+test "decode Go v2 mixed compressed and stored snapshot" {
+    const fixture = @embedFile("fixtures/go_v2_mixed_snapshot.ltx");
+    var harness: FixtureDecoder = undefined;
+    try harness.init(.v2, fixture);
+    try std.testing.expectEqual(ltx.FormatVersion.v2, harness.decoder.selected_format_version());
+
+    switch (try harness.decoder.next()) {
+        .header => |header| {
+            try std.testing.expectEqual(@as(u32, 0), header.flags);
+            try std.testing.expectEqual(@as(u32, 512), header.page_size);
+            try std.testing.expectEqual(@as(u32, 2), header.commit);
+            try std.testing.expectEqual(@as(u64, 1), header.min_txid.value);
+            try std.testing.expectEqual(@as(u64, 1), header.max_txid.value);
+            try std.testing.expectEqual(@as(i64, 0), header.timestamp_ms);
+            try std.testing.expectEqual(@as(u64, 0), header.pre_apply_checksum.value);
+        },
+        else => return error.UnexpectedDecoderEvent,
+    }
+    switch (try harness.decoder.next()) {
+        .unverified_page => |page| {
+            try std.testing.expectEqual(@as(u32, 1), page.header.page_number);
+            try std.testing.expectEqual(@as(u16, 0), page.header.flags);
+            try std.testing.expectEqualSlices(u8, &(@as([512]u8, @splat(0))), page.data);
+        },
+        else => return error.UnexpectedDecoderEvent,
+    }
+    switch (try harness.decoder.next()) {
+        .unverified_page => |page| {
+            var expected: [512]u8 = undefined;
+            fill_xorshift_page(&expected);
+            try std.testing.expectEqual(@as(u32, 2), page.header.page_number);
+            try std.testing.expectEqual(@as(u16, 0), page.header.flags);
+            try std.testing.expectEqualSlices(u8, &expected, page.data);
+        },
+        else => return error.UnexpectedDecoderEvent,
+    }
+    try expect_page_block_complete(try harness.decoder.next());
+    const verified = try expect_verified(try harness.decoder.next());
+    try std.testing.expectEqual(ltx.FormatVersion.v2, verified.format_version);
+    try std.testing.expectEqual(@as(u32, 2), verified.page_count);
+    try std.testing.expectEqual(@as(u64, fixture.len), verified.byte_count);
+    try std.testing.expectEqual(
+        @as(u64, 0xff27_3ef8_3077_8b70),
+        verified.trailer.post_apply_checksum.value,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0xb543_4126_ea96_be07),
+        verified.trailer.file_checksum.value,
+    );
+    try std.testing.expectError(error.InvalidState, harness.decoder.next());
+}
+
+test "decode Go v2 empty snapshot" {
+    const fixture = @embedFile("fixtures/go_v2_empty_snapshot.ltx");
+    var harness: FixtureDecoder = undefined;
+    try harness.init(.v2, fixture);
+    const header = try expect_header(try harness.decoder.next());
+    try std.testing.expectEqual(@as(u32, 0), header.flags);
+    try std.testing.expectEqual(@as(u32, 512), header.page_size);
+    try std.testing.expectEqual(@as(u32, 0), header.commit);
+    try std.testing.expectEqual(@as(u64, 1), header.min_txid.value);
+    try std.testing.expectEqual(@as(u64, 1), header.max_txid.value);
+    try std.testing.expectEqual(@as(i64, 0), header.timestamp_ms);
+    try std.testing.expectEqual(@as(u64, 0), header.pre_apply_checksum.value);
+    try std.testing.expect(header.is_snapshot());
+    try expect_page_block_complete(try harness.decoder.next());
+    const verified = try expect_verified(try harness.decoder.next());
+    try std.testing.expectEqual(ltx.FormatVersion.v2, verified.format_version);
+    try std.testing.expectEqual(@as(u32, 0), verified.page_count);
+    try std.testing.expectEqual(@as(u64, fixture.len), verified.byte_count);
+    try std.testing.expectEqual(ltx.checksum_flag, verified.trailer.post_apply_checksum.value);
+    try std.testing.expectEqual(
+        @as(u64, 0xbc11_4ac8_c457_e208),
+        verified.trailer.file_checksum.value,
+    );
+}
+
+test "decode Go v2 checksummed incremental positions and pages" {
+    const fixture = @embedFile("fixtures/go_v2_incremental.ltx");
+    var harness: FixtureDecoder = undefined;
+    try harness.init(.v2, fixture);
+    const header = try expect_header(try harness.decoder.next());
+    try std.testing.expectEqual(@as(u32, 0), header.flags);
+    try std.testing.expectEqual(@as(u32, 512), header.page_size);
+    try std.testing.expectEqual(@as(u32, 3), header.commit);
+    try std.testing.expectEqual(@as(u64, 2), header.min_txid.value);
+    try std.testing.expectEqual(@as(u64, 4), header.max_txid.value);
+    try std.testing.expectEqual(@as(i64, -1000), header.timestamp_ms);
+    try std.testing.expectEqual(
+        @as(u64, 0xff27_3ef8_3077_8b70),
+        header.pre_apply_checksum.value,
+    );
+    try std.testing.expect(!header.is_snapshot());
+    try expect_repeated_page(&harness.decoder, 1, 0x31);
+    try expect_repeated_page(&harness.decoder, 3, 0x33);
+    try expect_page_block_complete(try harness.decoder.next());
+    const verified = try expect_verified(try harness.decoder.next());
+    try std.testing.expectEqual(ltx.FormatVersion.v2, verified.format_version);
+    try std.testing.expectEqual(@as(u32, 2), verified.page_count);
+    try std.testing.expectEqual(@as(u64, fixture.len), verified.byte_count);
+    try std.testing.expectEqual(
+        @as(u64, 0xb6a0_600a_0173_c6ad),
+        verified.post_apply_position().post_apply_checksum.value,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0x9617_bdbd_4863_43c2),
+        verified.trailer.file_checksum.value,
+    );
+    try std.testing.expectEqual(@as(u64, 1), (try verified.pre_apply_position()).txid.value);
+    try std.testing.expectEqual(@as(u64, 4), verified.post_apply_position().txid.value);
+}
+
+test "decode Go v2 no-checksum incremental" {
+    const fixture = @embedFile("fixtures/go_v2_no_checksum.ltx");
+    var harness: FixtureDecoder = undefined;
+    try harness.init(.v2, fixture);
+    const header = try expect_header(try harness.decoder.next());
+    try std.testing.expectEqual(ltx.header_flag_no_checksum, header.flags);
+    try std.testing.expect(header.no_checksum());
+    try std.testing.expectEqual(@as(u32, 4096), header.page_size);
+    try std.testing.expectEqual(@as(u32, 2), header.commit);
+    try std.testing.expectEqual(@as(u64, 5), header.min_txid.value);
+    try std.testing.expectEqual(@as(u64, 5), header.max_txid.value);
+    try std.testing.expectEqual(@as(i64, 2000), header.timestamp_ms);
+    try std.testing.expectEqual(@as(u64, 0), header.pre_apply_checksum.value);
+    try std.testing.expect(!header.is_snapshot());
+    try expect_repeated_page(&harness.decoder, 2, 0xa5);
+    try expect_page_block_complete(try harness.decoder.next());
+    const verified = try expect_verified(try harness.decoder.next());
+    try std.testing.expectEqual(ltx.FormatVersion.v2, verified.format_version);
+    try std.testing.expectEqual(@as(u32, 1), verified.page_count);
+    try std.testing.expectEqual(@as(u64, 0), verified.trailer.post_apply_checksum.value);
+    try std.testing.expectEqual(
+        @as(u64, 0xae90_72bf_a900_4879),
+        verified.trailer.file_checksum.value,
+    );
+    try std.testing.expectEqual(@as(u64, fixture.len), verified.byte_count);
+}
+
+test "decode Go v2 maximum page fixture around the SQLite lock page" {
+    const fixture = @embedFile("fixtures/go_v2_near_lock_page.ltx");
+    var harness: FixtureDecoder = undefined;
+    try harness.init(.v2, fixture);
+    const header = try expect_header(try harness.decoder.next());
+    try std.testing.expectEqual(@as(u32, 0), header.flags);
+    try std.testing.expectEqual(@as(u32, 65_536), header.page_size);
+    try std.testing.expectEqual(@as(u32, 16_386), header.commit);
+    try std.testing.expectEqual(@as(u64, 7), header.min_txid.value);
+    try std.testing.expectEqual(@as(u64, 8), header.max_txid.value);
+    try std.testing.expectEqual(@as(i64, 3000), header.timestamp_ms);
+    try std.testing.expectEqual(ltx.checksum_flag | 0x111, header.pre_apply_checksum.value);
+    try std.testing.expect(!header.is_snapshot());
+    try std.testing.expectEqual(@as(u32, 16_385), try ltx.lock_page_number(header.page_size));
+    try expect_repeated_page(&harness.decoder, 16_384, 0x84);
+    try expect_repeated_page(&harness.decoder, 16_386, 0x86);
+    try expect_page_block_complete(try harness.decoder.next());
+    const verified = try expect_verified(try harness.decoder.next());
+    try std.testing.expectEqual(ltx.FormatVersion.v2, verified.format_version);
+    try std.testing.expectEqual(@as(u32, 2), verified.page_count);
+    try std.testing.expectEqual(@as(u64, fixture.len), verified.byte_count);
+    try std.testing.expectEqual(
+        ltx.checksum_flag | 0x222,
+        verified.trailer.post_apply_checksum.value,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0xbf19_22ef_87e1_dd8f),
+        verified.trailer.file_checksum.value,
+    );
+}
+
 test "Zig match-compressed output verifies through the Zig decoder" {
     var output: [2048]u8 = undefined;
     var sink = ltx.SliceWriter.init(&output);
@@ -754,6 +924,62 @@ fn encode_generated_snapshot(output: []u8, pages: *const [4][512]u8) !usize {
     const verified = try encoder.finish(post_apply_checksum);
     try std.testing.expectEqual(@as(u32, pages.len), verified.page_count);
     return sink.written().len;
+}
+
+const FixtureDecoder = struct {
+    source: ltx.SliceReader,
+    page_workspace: [65_536]u8,
+    compressed_workspace: [66_000]u8,
+    index_workspace: [8]ltx.PageIndexEntry,
+    decoder: ltx.Decoder,
+
+    fn init(
+        self: *FixtureDecoder,
+        version: ltx.FormatVersion,
+        fixture: []const u8,
+    ) !void {
+        self.source = ltx.SliceReader.init(fixture);
+        self.decoder = try ltx.Decoder.init(
+            version,
+            limits,
+            self.source.reader(),
+            &self.page_workspace,
+            &self.compressed_workspace,
+            &self.index_workspace,
+        );
+    }
+};
+
+fn expect_header(event: ltx.DecoderEvent) !ltx.Header {
+    return switch (event) {
+        .header => |header| header,
+        else => error.UnexpectedDecoderEvent,
+    };
+}
+
+fn expect_repeated_page(decoder: *ltx.Decoder, page_number: u32, byte: u8) !void {
+    switch (try decoder.next()) {
+        .unverified_page => |page| {
+            try std.testing.expectEqual(page_number, page.header.page_number);
+            try std.testing.expectEqual(@as(u16, 0), page.header.flags);
+            for (page.data) |actual| try std.testing.expectEqual(byte, actual);
+        },
+        else => return error.UnexpectedDecoderEvent,
+    }
+}
+
+fn expect_page_block_complete(event: ltx.DecoderEvent) !void {
+    switch (event) {
+        .page_block_complete => {},
+        else => return error.UnexpectedDecoderEvent,
+    }
+}
+
+fn expect_verified(event: ltx.DecoderEvent) !ltx.VerifiedLTX {
+    return switch (event) {
+        .verified => |verified| verified,
+        else => error.UnexpectedDecoderEvent,
+    };
 }
 
 fn snapshot_header(commit: u32) ltx.Header {

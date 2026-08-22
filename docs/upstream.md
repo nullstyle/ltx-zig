@@ -5,6 +5,8 @@
 The implementation and compatibility fixtures were developed against these
 exact revisions:
 
+- [`superfly/ltx` v0.4.0 (LTX v2 import oracle)](https://github.com/superfly/ltx/tree/2af9b0cb7a6eebfb59c2ca76acc4ae3adf4b6a09):
+  `2af9b0cb7a6eebfb59c2ca76acc4ae3adf4b6a09`
 - [`superfly/ltx`](https://github.com/superfly/ltx/tree/8cb8f8ebaf8f57c9b0e1041a27d5444032ea0643):
   `8cb8f8ebaf8f57c9b0e1041a27d5444032ea0643`
 - [TigerBeetle repository containing `docs/TIGER_STYLE.md`](https://github.com/tigerbeetle/tigerbeetle/blob/97c7a8ef385270ebe0e1b75959d3d21d134629df/docs/TIGER_STYLE.md):
@@ -36,13 +38,26 @@ A size-prefixed complete-frame experiment at
 `fdbcb22c829f6fab749b76554bf53d5223a98160` was never merged and is not part of
 the compatibility target.
 
+The separate v0.4.0 pin is the historical LTX v2 wire oracle. V2 and v3 both
+start with `LTX1` and contain no on-disk version discriminator, so the pin does
+not establish a detection heuristic. Callers must carry trusted version
+metadata into every decode, apply, or compaction input.
+
 ## Files inspected
 
-For Go: `README.md`, `CLAUDE.md`, `ltx.go`, `checksum.go`, `encoder.go`,
-`decoder.go`, `file_spec.go`, `compactor.go`, `compactor_test.go`, all core
-tests, and relevant `cmd/ltx` apply, encode, dump, and verify code. The pinned
-repository passed `go test ./...`. The apply audit also traced page writes,
-decoder finalization, truncation, and post-apply checksum verification.
+For current Go v3: `README.md`, `CLAUDE.md`, `ltx.go`, `checksum.go`,
+`encoder.go`, `decoder.go`, `file_spec.go`, `compactor.go`,
+`compactor_test.go`, all core tests, and relevant `cmd/ltx` apply, encode, dump,
+and verify code. The pinned repository passed `go test ./...`. The apply audit
+also traced page writes, decoder finalization, truncation, and post-apply
+checksum verification.
+
+For Go v0.4.0 LTX v2: `README.md`, `ltx.go`, `checksum.go`, `encoder.go`,
+`decoder.go`, `file_spec.go`, `compactor.go`, their tests, and the relevant
+`cmd/ltx` paths. In particular, the audit traced the 100-byte header, four-byte
+page header and terminator, independent LZ4 frame per page, page index, trailer,
+and logical checksum coverage. That historical source is used only as the v2
+import oracle; current output remains governed by the v3 pin.
 
 For TigerStyle: `docs/TIGER_STYLE.md` at the pinned tree.
 
@@ -65,7 +80,8 @@ unflagged LZ4 frames. It also validates exact decompressed length, the declared
 index size, and the trailer. Its `Vec`, `BTreeMap`, `HashMap`, and
 read-to-end design is intentionally not a memory model for this
 allocation-free Zig core, and it does not perform Zig's exact one-to-one
-index/frame cross-check.
+index/frame cross-check. This pinned crate is v3-only: it contains no LTX v2
+decoder, writer, fixture corpus, or oracle.
 
 For Litestream v0.5.16: the release archive manifest, `go.mod`,
 `cmd/litestream/restore.go`, `replica.go` restore planning and decode path, and
@@ -81,6 +97,46 @@ the independently written Celld port is a second byte-exact reference. The
 algorithm is Copyright (c) 2015 Pierre Curto under BSD-3-Clause, retained in
 [`LICENSE.pierrec-lz4`](../LICENSE.pierrec-lz4). It remains separate from and
 must accompany the project's [MIT License](../LICENSE) where applicable.
+
+## LTX v2 import and migration evidence
+
+The v2 import profile is anchored to
+[`superfly/ltx` v0.4.0](https://github.com/superfly/ltx/tree/2af9b0cb7a6eebfb59c2ca76acc4ae3adf4b6a09),
+commit `2af9b0cb7a6eebfb59c2ca76acc4ae3adf4b6a09`. Its
+[`ltx.go`](https://github.com/superfly/ltx/blob/2af9b0cb7a6eebfb59c2ca76acc4ae3adf4b6a09/ltx.go)
+sets `Version = 2` in memory after reading the shared `LTX1` magic; the version
+is not serialized. Zig therefore requires explicit `.v2` or `.v3` selection
+and never falls back to another layout after a parse error. LTX v1 remains
+unsupported.
+
+The v2 wire profile has the same 100-byte header and 16-byte trailer used by
+the supported v3 profile, but each page begins with only a four-byte page
+number. A four-byte zero page number terminates the page block. The pinned
+[`Encoder.EncodePage`](https://github.com/superfly/ltx/blob/2af9b0cb7a6eebfb59c2ca76acc4ae3adf4b6a09/encoder.go#L206-L266)
+then writes one independent LZ4 frame per page; the decoder reads exactly one
+uncompressed page and consumes that frame's end marker before reading the next
+page header. The page index and trailer follow the terminator. The logical file
+checksum includes the v2 header, four-byte page headers, uncompressed page
+bytes, terminator, index, and post-apply checksum, while physical LZ4 framing
+bytes are excluded.
+
+After physical decoding, v2 page events enter the same bounded trust pipeline
+as v3: strict page order, snapshot completeness, one-to-one index/frame
+correspondence, canonical index varints, trailer fields, configured limits,
+logical and database checksums, and exact EOF must all verify before a staged
+database image or position may be published. The optional SQLite store
+publishes that verified image through the same generation manifest and recovery
+protocol used for v3; it does not retain or expose the source wire framing.
+
+Migration compaction carries an explicit version on every input. V2-only and
+mixed v2/v3 chains still require exact TXID continuity, enabled-checksum
+continuity, and a common checksum mode. Their only supported output is the
+current canonical v3 profile. That Zig encoder is separately byte-qualified
+against the current Go valid-output oracle; this is not a direct Go comparison
+of the exact v2 migration chain. Attempting to initialize encoding or compactor
+output as `.v2` returns `UnsupportedFormatVersion`. Celld independently informs
+v3 compaction and deployment behavior but supplies no v2 implementation or
+oracle.
 
 ## Compaction evidence
 
@@ -274,12 +330,16 @@ accept. These are hardening differences, not silent reinterpretations.
 
 1. **Version selection.** The Go README correctly says v2 and v3 both use
    `LTX1` and need out-of-band version selection. `NewDecoder`, however, takes
-   no version and `Header.UnmarshalBinary()` assigns v3 from magic alone. Every
-   Zig entry point requires `FormatVersion`; only `.v3` is supported.
+   no version and each historical `Header.UnmarshalBinary()` assigns that
+   checkout's compiled-in version from magic alone. Zig decoders, staged
+   appliers, and compaction inputs require an explicit `.v2` or `.v3`. Encoding
+   and compactor output accept only `.v3`; the library never guesses or retries
+   another version.
 
-2. **Section count.** Current Go README and code have header, page block, page
-   index, and trailer. `CLAUDE.md` still describes three sections and omits the
-   index. Zig implements the four-section format.
+2. **Section count.** Both supported Go profiles contain a header, page block,
+   page index, and trailer. The v0.4.0 README and current `CLAUDE.md` each still
+   describe three sections and omit the index. Zig requires the four-section
+   structure for both versions.
 
 3. **Decompressed length.** README requires exactly `Header.PageSize`. Go calls
    `UncompressBlock` but ignores its returned length. Zig rejects short or long
@@ -358,9 +418,30 @@ checksum are verified.
 The per-fixture generation command, semantic header/trailer values, and hashes
 are catalogued in [`tests/fixtures/README.md`](../tests/fixtures/README.md).
 
-The current Go fixtures in `tests/fixtures/` were generated with the pinned Go
-`NewEncoder`, directly or through `FileSpec.WriteTo`. The SHA-256 values of the
-binary artifacts are:
+The LTX v2 fixtures were generated with the v0.4.0 pin through
+`tools/v2_fixturegen`; the module and its LZ4 dependency are checksum-locked.
+Each binary has a reviewed hex mirror. The primary
+`go_v2_mixed_snapshot.ltx` fixture covers compressed and stored LZ4 frames in
+one snapshot, while the remaining fixtures cover an empty snapshot, a valid
+empty SQLite image, contiguous incremental application, no-checksum mode, and
+maximum-size pages around the SQLite lock page. Their SHA-256 values are:
+
+- `go_v2_mixed_snapshot`: `e07e756bf683ef73eb0628177baa8f3a64f59bfbd162957189b626f1331e2eae`
+- `go_v2_empty_snapshot`: `1f518147c9c690b0494d6a9c9eb6884f6131bd6e27c739bb4fcc2f9db4971088`
+- `go_v2_sqlite_empty`: `263808f41dda5869000e8b722efd1e8d866c6a5dbde594b4b8efbd226f35e09a`
+- `go_v2_incremental`: `f960103ca1bf1df2475d4f9a229c7863949f9c4394b35096ae90a257f15e5224`
+- `go_v2_no_checksum`: `76b3dfdaa958ad939f9adf4a2e22563452eb8480a006883a995c9cfce775d966`
+- `go_v2_near_lock_page`: `35a89b6af9e8f5b29377ad5e904444eb62cef5cf87ae8a512aa400b5a3058e30`
+
+These fixtures are import known answers. They do not make v2 an output target.
+Migration tests require v2-only and mixed inputs to match a canonical v3 result
+emitted by Zig; that v3 encoder is separately byte-qualified against current
+Go. This is transitive output evidence, not a direct Go comparison of the exact
+v2 migration chain. The pinned Celld corpus contains no v2 artifact.
+
+The current Go v3 fixtures in `tests/fixtures/` were generated with the pinned
+Go `NewEncoder`, directly or through `FileSpec.WriteTo`. The SHA-256 values of
+the binary artifacts are:
 
 - `go_v3_snapshot_zero_page`: `7ab2cbb91c15c977abcb7256ac471ee1f4f78343d16b1bacd55edd3d2d930e4a`
 - `go_v3_empty_snapshot`: `b270619913b21cecb628827c679749ae6277159391ac0223762f408f57ff7287`

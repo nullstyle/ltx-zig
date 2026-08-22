@@ -128,6 +128,7 @@ const celld_litestream_captures = [_][]const u8{
             "0000000000000006-0000000000000006.ltx",
     ),
 };
+const v2_sqlite_empty_fixture = @embedFile("fixtures/go_v2_sqlite_empty.ltx");
 
 const DatabaseImage = struct {
     bytes: [max_database_bytes]u8 = undefined,
@@ -479,6 +480,57 @@ test "real Litestream capture chain publishes the expected SQLite database" {
         "SELECT group_concat(k || '=' || v, ',') FROM (SELECT k, v FROM kv ORDER BY k)",
         "a=upd5,b=2,c=3,k1=v1,k2=v2,k3=v3,k4=v4,k5=v5",
     );
+    try expect_text_query(database, "PRAGMA integrity_check", "ok");
+    try lifecycle.close();
+}
+
+test "pinned Go v2 snapshot publishes as an immutable SQLite generation" {
+    try std.testing.expect(sqlite3_libversion_number() >= 3_022_000);
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var lifecycle: ManagedLifecycle = .{};
+    defer lifecycle.close() catch {};
+    var copy_workspace: [4096]u8 = undefined;
+    var store = try sqlite_store.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &copy_workspace,
+        lifecycle.lifecycle(),
+        .{},
+    );
+
+    var source = ltx.SliceReader.init(v2_sqlite_empty_fixture);
+    var page_workspace: [1024]u8 = undefined;
+    var compressed_workspace: [max_compressed_bytes]u8 = undefined;
+    var index_workspace: [max_pages]ltx.PageIndexEntry = undefined;
+    var applier = try ltx.StagedApplier.init(
+        .v2,
+        codec_limits,
+        .{
+            .max_database_pages = max_pages,
+            .max_database_bytes = max_database_bytes,
+        },
+        .replace_snapshot,
+        source.reader(),
+        store.backend(),
+        &page_workspace,
+        &compressed_workspace,
+        &index_workspace,
+    );
+    const verified = try applier.apply();
+    try std.testing.expectEqual(ltx.FormatVersion.v2, verified.format_version);
+    try std.testing.expectEqual(@as(u32, 512), verified.header.page_size);
+
+    var access_storage: sqlite_store.GenerationAccessStorage = .{};
+    var access_workspace: sqlite_store.GenerationAccessWorkspace = .{};
+    const current = try lifecycle.open_generation(
+        &store,
+        &access_storage,
+        &access_workspace,
+    );
+    try std.testing.expectEqual(verified.post_apply_position(), current.position);
+    const database = lifecycle.database orelse return error.ExpectedGeneration;
+    try expect_integer_query(database, "SELECT count(*) FROM sqlite_schema", 0);
     try expect_text_query(database, "PRAGMA integrity_check", "ok");
     try lifecycle.close();
 }
