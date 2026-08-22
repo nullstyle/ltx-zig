@@ -21,7 +21,9 @@ check is manual; pinned upstream vectors are identified in the evidence.
 | Page-index validation | Tested | Exact entries, offsets, sizes, canonical varints, and byte size |
 | Nonzero reserved header bytes | Supported | Accepted by structural header decoding; encoder emits zero |
 | Trailing-byte rejection | Tested | Exact EOF required after the trailer |
-| Truncation boundaries | Tested | Every strict prefix of one current and one legacy Go fixture is rejected |
+| Truncation boundaries | Tested | Every strict prefix of all seven bounded-page Go and Celld fixtures is rejected |
+| Decoder fuzzing | Tested | Checked-in valid corpus, deterministic single-bit mutations, bounded termination, exact error/state checks, and contiguous-versus-short-read equivalence |
+| Raw LZ4 fuzzing | Tested | Guarded decoder outputs through 65,536 bytes; deterministic fast and literal encoders round trip dirty-workspace inputs through 4,096 bytes |
 | Position contiguity | Tested | Exact TXID and enabled-checksum equality |
 | Compaction | Unsupported | Future layer above the verified codec |
 | Direct SQLite apply | Unsupported | Future staging layer must publish only after verification |

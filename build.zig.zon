@@ -13,6 +13,7 @@
         "tests",
         "benchmarks",
         "tools",
+        "LICENSE",
         "LICENSE.pierrec-lz4",
         "README.md",
         "docs",

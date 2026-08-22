@@ -61,8 +61,8 @@ For raw-block compression: the current Go oracle pins
 compressor's search, table-update, match-extension, and output order exactly;
 the independently written Celld port is a second byte-exact reference. The
 algorithm is Copyright (c) 2015 Pierre Curto under BSD-3-Clause, retained in
-[`LICENSE.pierrec-lz4`](../LICENSE.pierrec-lz4). That notice does not select a
-project-wide license for `ltx-zig`.
+[`LICENSE.pierrec-lz4`](../LICENSE.pierrec-lz4). It remains separate from and
+must accompany the project's [MIT License](../LICENSE) where applicable.
 
 ## Compatibility decisions and disagreements
 

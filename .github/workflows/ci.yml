@@ -31,6 +31,9 @@ jobs:
         run: zig build check-legacy-fixtures
       - name: Test release-safe core
         run: zig build test -Doptimize=ReleaseSafe
+      - name: Run bounded native fuzzing
+        if: runner.os == 'Linux'
+        run: zig build fuzz --fuzz=10K -Doptimize=ReleaseSafe --seed 0
       - name: Build library
         run: zig build -Doptimize=ReleaseSafe
       - name: Verify Zig output with pinned Go oracle

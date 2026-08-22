@@ -36,7 +36,9 @@
 - Run `mise exec -- zig build fmt-check` and `mise exec -- zig build test`
   before handing off changes. Run `mise exec -- zig build interop` for encoder
   or wire-format changes when Go is available; normal tests stay network-free.
+- For decoder or compression changes, also run the bounded native fuzz suite:
+  `mise exec -- zig build fuzz --fuzz=10K -Doptimize=ReleaseSafe --seed 0`.
 - Keep Linux and macOS CI on the exact Zig pin and pin workflow actions by full
   commit SHA. Go module downloads must remain checksum-locked.
-- This repository has no project-wide license. Leave license selection as an
-  explicit TODO; the BSD file is only a required third-party notice.
+- Project-original code is MIT-licensed. Preserve `LICENSE` and the separate
+  required `LICENSE.pierrec-lz4` notice.

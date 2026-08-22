@@ -9,6 +9,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const host_ltx = b.createModule(.{
+        .root_source_file = b.path("src/ltx.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const host_lz4 = b.createModule(.{
+        .root_source_file = b.path("src/lz4_block.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
     const library = b.addLibrary(.{
         .name = "ltx",
         .root_module = ltx,
@@ -38,10 +48,43 @@ pub fn build(b: *std.Build) void {
     });
     const run_malformed = b.addRunArtifact(malformed);
 
+    const fuzz_decoder_tests = b.addTest(.{
+        .name = "ltx-decoder-fuzz-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ltx", .module = host_ltx }},
+        }),
+    });
+    const run_fuzz_decoder_tests = b.addRunArtifact(fuzz_decoder_tests);
+    // Zig 0.16 does not restore discovered fuzz-test names from a cached run.
+    run_fuzz_decoder_tests.has_side_effects = true;
+    const fuzz_lz4_tests = b.addTest(.{
+        .name = "ltx-lz4-fuzz-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz_lz4.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "lz4_block", .module = host_lz4 }},
+        }),
+    });
+    const run_fuzz_lz4_tests = b.addRunArtifact(fuzz_lz4_tests);
+    run_fuzz_lz4_tests.has_side_effects = true;
+
     const test_step = b.step("test", "Run all LTX tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_interoperability.step);
     test_step.dependOn(&run_malformed.step);
+    test_step.dependOn(&run_fuzz_decoder_tests.step);
+    test_step.dependOn(&run_fuzz_lz4_tests.step);
+
+    const fuzz_step = b.step(
+        "fuzz",
+        "Replay fuzz corpora; pass --fuzz[=N] to search for failures",
+    );
+    fuzz_step.dependOn(&run_fuzz_decoder_tests.step);
+    fuzz_step.dependOn(&run_fuzz_lz4_tests.step);
 
     const fmt = b.addFmt(.{
         .paths = &.{
@@ -57,11 +100,6 @@ pub fn build(b: *std.Build) void {
     const fmt_check_step = b.step("fmt-check", "Check Zig source formatting");
     fmt_check_step.dependOn(&fmt.step);
 
-    const host_ltx = b.createModule(.{
-        .root_source_file = b.path("src/ltx.zig"),
-        .target = b.graph.host,
-        .optimize = optimize,
-    });
     const fixturegen = b.addExecutable(.{
         .name = "ltx-fixturegen",
         .root_module = b.createModule(.{
