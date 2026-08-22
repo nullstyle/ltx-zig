@@ -38,11 +38,15 @@
 - Preserve decoding of the canonical legacy unflagged v3 LZ4 profile as well
   as current flagged blocks. V2, compaction, and fixed-path replacement beneath
   open SQLite connections are not currently supported. The optional
-  `ltx_sqlite` store requires a host-owned quiescence gate and read-only active
-  generations.
+  `ltx_sqlite` store requires a host-owned quiescence gate, a durable empty
+  manifest before first slot creation, and leased active generations opened
+  with SQLite URI `mode=ro&immutable=1` plus `query_only`.
 - Run `mise exec -- zig build fmt-check` and `mise exec -- zig build test`
   before handing off changes. Run `mise exec -- zig build interop` for encoder
   or wire-format changes when Go is available; normal tests stay network-free.
+- For `ltx_sqlite` store or lifecycle changes, also run `mise exec -- zig build
+  sqlite-integration -Doptimize=ReleaseSafe`. This host-only test may link the
+  system SQLite and libc; neither library module may do so.
 - For decoder or compression changes, also run the bounded native fuzz suite:
   `mise exec -- zig build fuzz --fuzz=10K -Doptimize=ReleaseSafe --seed 0`.
 - Keep Linux and macOS CI on the exact Zig pin and pin workflow actions by full

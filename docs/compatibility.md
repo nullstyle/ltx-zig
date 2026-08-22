@@ -27,7 +27,7 @@ check is manual; pinned upstream vectors are identified in the evidence.
 | Position contiguity | Tested | Exact TXID and enabled-checksum equality |
 | Staged apply orchestration | Tested | Private staging, explicit transition modes, page-size compatibility, full-image checksum verification, abort-on-error, and atomic publish contract |
 | Compaction | Unsupported | Future layer above the verified codec |
-| Quiescent SQLite generation store | Tested | Optional `ltx_sqlite`; host-owned connection gate, read-only active generations, sidecar rejection, faulted manifest recovery, and end-to-end staged apply |
+| Quiescent SQLite generation store | Tested | Optional `ltx_sqlite`; durable empty baseline, host-owned connection gate, read-only active generations, sidecar rejection, subprocess crash-point recovery, real SQLite integrity/WAL integration, and end-to-end staged apply |
 | Fixed-path replacement under open SQLite handles | Unsupported | Unsafe pathname/journal association; exact Online Backup output differs from verified LTX bytes |
 
 The encoder uses a bounded port of the fast raw-block compressor pinned by Go

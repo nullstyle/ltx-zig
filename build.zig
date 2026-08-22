@@ -102,6 +102,57 @@ pub fn build(b: *std.Build) void {
     });
     const run_sqlite_store_tests = b.addRunArtifact(sqlite_store_tests);
     run_sqlite_store_tests.has_side_effects = true;
+    const sqlite_store_crash_child = b.addExecutable(.{
+        .name = "ltx-sqlite-store-crash-child",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sqlite_store_crash_child.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ltx", .module = host_ltx },
+                .{ .name = "ltx_sqlite", .module = host_sqlite_store },
+            },
+        }),
+    });
+    const crash_options = b.addOptions();
+    crash_options.addOptionPath("child_path", sqlite_store_crash_child.getEmittedBin());
+    const sqlite_store_crash_tests = b.addTest(.{
+        .name = "ltx-sqlite-store-crash-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sqlite_store_crash.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ltx_sqlite", .module = host_sqlite_store },
+                .{ .name = "crash_options", .module = crash_options.createModule() },
+            },
+        }),
+    });
+    const run_sqlite_store_crash_tests = b.addRunArtifact(sqlite_store_crash_tests);
+    run_sqlite_store_crash_tests.has_side_effects = true;
+
+    const sqlite_integration_module = b.createModule(.{
+        .root_source_file = b.path("tests/sqlite_integration.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "ltx", .module = host_ltx },
+            .{ .name = "ltx_sqlite", .module = host_sqlite_store },
+        },
+    });
+    sqlite_integration_module.linkSystemLibrary("sqlite3", .{});
+    const sqlite_integration_tests = b.addTest(.{
+        .name = "ltx-sqlite-integration-tests",
+        .root_module = sqlite_integration_module,
+    });
+    const run_sqlite_integration_tests = b.addRunArtifact(sqlite_integration_tests);
+    run_sqlite_integration_tests.has_side_effects = true;
+    const sqlite_integration_step = b.step(
+        "sqlite-integration",
+        "Run live host-SQLite WAL and generation-store integration tests",
+    );
+    sqlite_integration_step.dependOn(&run_sqlite_integration_tests.step);
     const fuzz_lz4_tests = b.addTest(.{
         .name = "ltx-lz4-fuzz-tests",
         .root_module = b.createModule(.{
@@ -122,6 +173,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_apply_tests.step);
     test_step.dependOn(&run_sqlite_store_unit_tests.step);
     test_step.dependOn(&run_sqlite_store_tests.step);
+    test_step.dependOn(&run_sqlite_store_crash_tests.step);
     test_step.dependOn(&run_fuzz_lz4_tests.step);
 
     const fuzz_step = b.step(

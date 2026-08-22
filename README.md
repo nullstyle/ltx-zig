@@ -38,8 +38,8 @@ also used as a secondary format and deployment reference:
 - a full staged-image checksum pass and one atomic backend publication boundary;
 - an optional allocation-free `ltx_sqlite` filesystem store with quiescent
   connection lifecycle hooks, two immutable database generations, a
-  checksummed atomic manifest, sidecar rejection, durability barriers, and
-  explicit recovery after an indeterminate commit.
+  checksummed atomic manifest with a durable empty baseline, sidecar rejection,
+  durability barriers, and explicit recovery after an indeterminate commit.
 
 The decoder covers both page encodings emitted across upstream v3 history. The
 encoder always emits the current flagged raw-block representation. Valid LZ4
@@ -49,7 +49,8 @@ are not implemented. The core API remains synchronous, transport-neutral, and
 free of filesystem and SQLite dependencies. The optional store is deliberately
 a quiescent replica/apply destination: the host drains SQLite through an
 application-owned lifecycle gate, and published generation paths may be opened
-only read-only. It does not link a second SQLite copy or manage application
+only under a generation lease using SQLite URI `mode=ro&immutable=1` and
+`query_only`. It does not link a second SQLite copy or manage application
 connection handles itself. See [docs/sqlite-store.md](docs/sqlite-store.md).
 
 `ltx-zig` is licensed under the [MIT License](LICENSE). The fast-compressor
@@ -67,6 +68,7 @@ mise exec -- zig version
 mise exec -- zig build
 mise exec -- zig build fmt-check
 mise exec -- zig build test
+mise exec -- zig build sqlite-integration # optional; links the host libsqlite3
 mise exec -- zig build fuzz -Doptimize=ReleaseSafe # replay fuzz corpora
 mise exec -- zig build fuzz --fuzz=10K -Doptimize=ReleaseSafe --seed 0
 mise exec -- zig build interop # optional; requires Go and may download modules
@@ -197,7 +199,12 @@ module as `ltx_sqlite`. Its `Store` borrows a `std.Io.Dir`, a non-empty
 caller-owned copy/checksum workspace, and a `Lifecycle` callback pair. The
 quiesce callback must stop new SQLite opens, checkpoint and close all owned
 connections, and leave both generation names without `-wal`, `-shm`, or
-`-journal` files. `store.backend()` plugs directly into `StagedApplier`.
+`-journal` files. Active connections use an encoded SQLite URI with
+`mode=ro&immutable=1` while holding the generation lease. `store.backend()`
+plugs directly into `StagedApplier`.
+`store.recover()` on a pristine directory durably creates the empty baseline;
+the first snapshot also initializes it automatically before creating a database
+slot. Interrupted first stages recover back to empty without guessing.
 
 After a successful apply, `store.current()` returns the manifest-bound position,
 page size, exact length, generation, and database filename. If apply returns
@@ -205,3 +212,9 @@ page size, exact length, generation, and database filename. If apply returns
 gate closed; call `store.recover()` until it succeeds before opening SQLite or
 starting another apply. Full deployment constraints and crash outcomes are in
 [the SQLite store guide](docs/sqlite-store.md).
+
+Store changes are qualified with real child-process termination at every
+baseline and publication sync/rename boundary. `zig build sqlite-integration`
+additionally exercises the host SQLite library's WAL drain, read-only generation
+access, data queries, and `PRAGMA integrity_check` without linking SQLite into
+either library module.

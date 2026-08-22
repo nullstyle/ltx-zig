@@ -14,6 +14,7 @@ const manifest_version: u32 = 1;
 const manifest_magic_offset = 0;
 const manifest_version_offset = 8;
 const manifest_slot_offset = 12;
+const manifest_empty_slot_tag: u8 = 2;
 const manifest_reserved_a_offset = 13;
 const manifest_generation_offset = 16;
 const manifest_txid_offset = 24;
@@ -91,19 +92,42 @@ pub const Slot = enum(u8) {
 /// stops new opens, checkpoints and closes all owned connections, and returns
 /// only after neither database generation has live SQLite users. `release` reopens
 /// the gate; reopening a connection is the application's responsibility. The
-/// host must open the active generation read-only (including SQLite
-/// `query_only`) because no-checksum positions cannot detect outside writes.
+/// host must hold its generation lease and open the active generation through
+/// SQLite read-only (including `query_only`; WAL-header images also need the
+/// `immutable=1` URI option) because no-checksum positions cannot detect
+/// outside writes.
 pub const Lifecycle = struct {
     context: *anyopaque,
     quiesce_fn: *const fn (context: *anyopaque) error{QuiesceFailure}!void,
     release_fn: *const fn (context: *anyopaque) void,
 };
 
-/// Deterministic fault injection for commit-boundary tests. Production callers
-/// should leave `Options.fault_injection` null.
+/// Exact durability boundaries exposed to deterministic crash tests.
+pub const FaultPoint = enum {
+    baseline_manifest_sync,
+    baseline_directory_sync,
+    baseline_manifest_rename,
+    baseline_commit_directory_sync,
+    loaded_manifest_directory_sync,
+    database_sync,
+    database_directory_sync,
+    manifest_sync,
+    manifest_directory_sync,
+    manifest_rename,
+    commit_directory_sync,
+};
+
+/// Deterministic fault injection for durability tests. `hit_fn` runs at every
+/// boundary and may terminate the process. Production callers should leave
+/// `Options.fault_injection` null.
 pub const FaultInjection = struct {
+    /// Compatibility controls retained for callers of the original test API.
+    /// Prefer `fail_at` for new tests.
     fail_before_manifest_rename: bool = false,
     fail_after_manifest_rename: bool = false,
+    fail_at: ?FaultPoint = null,
+    context: ?*anyopaque = null,
+    hit_fn: ?*const fn (context: ?*anyopaque, point: FaultPoint) void = null,
 };
 
 pub const Options = struct {
@@ -127,7 +151,8 @@ pub const Current = struct {
 };
 
 const Manifest = struct {
-    current: Current,
+    /// Null is the canonical, durably initialized empty store.
+    current: ?Current,
 
     fn encode(self: Manifest) [manifest_size]u8 {
         var bytes: [manifest_size]u8 = @splat(0);
@@ -138,37 +163,41 @@ const Manifest = struct {
             manifest_version,
             .big,
         );
-        bytes[manifest_slot_offset] = @intFromEnum(self.current.slot);
-        std.mem.writeInt(
-            u64,
-            bytes[manifest_generation_offset..manifest_txid_offset],
-            self.current.generation,
-            .big,
-        );
-        std.mem.writeInt(
-            u64,
-            bytes[manifest_txid_offset..manifest_position_checksum_offset],
-            self.current.position.txid.value,
-            .big,
-        );
-        std.mem.writeInt(
-            u64,
-            bytes[manifest_position_checksum_offset..manifest_page_size_offset],
-            self.current.position.post_apply_checksum.value,
-            .big,
-        );
-        std.mem.writeInt(
-            u32,
-            bytes[manifest_page_size_offset..manifest_reserved_b_offset],
-            self.current.page_size,
-            .big,
-        );
-        std.mem.writeInt(
-            u64,
-            bytes[manifest_database_size_offset..manifest_digest_offset],
-            self.current.database_size_bytes,
-            .big,
-        );
+        if (self.current) |current| {
+            bytes[manifest_slot_offset] = @intFromEnum(current.slot);
+            std.mem.writeInt(
+                u64,
+                bytes[manifest_generation_offset..manifest_txid_offset],
+                current.generation,
+                .big,
+            );
+            std.mem.writeInt(
+                u64,
+                bytes[manifest_txid_offset..manifest_position_checksum_offset],
+                current.position.txid.value,
+                .big,
+            );
+            std.mem.writeInt(
+                u64,
+                bytes[manifest_position_checksum_offset..manifest_page_size_offset],
+                current.position.post_apply_checksum.value,
+                .big,
+            );
+            std.mem.writeInt(
+                u32,
+                bytes[manifest_page_size_offset..manifest_reserved_b_offset],
+                current.page_size,
+                .big,
+            );
+            std.mem.writeInt(
+                u64,
+                bytes[manifest_database_size_offset..manifest_digest_offset],
+                current.database_size_bytes,
+                .big,
+            );
+        } else {
+            bytes[manifest_slot_offset] = manifest_empty_slot_tag;
+        }
         const digest = std.hash.crc.Crc64GoIso.hash(bytes[0..manifest_digest_offset]);
         std.mem.writeInt(u64, bytes[manifest_digest_offset..manifest_size], digest, .big);
         return bytes;
@@ -204,13 +233,22 @@ const Manifest = struct {
         ) != expected_digest) {
             return error.ManifestCorrupt;
         }
-        const slot: Slot = switch (bytes[manifest_slot_offset]) {
+        const slot: ?Slot = switch (bytes[manifest_slot_offset]) {
             0 => .a,
             1 => .b,
+            manifest_empty_slot_tag => null,
             else => return error.ManifestCorrupt,
         };
+        if (slot == null) {
+            if (!std.mem.allEqual(
+                u8,
+                bytes[manifest_generation_offset..manifest_digest_offset],
+                0,
+            )) return error.ManifestCorrupt;
+            return .{ .current = null };
+        }
         const current: Current = .{
-            .slot = slot,
+            .slot = slot.?,
             .generation = std.mem.readInt(
                 u64,
                 bytes[manifest_generation_offset..manifest_txid_offset],
@@ -266,6 +304,29 @@ test "manifest wire encoding is canonical and rejects reserved bytes" {
 
     var noncanonical = canonical;
     noncanonical[manifest_reserved_a_offset] = 1;
+    const digest = std.hash.crc.Crc64GoIso.hash(noncanonical[0..manifest_digest_offset]);
+    std.mem.writeInt(
+        u64,
+        noncanonical[manifest_digest_offset..manifest_size],
+        digest,
+        .big,
+    );
+    try std.testing.expectError(error.ManifestCorrupt, Manifest.decode(&noncanonical));
+}
+
+test "manifest wire encoding has one canonical empty state" {
+    const expected: Manifest = .{ .current = null };
+    const canonical = expected.encode();
+    try std.testing.expectEqual(manifest_empty_slot_tag, canonical[manifest_slot_offset]);
+    try std.testing.expect(std.mem.allEqual(
+        u8,
+        canonical[manifest_generation_offset..manifest_digest_offset],
+        0,
+    ));
+    try std.testing.expectEqualDeep(expected, try Manifest.decode(&canonical));
+
+    var noncanonical = canonical;
+    noncanonical[manifest_generation_offset] = 1;
     const digest = std.hash.crc.Crc64GoIso.hash(noncanonical[0..manifest_digest_offset]);
     std.mem.writeInt(
         u64,
@@ -365,20 +426,20 @@ pub const Store = struct {
         }
         self.acquire_lock() catch |err| return self.record(err);
         errdefer self.release_lock();
-        const manifest = self.read_manifest() catch |err| return self.record(err);
-        if (manifest == null) self.require_fresh_store() catch |err| return self.record(err);
         self.reject_all_sidecars() catch |err| return self.record(err);
-        if (manifest) |value| {
-            self.validate_current(value.current) catch |err| return self.record(err);
+        const manifest = self.load_or_initialize_manifest() catch |err| return self.record(err);
+        if (manifest.current) |current_value| {
+            self.validate_current(current_value) catch |err| return self.record(err);
+            _ = self.delete_temporary_manifest() catch |err| return self.record(err);
+        } else {
+            self.clean_empty_artifacts() catch |err| return self.record(err);
         }
-        const removed_temporary = self.delete_temporary_manifest() catch |err| return self.record(err);
-        _ = removed_temporary;
         self.sync_directory() catch |err| return self.record(err);
         self.release_lock();
         self.release_gate();
         self.phase = .idle;
         self.failure = .none;
-        return if (manifest) |value| value.current else null;
+        return manifest.current;
     }
 
     fn begin_callback(context: *anyopaque, plan: ltx.ApplyPlan) error{ApplyBeginFailure}!ltx.ApplyCurrent {
@@ -439,8 +500,10 @@ pub const Store = struct {
         const self: *Store = @ptrCast(@alignCast(context));
         std.debug.assert(self.phase == .staging);
         self.dir.deleteFile(self.io, manifest_temporary_name) catch {};
-        if (self.captured_manifest == null) {
-            self.dir.deleteFile(self.io, self.stage_slot.database_name()) catch {};
+        if (self.captured_manifest) |manifest| {
+            if (manifest.current == null) {
+                self.dir.deleteFile(self.io, self.stage_slot.database_name()) catch {};
+            }
         }
         self.finish_stage();
     }
@@ -454,17 +517,24 @@ pub const Store = struct {
         errdefer self.release_gate();
         try self.acquire_lock();
         errdefer self.release_lock();
-        const manifest = try self.read_manifest();
-        if (manifest == null) try self.require_fresh_store();
-        if (!plan.header.is_snapshot() and manifest == null) return error.DatabaseMissing;
         try self.reject_all_sidecars();
-        if (manifest) |value| try self.validate_current(value.current);
+        const manifest = try self.load_or_initialize_manifest();
+        if (!plan.header.is_snapshot() and manifest.current == null) return error.DatabaseMissing;
+        if (manifest.current) |current_value| {
+            try self.validate_current(current_value);
+        } else {
+            try self.clean_empty_artifacts();
+            try self.sync_directory();
+        }
 
-        const slot: Slot = if (manifest) |value| value.current.slot.other() else .a;
-        errdefer if (manifest == null) {
+        const slot: Slot = if (manifest.current) |current_value|
+            current_value.slot.other()
+        else
+            .a;
+        errdefer if (manifest.current == null) {
             self.dir.deleteFile(self.io, slot.database_name()) catch {};
         };
-        const file = try self.create_stage(slot, manifest, plan);
+        const file = try self.create_stage(slot, manifest.current, plan);
         self.stage_file = file;
         self.captured_manifest = manifest;
         self.stage_slot = slot;
@@ -472,13 +542,16 @@ pub const Store = struct {
         self.commit_crossed = false;
         self.phase = .staging;
         self.failure = .none;
-        return if (manifest) |value| value.current.apply_current() else empty_apply_current();
+        return if (manifest.current) |current_value|
+            current_value.apply_current()
+        else
+            empty_apply_current();
     }
 
     fn create_stage(
         self: *Store,
         slot: Slot,
-        manifest: ?Manifest,
+        source_current: ?Current,
         plan: ltx.ApplyPlan,
     ) Error!std.Io.File {
         _ = try self.delete_path(slot.database_name());
@@ -490,10 +563,10 @@ pub const Store = struct {
         }) catch return error.IOFailure;
         errdefer destination.close(self.io);
         if (!plan.header.is_snapshot()) {
-            const source_manifest = manifest orelse return error.DatabaseMissing;
-            var source = self.dir.openFile(
+            const source_value = source_current orelse return error.DatabaseMissing;
+            var source_file = self.dir.openFile(
                 self.io,
-                source_manifest.current.database_name(),
+                source_value.database_name(),
                 .{
                     .mode = .read_only,
                     .allow_directory = false,
@@ -501,12 +574,12 @@ pub const Store = struct {
                     .resolve_beneath = true,
                 },
             ) catch return error.DatabaseMissing;
-            defer source.close(self.io);
+            defer source_file.close(self.io);
             const copy_size_bytes = @min(
-                source_manifest.current.database_size_bytes,
+                source_value.database_size_bytes,
                 plan.final_database_size_bytes,
             );
-            try self.copy_exact(source, destination, copy_size_bytes);
+            try self.copy_exact(source_file, destination, copy_size_bytes);
         }
         destination.setLength(self.io, plan.final_database_size_bytes) catch return error.IOFailure;
         return destination;
@@ -573,8 +646,9 @@ pub const Store = struct {
         DatabasePageSizeMismatch,
     }!void {
         if (self.phase != .staging) return error.ApplyPublishFailure;
-        const actual = if (self.captured_manifest) |manifest|
-            manifest.current.apply_current()
+        const manifest = self.captured_manifest orelse return error.ApplyPublishFailure;
+        const actual = if (manifest.current) |current_value|
+            current_value.apply_current()
         else
             empty_apply_current();
         if (expected.position.txid.value != actual.position.txid.value) {
@@ -593,10 +667,13 @@ pub const Store = struct {
         try self.reject_all_sidecars();
         try self.validate_sqlite_file(file, plan.header.page_size, plan.final_database_size_bytes);
         file.sync(self.io) catch return error.IOFailure;
+        try self.hit_fault(.database_sync);
         try self.sync_directory();
+        try self.hit_fault(.database_directory_sync);
 
-        const generation = if (self.captured_manifest) |manifest|
-            std.math.add(u64, manifest.current.generation, 1) catch return error.GenerationOverflow
+        const captured = self.captured_manifest orelse return error.InvalidState;
+        const generation = if (captured.current) |current_value|
+            std.math.add(u64, current_value.generation, 1) catch return error.GenerationOverflow
         else
             1;
         const next: Manifest = .{ .current = .{
@@ -606,10 +683,11 @@ pub const Store = struct {
             .generation = generation,
             .slot = self.stage_slot,
         } };
-        try validate_manifest_current(next.current);
+        try validate_manifest_current(next.current.?);
         try self.write_temporary_manifest(next);
+        try self.hit_fault(.manifest_sync);
         try self.sync_directory();
-        if (self.should_fail(.before)) return error.FaultInjected;
+        try self.hit_fault(.manifest_directory_sync);
         self.dir.rename(
             manifest_temporary_name,
             self.dir,
@@ -617,20 +695,22 @@ pub const Store = struct {
             self.io,
         ) catch return error.IOFailure;
         self.commit_crossed = true;
-        if (self.should_fail(.after)) return error.FaultInjected;
+        try self.hit_fault(.manifest_rename);
         try self.sync_directory();
+        try self.hit_fault(.commit_directory_sync);
         self.finish_stage();
         self.failure = .none;
     }
 
-    const FaultPoint = enum { before, after };
-
-    fn should_fail(self: *const Store, point: FaultPoint) bool {
-        const injection = self.options.fault_injection orelse return false;
-        return switch (point) {
-            .before => injection.fail_before_manifest_rename,
-            .after => injection.fail_after_manifest_rename,
+    fn hit_fault(self: *const Store, point: FaultPoint) Error!void {
+        const injection = self.options.fault_injection orelse return;
+        if (injection.hit_fn) |hit_fn| hit_fn(injection.context, point);
+        const legacy_failure = switch (point) {
+            .manifest_directory_sync => injection.fail_before_manifest_rename,
+            .manifest_rename => injection.fail_after_manifest_rename,
+            else => false,
         };
+        if (injection.fail_at == point or legacy_failure) return error.FaultInjected;
     }
 
     fn validate_verified(
@@ -698,6 +778,42 @@ pub const Store = struct {
         const read = file.readPositionalAll(self.io, &bytes, 0) catch return error.IOFailure;
         if (read != bytes.len) return error.ManifestCorrupt;
         return try Manifest.decode(&bytes);
+    }
+
+    /// Establishes the canonical empty manifest before any first-generation
+    /// slot can be created. Missing current plus any slot remains ambiguous and
+    /// fails closed; a temp-only state is an interrupted empty initialization.
+    fn load_or_initialize_manifest(self: *Store) Error!Manifest {
+        if (try self.read_manifest()) |manifest| {
+            // A prior process may have exposed a manifest rename and exited
+            // before syncing the directory. Make that observed selection
+            // durable before begin is allowed to reuse the opposite slot.
+            try self.sync_directory();
+            try self.hit_fault(.loaded_manifest_directory_sync);
+            return manifest;
+        }
+        if (try self.path_exists(database_a_name) or
+            try self.path_exists(database_b_name))
+        {
+            return error.ManifestCorrupt;
+        }
+
+        _ = try self.delete_temporary_manifest();
+        const baseline: Manifest = .{ .current = null };
+        try self.write_temporary_manifest(baseline);
+        try self.hit_fault(.baseline_manifest_sync);
+        try self.sync_directory();
+        try self.hit_fault(.baseline_directory_sync);
+        self.dir.rename(
+            manifest_temporary_name,
+            self.dir,
+            manifest_name,
+            self.io,
+        ) catch return error.IOFailure;
+        try self.hit_fault(.baseline_manifest_rename);
+        try self.sync_directory();
+        try self.hit_fault(.baseline_commit_directory_sync);
+        return baseline;
     }
 
     fn validate_current(self: *Store, current_value: Current) Error!void {
@@ -927,6 +1043,12 @@ pub const Store = struct {
             else => return error.IOFailure,
         };
         return true;
+    }
+
+    fn clean_empty_artifacts(self: *Store) Error!void {
+        _ = try self.delete_path(database_a_name);
+        _ = try self.delete_path(database_b_name);
+        _ = try self.delete_temporary_manifest();
     }
 
     fn require_fresh_store(self: *Store) Error!void {

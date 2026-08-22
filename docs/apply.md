@@ -157,9 +157,11 @@ observe bytes beyond the planned final length, so exact staging length remains
 part of the backend's `begin` and atomic publication contract.
 
 The optional SQLite store implements this boundary with one inactive database
-slot and a checksummed manifest as the sole commit pointer. `stage_page` never
-writes into the manifest-selected generation. Its lifecycle hook drains host
-SQLite connections, it rejects rollback-journal, WAL, and SHM sidecars, and its
-publication sequence syncs the staged database, temporary manifest, and parent
-directory around the atomic rename. These policies remain outside the core and
-are documented in [`sqlite-store.md`](sqlite-store.md).
+slot and a checksummed manifest as the sole commit pointer. A canonical empty
+manifest is durably installed before the first slot is created, giving first
+publication the same atomic old/new selection as later generations.
+`stage_page` never writes into the manifest-selected generation. Its lifecycle
+hook drains host SQLite connections, it rejects rollback-journal, WAL, and SHM
+sidecars, and its publication sequence syncs the staged database, temporary
+manifest, and parent directory around the atomic rename. These policies remain
+outside the core and are documented in [`sqlite-store.md`](sqlite-store.md).

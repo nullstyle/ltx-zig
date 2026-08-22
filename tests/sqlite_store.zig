@@ -164,6 +164,146 @@ fn read_exact(file: std.Io.File, bytes: []u8, offset: u64) !void {
     try std.testing.expectEqual(bytes.len, read);
 }
 
+fn expect_missing(dir: std.Io.Dir, name: []const u8) !void {
+    _ = dir.statFile(std.testing.io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    return error.TestUnexpectedResult;
+}
+
+test "recovery durably initializes a pristine store" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var first_gate: Gate = .{};
+    var first_workspace: [17]u8 = undefined;
+    var first = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &first_workspace,
+        first_gate.lifecycle(),
+        .{},
+    );
+    try std.testing.expectEqual(null, try first.current());
+    try std.testing.expectEqual(null, try first.recover());
+    const manifest_stat = try temporary.dir.statFile(
+        std.testing.io,
+        sqlite.manifest_name,
+        .{ .follow_symlinks = false },
+    );
+    try std.testing.expectEqual(@as(u64, 64), manifest_stat.size);
+    try expect_missing(temporary.dir, sqlite.database_a_name);
+    try expect_missing(temporary.dir, sqlite.database_b_name);
+
+    var second_gate: Gate = .{};
+    var second_workspace: [19]u8 = undefined;
+    var second = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &second_workspace,
+        second_gate.lifecycle(),
+        .{},
+    );
+    try std.testing.expectEqual(null, try second.current());
+    try std.testing.expectEqual(null, try second.recover());
+}
+
+test "interrupted empty initialization and first stage recover automatically" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var partial = try temporary.dir.createFile(
+        std.testing.io,
+        sqlite.manifest_temporary_name,
+        .{},
+    );
+    try partial.writePositionalAll(std.testing.io, "partial", 0);
+    partial.close(std.testing.io);
+
+    var gate: Gate = .{};
+    var workspace: [23]u8 = undefined;
+    var store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &workspace,
+        gate.lifecycle(),
+        .{},
+    );
+    try std.testing.expectEqual(null, try store.recover());
+
+    var staged = try temporary.dir.createFile(std.testing.io, sqlite.database_a_name, .{});
+    try staged.writePositionalAll(std.testing.io, "incomplete", 0);
+    staged.close(std.testing.io);
+    var next_manifest = try temporary.dir.createFile(
+        std.testing.io,
+        sqlite.manifest_temporary_name,
+        .{},
+    );
+    try next_manifest.writePositionalAll(std.testing.io, "uncommitted", 0);
+    next_manifest.close(std.testing.io);
+
+    try std.testing.expectEqual(null, try store.recover());
+    try expect_missing(temporary.dir, sqlite.database_a_name);
+    try expect_missing(temporary.dir, sqlite.manifest_temporary_name);
+}
+
+test "empty recovery rejects sidecars before cleaning an abandoned first stage" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var gate: Gate = .{};
+    var workspace: [29]u8 = undefined;
+    var store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &workspace,
+        gate.lifecycle(),
+        .{},
+    );
+    try std.testing.expectEqual(null, try store.recover());
+    var staged = try temporary.dir.createFile(std.testing.io, sqlite.database_a_name, .{});
+    staged.close(std.testing.io);
+    var sidecar = try temporary.dir.createFile(std.testing.io, "ltx.sqlite.a-wal", .{});
+    sidecar.close(std.testing.io);
+
+    try std.testing.expectError(error.SidecarPresent, store.recover());
+    try std.testing.expect(gate.held);
+    try temporary.dir.deleteFile(std.testing.io, "ltx.sqlite.a-wal");
+    try std.testing.expectEqual(null, try store.recover());
+    try std.testing.expect(!gate.held);
+    try expect_missing(temporary.dir, sqlite.database_a_name);
+}
+
+test "empty store accepts only a snapshot and abort preserves its baseline" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var gate: Gate = .{};
+    var workspace: [31]u8 = undefined;
+    var store = try sqlite.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &workspace,
+        gate.lifecycle(),
+        .{},
+    );
+    const incremental = make_header(2, 2, 1);
+    try std.testing.expectError(
+        error.ApplyBeginFailure,
+        begin(&store, make_plan(.contiguous, incremental)),
+    );
+    try std.testing.expectEqual(sqlite.Failure.database_missing, store.last_failure());
+    try expect_missing(temporary.dir, sqlite.database_a_name);
+
+    const snapshot = make_header(1, 1, 1);
+    _ = try begin(&store, make_plan(.contiguous, snapshot));
+    _ = try temporary.dir.statFile(
+        std.testing.io,
+        sqlite.manifest_name,
+        .{ .follow_symlinks = false },
+    );
+    abort(&store);
+    try std.testing.expectEqual(null, try store.current());
+    try expect_missing(temporary.dir, sqlite.database_a_name);
+}
+
 test "snapshot and incremental publication alternate exact SQLite generations" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -395,7 +535,7 @@ test "pre-rename failure aborts while post-rename failure requires recovery" {
     try std.testing.expectEqual(null, try store.current());
 
     faults.fail_before_manifest_rename = false;
-    faults.fail_after_manifest_rename = true;
+    faults.fail_at = .manifest_rename;
     const retry = try begin(&store, make_plan(.contiguous, header));
     try std.testing.expectError(
         error.ApplyPublishIndeterminate,
@@ -403,10 +543,23 @@ test "pre-rename failure aborts while post-rename failure requires recovery" {
     );
     try std.testing.expect(gate.held);
     try std.testing.expectError(error.InvalidState, store.current());
-    faults.fail_after_manifest_rename = false;
+    faults.fail_at = null;
     const recovered = (try store.recover()).?;
     try std.testing.expectEqual(@as(u64, 1), recovered.generation);
     try std.testing.expectEqual(@as(u64, 1), recovered.position.txid.value);
+    try std.testing.expect(!gate.held);
+
+    faults.fail_after_manifest_rename = true;
+    const next_header = make_header(2, 2, 0);
+    const next = try begin(&store, make_plan(.contiguous, next_header));
+    try std.testing.expectError(
+        error.ApplyPublishIndeterminate,
+        publish(&store, next, make_verified(next_header)),
+    );
+    faults.fail_after_manifest_rename = false;
+    const recovered_next = (try store.recover()).?;
+    try std.testing.expectEqual(@as(u64, 2), recovered_next.generation);
+    try std.testing.expectEqual(@as(u64, 2), recovered_next.position.txid.value);
     try std.testing.expect(!gate.held);
 }
 
