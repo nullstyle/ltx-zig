@@ -1,0 +1,14 @@
+.{
+    .name = .ltx_zig_consumer_smoke,
+    .version = "0.0.0",
+    .fingerprint = 0xfe651a7f8b103076,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .ltx_zig = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

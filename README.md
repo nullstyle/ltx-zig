@@ -67,12 +67,47 @@ algorithm includes BSD-3-Clause-licensed work whose separate notice is retained
 in [`LICENSE.pierrec-lz4`](LICENSE.pierrec-lz4). Distributions must retain the
 applicable notices.
 
+## Using the package
+
+For a tagged release, add the package to a consumer's `build.zig.zon` with:
+
+```sh
+zig fetch --save=ltx_zig https://github.com/nullstyle/ltx-zig/archive/refs/tags/v0.1.0.tar.gz
+```
+
+Then expose either or both public modules to the consumer root module:
+
+```zig
+const ltx_zig = b.dependency("ltx_zig", .{
+    .target = target,
+    .optimize = optimize,
+});
+const app = b.addExecutable(.{
+    .name = "replica",
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ltx", .module = ltx_zig.module("ltx") },
+            .{ .name = "ltx_sqlite", .module = ltx_zig.module("ltx_sqlite") },
+        },
+    }),
+});
+b.installArtifact(app);
+```
+
+The `consumer-smoke` build step tests the same dependency and module wiring
+through a local path dependency rather than importing modules directly from the
+repository build. The release checklist separately qualifies a fetched archive.
+
 ## Toolchain and tests
 
 Zig 0.16.0 and the Go 1.24.13 fixture-oracle toolchain are pinned by
 `.mise.toml`; `build.zig.zon` also rejects older Zig versions through its
 minimum-version field. Setting `GOTOOLCHAIN=local` keeps oracle checks on that
-exact Go toolchain instead of permitting an implicit download.
+exact Go toolchain instead of permitting an implicit download. The local CI
+task pins `act` 0.2.89 without installing it on hosted CI runners.
 
 ```sh
 mise exec -- zig version
@@ -80,11 +115,40 @@ mise exec -- zig build
 mise exec -- zig build fmt-check
 mise exec -- zig build test
 mise exec -- zig build sqlite-integration # optional; links the host libsqlite3
+mise exec -- zig build consumer-smoke
+mise exec -- zig build example-round-trip
+mise exec -- zig build release-check
 mise exec -- zig build fuzz -Doptimize=ReleaseSafe # replay fuzz corpora
 mise exec -- zig build fuzz --fuzz=10K -Doptimize=ReleaseSafe --seed 0
 mise exec -- zig build interop # optional; requires Go and may download modules
 mise exec -- zig build bench   # optional local compression benchmark
 ```
+
+With Docker running, the pinned `act` task parses and executes the exact Linux
+job from `.github/workflows/ci.yml`:
+
+```sh
+mise run ci-local -- --dryrun
+mise run ci-local
+```
+
+`.actrc` selects only `ubuntu-24.04`, forces the hosted runner's `linux/amd64`
+architecture, pins the container image by digest, and does not mount the host
+Docker daemon into the job container. Run it only from a trusted, reviewed
+worktree. The first full run is a substantial download and needs outbound
+access. No secrets are needed for this public read-only workflow; if GitHub
+rate limits a run, use `mise run ci-local -- -s GITHUB_TOKEN` and enter a
+least-privilege token at the secure prompt. Workflow code receives any supplied
+token, so never use this fallback on an untrusted branch or store tokens in
+`.actrc`. `act` cannot qualify the hosted macOS lane and its runner image is an
+approximation. The local lane deterministically replays the fuzz corpora;
+hosted native Linux performs the 10K instrumented search. The complete GitHub
+matrix therefore remains mandatory. See
+[the release checklist](docs/releasing.md) for the full gate.
+
+The runnable [`examples/round_trip.zig`](examples/round_trip.zig) encodes and
+decodes a one-page snapshot using only bounded stack storage. The project
+history is recorded in [`CHANGELOG.md`](CHANGELOG.md).
 
 Generate a deterministic v3 file on standard output with:
 

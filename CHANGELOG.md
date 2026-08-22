@@ -1,0 +1,31 @@
+# Changelog
+
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.0] - 2026-08-21
+
+### Added
+
+- Allocation-free LTX v3 decoding and canonical encoding for current raw-LZ4
+  blocks and the historical upstream frame profile.
+- Strict structure, page-index, CRC-64, rolling database, snapshot, and terminal
+  verification over bounded caller-owned workspaces.
+- Bounded storage-neutral compaction and staged apply orchestration.
+- Optional crash-qualified two-generation SQLite storage with typed read-only
+  generation leases and explicit recovery after indeterminate publication.
+- Pinned Go and Celld interoperability fixtures, mutation and fuzz suites, and
+  byte-for-byte Go-oracle compaction checks.
+- MIT licensing with the required separate BSD-3-Clause LZ4 attribution.
+
+### Changed
+
+- CI now qualifies Debug and ReleaseSafe behavior on pinned Linux and macOS
+  toolchains, public-module compilation across five targets, consumer package
+  wiring, the bounded example, and release metadata.
+- A pinned, digest-locked `act` task rehearses the Linux lane without mounting
+  the host Docker daemon; hosted Linux and macOS remain authoritative.
+- SQLite directory durability barriers are portable across qualified hosts.

@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
-    _ = b.addModule("ltx_sqlite", .{
+    const ltx_sqlite = b.addModule("ltx_sqlite", .{
         .root_source_file = b.path("src/sqlite_store.zig"),
         .target = target,
         .optimize = optimize,
@@ -39,6 +39,10 @@ pub fn build(b: *std.Build) void {
 
     const unit_tests = b.addTest(.{ .root_module = ltx });
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    const portability_sqlite_tests = b.addTest(.{
+        .name = "ltx-sqlite-portability-tests",
+        .root_module = ltx_sqlite,
+    });
 
     const interoperability = b.addTest(.{
         .root_module = b.createModule(.{
@@ -188,6 +192,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_sqlite_store_crash_tests.step);
     test_step.dependOn(&run_fuzz_lz4_tests.step);
 
+    const compile_tests_step = b.step(
+        "compile-tests",
+        "Compile the core and SQLite module tests without running them",
+    );
+    compile_tests_step.dependOn(&unit_tests.step);
+    compile_tests_step.dependOn(&portability_sqlite_tests.step);
+
     const fuzz_step = b.step(
         "fuzz",
         "Replay fuzz corpora; pass --fuzz[=N] to search for failures",
@@ -203,14 +214,78 @@ pub fn build(b: *std.Build) void {
             "build.zig.zon",
             "src",
             "tests",
+            "examples",
             "benchmarks",
             "tools/fixturegen",
             "tools/compaction_fixturegen",
+            "tools/release_check",
         },
         .check = true,
     });
     const fmt_check_step = b.step("fmt-check", "Check Zig source formatting");
     fmt_check_step.dependOn(&fmt.step);
+
+    const round_trip_example = b.addExecutable(.{
+        .name = "ltx-round-trip-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/round_trip.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ltx", .module = host_ltx }},
+        }),
+    });
+    const run_round_trip_example = b.addRunArtifact(round_trip_example);
+    const round_trip_example_step = b.step(
+        "example-round-trip",
+        "Run the bounded allocation-free encode/decode example",
+    );
+    round_trip_example_step.dependOn(&run_round_trip_example.step);
+
+    const consumer_smoke = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "build",
+        "test",
+        "--cache-dir",
+        "../../.zig-cache/consumer-smoke",
+    });
+    consumer_smoke.setCwd(b.path("tests/consumer"));
+    consumer_smoke.addArg(b.fmt("-Doptimize={s}", .{@tagName(optimize)}));
+    consumer_smoke.has_side_effects = true;
+    const consumer_smoke_step = b.step(
+        "consumer-smoke",
+        "Test both public modules through an external path dependency",
+    );
+    consumer_smoke_step.dependOn(&consumer_smoke.step);
+
+    const release_check = b.addExecutable(.{
+        .name = "ltx-release-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/release_check/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_release_check = b.addRunArtifact(release_check);
+    run_release_check.addFileArg(b.path("build.zig.zon"));
+    run_release_check.addFileArg(b.path("CHANGELOG.md"));
+    if (b.option([]const u8, "release-tag", "Release tag expected for package version")) |tag| {
+        run_release_check.addArg(tag);
+    }
+    const release_check_step = b.step(
+        "release-check",
+        "Check package version, changelog, and optional release tag",
+    );
+    release_check_step.dependOn(&run_release_check.step);
+    const release_check_tests = b.addTest(.{
+        .name = "ltx-release-check-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/release_check/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_release_check_tests = b.addRunArtifact(release_check_tests);
+    test_step.dependOn(&run_release_check_tests.step);
 
     const fixturegen = b.addExecutable(.{
         .name = "ltx-fixturegen",

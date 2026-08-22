@@ -1026,14 +1026,13 @@ test "generation access rejects state and output workspace aliasing" {
         store: sqlite.Store,
         workspace: sqlite.GenerationAccessWorkspace,
     };
-    var aliased: StoreWorkspaceAlias = undefined;
-    aliased.store = try sqlite.Store.init(
+    var aliased: StoreWorkspaceAlias = .{ .store = try sqlite.Store.init(
         std.testing.io,
         temporary.dir,
         &copy_workspace,
         gate.lifecycle(),
         .{},
-    );
+    ) };
     var storage: sqlite.GenerationAccessStorage = .{};
     const aliased_workspace: *sqlite.GenerationAccessWorkspace = @ptrCast(&aliased);
     try std.testing.expectError(

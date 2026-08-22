@@ -1,3 +1,8 @@
 [tools]
 go = "1.24.13"
 zig = "0.16.0"
+
+[tasks.ci-local]
+description = "Run the Linux GitHub Actions lane locally"
+tools.act = "0.2.89"
+run = "act push"
