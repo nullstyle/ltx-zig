@@ -6,7 +6,6 @@ const minimum_zig_marker = ".minimum_zig_version = \"";
 const required_package_name = "ltx_zig";
 const required_minimum_zig_version = "0.16.0";
 const manifest_limit_bytes = 64 * 1024;
-const build_limit_bytes = 1024 * 1024;
 const changelog_limit_bytes = 1024 * 1024;
 const documentation_limit_bytes = 1024 * 1024;
 const license_limit_bytes = 64 * 1024;
@@ -33,7 +32,6 @@ const required_licenses = [_]RequiredLicense{
 
 const Cli = struct {
     manifest_path: []const u8,
-    build_path: []const u8,
     changelog_path: []const u8,
     readme_path: []const u8,
     releasing_path: []const u8,
@@ -48,7 +46,6 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     const manifest = try read_bounded(init, cli.manifest_path, manifest_limit_bytes);
-    const build_source = try read_bounded(init, cli.build_path, build_limit_bytes);
     const changelog = try read_bounded(init, cli.changelog_path, changelog_limit_bytes);
     const readme = try read_bounded(init, cli.readme_path, documentation_limit_bytes);
     const releasing = try read_bounded(init, cli.releasing_path, documentation_limit_bytes);
@@ -57,7 +54,6 @@ pub fn main(init: std.process.Init) !void {
     _ = std.SemanticVersion.parse(version) catch return error.ManifestVersionMalformed;
     try require_package_name(manifest);
     try require_minimum_zig_version(manifest);
-    try require_public_modules(build_source);
     try require_readme_version(readme, version);
     try require_releasing_version(releasing, version);
     try require_release_state(changelog, version, cli.release_tag);
@@ -70,22 +66,21 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [128]u8 = undefined;
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     try stdout_writer.interface.print(
-        "release metadata, public modules, documentation, and notices verified for {s}\n",
+        "release metadata, documentation, and notices verified for {s}\n",
         .{version},
     );
     try stdout_writer.interface.flush();
 }
 
 fn parse_cli(args: anytype) !Cli {
-    if (args.len != 9 and args.len != 10) return error.InvalidArguments;
+    if (args.len != 8 and args.len != 9) return error.InvalidArguments;
     return .{
         .manifest_path = args[1],
-        .build_path = args[2],
-        .changelog_path = args[3],
-        .readme_path = args[4],
-        .releasing_path = args[5],
-        .license_paths = .{ args[6], args[7], args[8] },
-        .release_tag = if (args.len == 10) args[9] else null,
+        .changelog_path = args[2],
+        .readme_path = args[3],
+        .releasing_path = args[4],
+        .license_paths = .{ args[5], args[6], args[7] },
+        .release_tag = if (args.len == 9) args[8] else null,
     };
 }
 
@@ -93,8 +88,8 @@ fn write_usage(init: std.process.Init) !void {
     var buffer: [512]u8 = undefined;
     var writer: std.Io.File.Writer = .init(.stderr(), init.io, &buffer);
     try writer.interface.writeAll(
-        "usage: ltx-release-check <build.zig.zon> <build.zig> <CHANGELOG.md> " ++
-            "<README.md> <docs/releasing.md> <LICENSE> <LICENSE.pierrec-lz4> " ++
+        "usage: ltx-release-check <build.zig.zon> <CHANGELOG.md> <README.md> " ++
+            "<docs/releasing.md> <LICENSE> <LICENSE.pierrec-lz4> " ++
             "<LICENSE.celld-litestream-apache-2.0> [release-tag]\n",
     );
     try writer.interface.flush();
@@ -156,131 +151,6 @@ fn unique_delimited_value(
         return error.ValueDuplicate;
     }
     return source[value_offset..value_end];
-}
-
-const ModuleScanner = struct {
-    source: []const u8,
-    index: usize = 0,
-
-    fn next(scanner: *ModuleScanner) !?[]const u8 {
-        const marker = "b.addModule";
-        while (scanner.index < scanner.source.len) {
-            if (scanner.starts_with("//")) {
-                scanner.skip_line_comment();
-            } else if (scanner.starts_with("/*")) {
-                try scanner.skip_block_comment();
-            } else if (scanner.source[scanner.index] == '"' or scanner.source[scanner.index] == '\'') {
-                try scanner.skip_quoted(scanner.source[scanner.index]);
-            } else if (scanner.starts_with(marker) and scanner.has_identifier_boundaries(marker.len)) {
-                scanner.index += marker.len;
-                return try scanner.parse_module_name();
-            } else {
-                scanner.index += 1;
-            }
-        }
-        return null;
-    }
-
-    fn parse_module_name(scanner: *ModuleScanner) ![]const u8 {
-        scanner.skip_whitespace();
-        if (scanner.index >= scanner.source.len or scanner.source[scanner.index] != '(') {
-            return error.PublicModuleDeclarationMalformed;
-        }
-        scanner.index += 1;
-        scanner.skip_whitespace();
-        if (scanner.index >= scanner.source.len or scanner.source[scanner.index] != '"') {
-            return error.PublicModuleNameMustBeLiteral;
-        }
-        scanner.index += 1;
-        const start = scanner.index;
-        while (scanner.index < scanner.source.len and scanner.source[scanner.index] != '"') {
-            if (scanner.source[scanner.index] == '\\') return error.PublicModuleNameMalformed;
-            scanner.index += 1;
-        }
-        if (scanner.index >= scanner.source.len or scanner.index == start) {
-            return error.PublicModuleNameMalformed;
-        }
-        const name = scanner.source[start..scanner.index];
-        scanner.index += 1;
-        return name;
-    }
-
-    fn skip_line_comment(scanner: *ModuleScanner) void {
-        scanner.index += 2;
-        while (scanner.index < scanner.source.len and scanner.source[scanner.index] != '\n') {
-            scanner.index += 1;
-        }
-    }
-
-    fn skip_block_comment(scanner: *ModuleScanner) !void {
-        scanner.index += 2;
-        var depth: usize = 1;
-        while (scanner.index < scanner.source.len and depth != 0) {
-            if (scanner.starts_with("/*")) {
-                depth += 1;
-                scanner.index += 2;
-            } else if (scanner.starts_with("*/")) {
-                depth -= 1;
-                scanner.index += 2;
-            } else {
-                scanner.index += 1;
-            }
-        }
-        if (depth != 0) return error.BuildSourceMalformed;
-    }
-
-    fn skip_quoted(scanner: *ModuleScanner, quote: u8) !void {
-        scanner.index += 1;
-        while (scanner.index < scanner.source.len) {
-            if (scanner.source[scanner.index] == '\\') {
-                scanner.index += 1;
-                if (scanner.index >= scanner.source.len) return error.BuildSourceMalformed;
-            } else if (scanner.source[scanner.index] == quote) {
-                scanner.index += 1;
-                return;
-            }
-            scanner.index += 1;
-        }
-        return error.BuildSourceMalformed;
-    }
-
-    fn skip_whitespace(scanner: *ModuleScanner) void {
-        while (scanner.index < scanner.source.len and std.ascii.isWhitespace(scanner.source[scanner.index])) {
-            scanner.index += 1;
-        }
-    }
-
-    fn starts_with(scanner: *const ModuleScanner, value: []const u8) bool {
-        return std.mem.startsWith(u8, scanner.source[scanner.index..], value);
-    }
-
-    fn has_identifier_boundaries(scanner: *const ModuleScanner, marker_len: usize) bool {
-        if (scanner.index != 0 and is_identifier_byte(scanner.source[scanner.index - 1])) return false;
-        const end = scanner.index + marker_len;
-        return end == scanner.source.len or !is_identifier_byte(scanner.source[end]);
-    }
-};
-
-fn is_identifier_byte(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or byte == '_';
-}
-
-fn require_public_modules(build_source: []const u8) !void {
-    var scanner: ModuleScanner = .{ .source = build_source };
-    var ltx_count: usize = 0;
-    var sqlite_count: usize = 0;
-    while (try scanner.next()) |name| {
-        if (std.mem.eql(u8, name, "ltx")) {
-            ltx_count += 1;
-        } else if (std.mem.eql(u8, name, "ltx_sqlite")) {
-            sqlite_count += 1;
-        } else {
-            return error.UnexpectedPublicModule;
-        }
-    }
-    if (ltx_count == 0) return error.LTXPublicModuleMissing;
-    if (sqlite_count == 0) return error.LTXSQLitePublicModuleMissing;
-    if (ltx_count != 1 or sqlite_count != 1) return error.PublicModuleDuplicate;
 }
 
 fn require_readme_version(readme: []const u8, version: []const u8) !void {
@@ -415,18 +285,17 @@ fn require_matching_tag(version: []const u8, tag: []const u8) !void {
 
 test "CLI accepts metadata, notice paths, and an optional release tag" {
     const base = [_][]const u8{
-        "check",             "build.zig.zon", "build.zig",           "CHANGELOG.md",                        "README.md",
+        "check",             "build.zig.zon", "CHANGELOG.md",        "README.md",
         "docs/releasing.md", "LICENSE",       "LICENSE.pierrec-lz4", "LICENSE.celld-litestream-apache-2.0",
     };
     const prerelease = try parse_cli(&base);
     try std.testing.expect(prerelease.release_tag == null);
-    try std.testing.expectEqualStrings("build.zig", prerelease.build_path);
     try std.testing.expectEqualStrings("README.md", prerelease.readme_path);
 
     const tagged = base ++ [_][]const u8{"v0.1.0"};
     const release = try parse_cli(&tagged);
     try std.testing.expectEqualStrings("v0.1.0", release.release_tag.?);
-    try std.testing.expectError(error.InvalidArguments, parse_cli(base[0..8]));
+    try std.testing.expectError(error.InvalidArguments, parse_cli(base[0..7]));
 }
 
 test "manifest release metadata is exact, unique, and well formed" {
@@ -463,29 +332,6 @@ test "manifest release metadata is exact, unique, and well formed" {
     try std.testing.expectError(
         error.ManifestMinimumZigVersionMalformed,
         require_minimum_zig_version(".minimum_zig_version = \"development\","),
-    );
-}
-
-test "public module surface is exactly ltx and ltx_sqlite" {
-    const complete =
-        \\const decoy = "b.addModule(\\\"ignored\\\", .{})";
-        \\// b.addModule("ignored", .{});
-        \\/* b.addModule("also_ignored", .{}); */
-        \\const ltx = b.addModule("ltx", .{});
-        \\const sqlite = b.addModule("ltx_sqlite", .{});
-    ;
-    try require_public_modules(complete);
-    try std.testing.expectError(
-        error.LTXSQLitePublicModuleMissing,
-        require_public_modules("const ltx = b.addModule(\"ltx\", .{});"),
-    );
-    try std.testing.expectError(
-        error.PublicModuleDuplicate,
-        require_public_modules(complete ++ "\nconst duplicate = b.addModule(\"ltx\", .{});"),
-    );
-    try std.testing.expectError(
-        error.UnexpectedPublicModule,
-        require_public_modules(complete ++ "\nconst extra = b.addModule(\"private\", .{});"),
     );
 }
 

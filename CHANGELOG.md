@@ -2,7 +2,8 @@
 
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the major
+version is zero, the Zig source API is intentionally unstable.
 
 ## [Unreleased]
 
@@ -15,7 +16,7 @@ All notable changes to this project are documented here. The format follows
 - Strict structure, page-index, CRC-64, rolling database, snapshot, and terminal
   verification over bounded caller-owned workspaces.
 - Bounded storage-neutral compaction and staged apply orchestration.
-- An explicit external-consumer 0.1 source API contract plus runnable bounded
+- External path-dependency compile and smoke gates plus runnable bounded
   snapshot-apply and SQLite generation-store lifecycle examples.
 - A canonical local source-archive smoke gate that extracts with isolated
   caches and runs the archived consumer and examples.
@@ -57,6 +58,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- The pre-1.0 Zig source API is explicitly allowed to evolve with its
+  coordinated consumer; 0.x releases make no source-compatibility promise.
 - CI now qualifies Debug and ReleaseSafe behavior on pinned Linux and macOS
   toolchains, public-module compilation across five targets, consumer package
   wiring, the bounded example, and release metadata.

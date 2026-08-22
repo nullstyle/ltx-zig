@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const compile_step = b.step(
         "compile",
-        "Compile the 0.1 public API contract without running it",
+        "Compile the current external package consumer without running it",
     );
     compile_step.dependOn(&tests.step);
     const test_step = b.step("test", "Test the public modules as an external dependency");

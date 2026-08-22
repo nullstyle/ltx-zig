@@ -366,7 +366,7 @@ pub fn build(b: *std.Build) void {
         "build",
         "compile",
         "--cache-dir",
-        "../../.zig-cache/consumer-api-freeze",
+        "../../.zig-cache/consumer-compile",
     });
     consumer_compile.setCwd(b.path("tests/consumer"));
     consumer_compile.addArg(b.fmt("-Dtarget={s}", .{
@@ -374,11 +374,11 @@ pub fn build(b: *std.Build) void {
     }));
     consumer_compile.addArg(b.fmt("-Doptimize={s}", .{@tagName(optimize)}));
     consumer_compile.has_side_effects = true;
-    const api_freeze_step = b.step(
-        "api-freeze",
-        "Compile the supported 0.1 public API contract",
+    const consumer_compile_step = b.step(
+        "consumer-compile",
+        "Compile the current external package consumer",
     );
-    api_freeze_step.dependOn(&consumer_compile.step);
+    consumer_compile_step.dependOn(&consumer_compile.step);
     compile_tests_step.dependOn(&consumer_compile.step);
 
     const source_archive_smoke = b.addExecutable(.{
@@ -420,7 +420,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_release_check = b.addRunArtifact(release_check);
     run_release_check.addFileArg(b.path("build.zig.zon"));
-    run_release_check.addFileArg(b.path("build.zig"));
     run_release_check.addFileArg(b.path("CHANGELOG.md"));
     run_release_check.addFileArg(b.path("README.md"));
     run_release_check.addFileArg(b.path("docs/releasing.md"));

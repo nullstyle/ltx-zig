@@ -35,8 +35,8 @@ The exact caller-owned variable workspace totals are:
 These totals exclude `Decoder`, `Encoder`, `CompactionInput`, `Compactor`, and
 `StagedApplier` values; reader/writer and backend state; encoded inputs; source
 database pages; and encoded output. Their `@sizeOf` and `@alignOf` values depend
-on the compilation target and are not part of the source compatibility or ABI
-contract.
+on the compilation target. No source-compatibility, ABI, or numeric-layout
+guarantee is made for them before 1.0.
 
 The formulas assume separate, correctly aligned typed buffers. When carving
 them from one byte arena, apply checked alignment padding before

@@ -61,15 +61,15 @@ implemented. Compaction is a codec-level merge: it does not select storage
 levels, delete source files, publish a replica, or manage a Litestream process.
 The core API remains synchronous, transport-neutral, and free of filesystem and
 SQLite dependencies. See [docs/compaction.md](docs/compaction.md) for its exact
-contract. The supported 0.1 declarations and compatibility boundary are listed
-in the [public API contract](docs/api.md). The optional store is deliberately a
-quiescent replica/apply destination: the host drains SQLite through an
-application-owned lifecycle gate, and published generation paths may be opened
-only under a generation access lease using SQLite URI `mode=ro&immutable=1` and
-`query_only`. The lease holds a shared store lock from manifest resolution until
-the host has closed every SQLite handle using that URI. It does not link a
-second SQLite copy or manage application connection handles itself. See
-[docs/sqlite-store.md](docs/sqlite-store.md).
+contract. The [current API and stability policy](docs/api.md) explicitly keeps
+the pre-1.0 Zig source surface free to evolve. The optional store is
+deliberately a quiescent replica/apply destination: the host drains SQLite
+through an application-owned lifecycle gate, and published generation paths
+may be opened only under a generation access lease using SQLite URI
+`mode=ro&immutable=1` and `query_only`. The lease holds a shared store lock from
+manifest resolution until the host has closed every SQLite handle using that
+URI. It does not link a second SQLite copy or manage application connection
+handles itself. See [docs/sqlite-store.md](docs/sqlite-store.md).
 
 `ltx-zig` is licensed under the [MIT License](LICENSE). The fast-compressor
 algorithm includes BSD-3-Clause-licensed work whose separate notice is retained
@@ -77,6 +77,12 @@ in [`LICENSE.pierrec-lz4`](LICENSE.pierrec-lz4). The copied Celld/Litestream
 capture corpus is Apache-2.0-licensed; its notice is retained in
 [`LICENSE.celld-litestream-apache-2.0`](LICENSE.celld-litestream-apache-2.0).
 Distributions must retain the applicable notices.
+
+`ltx-zig` is pre-1.0. Its Zig source API may change in any 0.x release without
+a compatibility shim or deprecation period. Development is coordinated with
+one consumer; other users should pin an exact tag or commit. Wire compatibility
+and the verification invariants above remain separately enforced by the pinned
+oracles and interoperability suites.
 
 ## Using the package
 
@@ -110,12 +116,13 @@ b.installArtifact(app);
 
 The `consumer-smoke` build step tests the same dependency and module wiring
 through a local path dependency rather than importing modules directly from the
-repository build. `api-freeze` separately compiles the supported 0.1 source API
-as that external consumer. `source-archive-smoke` creates the canonical local
-`zig fetch` tarball, extracts it into a temporary tree, and uses isolated local
-and global caches to run the archived external consumer and all shipped
-examples. That gate catches missing package paths without consulting the live
-checkout or an existing cache.
+repository build. `consumer-compile` compiles that current external consumer
+without running it; it is a regression check, not a compatibility promise.
+`source-archive-smoke` creates the canonical local `zig fetch` tarball,
+extracts it into a temporary tree, and uses isolated local and global caches to
+run the archived external consumer and all shipped examples. That gate catches
+missing package paths without consulting the live checkout or an existing
+cache.
 
 ## Toolchain and tests
 
@@ -132,7 +139,7 @@ mise exec -- zig build fmt-check
 mise exec -- zig build test
 mise exec -- zig build sqlite-integration # optional; links the host libsqlite3
 mise exec -- zig build consumer-smoke
-mise exec -- zig build api-freeze
+mise exec -- zig build consumer-compile
 mise exec -- zig build example-round-trip
 mise exec -- zig build example-apply-snapshot
 mise exec -- zig build example-sqlite-store

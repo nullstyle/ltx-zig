@@ -41,9 +41,8 @@ mise exec -- zig build test
 mise exec -- zig build test -Doptimize=ReleaseSafe
 mise exec -- zig build sqlite-integration
 mise exec -- zig build sqlite-integration -Doptimize=ReleaseSafe
+mise exec -- zig build consumer-compile
 mise exec -- zig build consumer-smoke -Doptimize=ReleaseSafe
-mise exec -- zig build api-freeze
-mise exec -- zig build api-freeze -Doptimize=ReleaseSafe
 mise exec -- zig build resource-check -Doptimize=ReleaseSafe
 mise exec -- zig build bench-compile -Dbench-optimize=ReleaseSafe
 mise exec -- zig build benchmark-smoke -Dbench-optimize=ReleaseSafe
@@ -57,9 +56,11 @@ mise exec -- zig build litestream-interop -Doptimize=ReleaseSafe \
   -Dlitestream=/absolute/path/to/litestream
 ```
 
-`api-freeze` compiles the supported 0.1 contract through the external consumer
-package. `source-archive-smoke` asks the pinned Zig executable to create its
-canonical local `zig fetch` tarball, extracts it away from the checkout, and
+`consumer-compile` and `consumer-smoke` exercise the current external
+path-dependency wiring. They are regression gates for the coordinated
+consumer, not a source-compatibility promise. `source-archive-smoke` asks the
+pinned Zig executable to create its canonical local `zig fetch` tarball,
+extracts it away from the checkout, and
 runs the archived consumer plus all three examples with isolated local and
 global caches. It therefore checks package-path completeness without a cached
 or live-source fallback; it does not replace fetching the final remote tag.
