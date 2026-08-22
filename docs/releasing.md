@@ -40,7 +40,15 @@ mise exec -- zig build consumer-smoke -Doptimize=ReleaseSafe
 mise exec -- zig build example-round-trip -Doptimize=ReleaseSafe
 mise exec -- zig build fuzz --fuzz=10K -Doptimize=ReleaseSafe --seed 0
 GOTOOLCHAIN=local mise exec -- zig build interop -Doptimize=ReleaseSafe
+mise exec -- zig build litestream-interop -Doptimize=ReleaseSafe \
+  -Dlitestream=/absolute/path/to/litestream
 ```
+
+Use the official Litestream v0.5.16 archive for the host and verify its
+SHA-256 against the values recorded in [`upstream.md`](upstream.md) before the
+`litestream-interop` command. The harness also rejects every reported version
+other than exactly `0.5.16`. It uses only a temporary local file replica and
+does not contact a configured remote replica.
 
 With Docker running, parse and then execute the pinned Ubuntu CI rehearsal:
 
@@ -50,7 +58,8 @@ mise run ci-local
 ```
 
 The first full run downloads the digest-pinned Ubuntu runner image and requires
-outbound access for GitHub Actions, Ubuntu packages, mise tools, and Go modules.
+outbound access for GitHub Actions, Ubuntu packages, mise tools, Go modules,
+and the checksum-pinned Litestream release archive.
 Run it only from a trusted, reviewed worktree. The host Docker daemon is not
 mounted into the job container. The current public workflow needs no secrets.
 If GitHub rate limits a run, use `mise run ci-local -- -s GITHUB_TOKEN` and

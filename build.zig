@@ -98,6 +98,17 @@ pub fn build(b: *std.Build) void {
     });
     const run_compactor_tests = b.addRunArtifact(compactor_tests);
     run_compactor_tests.has_side_effects = true;
+    const litestream_compaction_tests = b.addTest(.{
+        .name = "ltx-litestream-compaction-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/litestream_compaction.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ltx", .module = host_ltx }},
+        }),
+    });
+    const run_litestream_compaction_tests = b.addRunArtifact(litestream_compaction_tests);
+    run_litestream_compaction_tests.has_side_effects = true;
     const sqlite_store_unit_tests = b.addTest(.{
         .name = "ltx-sqlite-store-unit-tests",
         .root_module = host_sqlite_store,
@@ -190,6 +201,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_fuzz_decoder_tests.step);
     test_step.dependOn(&run_apply_tests.step);
     test_step.dependOn(&run_compactor_tests.step);
+    test_step.dependOn(&run_litestream_compaction_tests.step);
     test_step.dependOn(&run_sqlite_store_unit_tests.step);
     test_step.dependOn(&run_sqlite_store_tests.step);
     test_step.dependOn(&run_sqlite_store_crash_tests.step);
@@ -221,6 +233,8 @@ pub fn build(b: *std.Build) void {
             "benchmarks",
             "tools/fixturegen",
             "tools/compaction_fixturegen",
+            "tools/litestream_compaction_fixturegen",
+            "tools/litestream_interop",
             "tools/release_check",
         },
         .check = true,
@@ -328,6 +342,33 @@ pub fn build(b: *std.Build) void {
     );
     compaction_fixturegen_step.dependOn(&run_compaction_fixturegen.step);
 
+    const litestream_compaction_fixturegen = b.addExecutable(.{
+        .name = "ltx-litestream-compaction-fixturegen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/litestream_compaction_fixturegen/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ltx", .module = host_ltx },
+                .{
+                    .name = "litestream_captures",
+                    .module = b.createModule(.{
+                        .root_source_file = b.path("tests/litestream_captures.zig"),
+                        .target = b.graph.host,
+                        .optimize = optimize,
+                    }),
+                },
+            },
+        }),
+    });
+    const run_litestream_compaction_fixturegen = b.addRunArtifact(
+        litestream_compaction_fixturegen,
+    );
+    const generated_litestream_compaction =
+        run_litestream_compaction_fixturegen.captureStdOut(.{
+            .basename = "0000000000000001-0000000000000004.ltx",
+        });
+
     const interop_fixturegen = b.addRunArtifact(fixturegen);
     const generated_fixture = interop_fixturegen.captureStdOut(.{
         .basename = "ltx-zig.ltx",
@@ -365,6 +406,59 @@ pub fn build(b: *std.Build) void {
     go_verify_compaction.addFileArg(generated_deletion_fixture);
     go_verify_compaction.addFileArg(generated_no_checksum_fixture);
     interop_step.dependOn(&go_verify_compaction.step);
+
+    const fixture_root = "tests/fixtures/celld_litestream_v0511/replica/ltx/0/";
+    const go_verify_real_compaction = b.addSystemCommand(&.{
+        "go",
+        "run",
+        "./verify_real_compaction",
+    });
+    go_verify_real_compaction.setCwd(b.path("tools/upstream_verify"));
+    go_verify_real_compaction.setEnvironmentVariable("GOWORK", "off");
+    go_verify_real_compaction.addFileArg(generated_litestream_compaction);
+    go_verify_real_compaction.addFileArg(b.path(
+        fixture_root ++ "0000000000000001-0000000000000001.ltx",
+    ));
+    go_verify_real_compaction.addFileArg(b.path(
+        fixture_root ++ "0000000000000002-0000000000000002.ltx",
+    ));
+    go_verify_real_compaction.addFileArg(b.path(
+        fixture_root ++ "0000000000000003-0000000000000003.ltx",
+    ));
+    go_verify_real_compaction.addFileArg(b.path(
+        fixture_root ++ "0000000000000004-0000000000000004.ltx",
+    ));
+    interop_step.dependOn(&go_verify_real_compaction.step);
+
+    const litestream_interop_module = b.createModule(.{
+        .root_source_file = b.path("tools/litestream_interop/main.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    litestream_interop_module.linkSystemLibrary("sqlite3", .{});
+    const litestream_interop = b.addExecutable(.{
+        .name = "ltx-litestream-interop",
+        .root_module = litestream_interop_module,
+    });
+    const run_litestream_interop = b.addRunArtifact(litestream_interop);
+    run_litestream_interop.addArg(b.option(
+        []const u8,
+        "litestream",
+        "Path to the exact Litestream v0.5.16 binary",
+    ) orelse "litestream");
+    run_litestream_interop.addFileArg(generated_litestream_compaction);
+    run_litestream_interop.addFileArg(b.path(
+        fixture_root ++ "0000000000000005-0000000000000005.ltx",
+    ));
+    run_litestream_interop.addFileArg(b.path(
+        fixture_root ++ "0000000000000006-0000000000000006.ltx",
+    ));
+    const litestream_interop_step = b.step(
+        "litestream-interop",
+        "Restore Zig-compacted real captures with Litestream v0.5.16",
+    );
+    litestream_interop_step.dependOn(&run_litestream_interop.step);
 
     const benchmark_lz4 = b.createModule(.{
         .root_source_file = b.path("src/lz4_block.zig"),

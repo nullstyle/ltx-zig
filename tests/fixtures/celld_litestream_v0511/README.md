@@ -52,9 +52,11 @@ and runs `PRAGMA integrity_check`.
 This corpus proves real Litestream capture compatibility, legacy-frame
 decoding, nonzero WAL metadata, file checksums, exact page-index/EOF handling,
 TXID continuity, and staged image reconstruction. It does not prove current
-flagged-block writer equality, enabled database checksums, sparse page
-transitions, or database growth and shrink; separate pinned and SQLite-produced
-tests cover those cases.
+flagged-block writer equality by itself. The outbound compaction gates use its
+TX1–TX4 prefix as Zig input, then require pinned-Go byte equality and a real
+Litestream v0.5.16 restore with the untouched legacy TX5/TX6 tail. Enabled
+database checksums, sparse page transitions, and database growth and shrink
+remain covered by separate pinned and SQLite-produced tests.
 
 Celld and Litestream distribute this material under Apache License 2.0. The
 applicable notice is retained at

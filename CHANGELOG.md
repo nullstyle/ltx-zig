@@ -27,6 +27,9 @@ All notable changes to this project are documented here. The format follows
   byte-for-byte Go-oracle compaction checks.
 - An immutable real-Litestream v0.5.11 six-transition capture chain with exact
   artifact and restored-image hashes plus final read-only SQLite qualification.
+- Outbound compaction qualification against pinned Go bytes and a
+  checksum-pinned Litestream v0.5.16 restore over mixed current-L1 and
+  legacy-L0 page representations.
 - Public SQLite store state and adapter-specific failure inspection, with an
   explicit retry/recovery decision contract.
 - Exhaustive returned-fault qualification at every SQLite durability boundary

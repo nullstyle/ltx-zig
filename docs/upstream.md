@@ -15,6 +15,8 @@ exact revisions:
   `89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9`
 - [`benbjohnson/litestream` v0.5.11](https://github.com/benbjohnson/litestream/tree/016c368704e63db0088b9b61e2e96c0019f11832):
   `016c368704e63db0088b9b61e2e96c0019f11832`
+- [`benbjohnson/litestream` v0.5.16](https://github.com/benbjohnson/litestream/tree/6d61ef5d007756d62e473daee4c760ac395a55c6):
+  `6d61ef5d007756d62e473daee4c760ac395a55c6`
 - [`pierrec/lz4` v4.1.23](https://github.com/pierrec/lz4/tree/cd9d7a4f66405a92f4881933816b828b0f7d5fe2):
   `cd9d7a4f66405a92f4881933816b828b0f7d5fe2`
 - [SQLite 3.53.4 source mirror](https://github.com/sqlite/sqlite/tree/b09c88c14082339b66c7b7158d609a771e64ca69):
@@ -64,6 +66,11 @@ index size, and the trailer. Its `Vec`, `BTreeMap`, `HashMap`, and
 read-to-end design is intentionally not a memory model for this
 allocation-free Zig core, and it does not perform Zig's exact one-to-one
 index/frame cross-check.
+
+For Litestream v0.5.16: the release archive manifest, `go.mod`,
+`cmd/litestream/restore.go`, `replica.go` restore planning and decode path, and
+the pinned `superfly/ltx v0.5.2` reader were checked. The shipped binary is the
+deployment oracle; it is not rebuilt with the repository's older Go pin.
 
 For raw-block compression: the current Go oracle pins
 `github.com/pierrec/lz4/v4 v4.1.23` with module content hash
@@ -179,6 +186,39 @@ with the checksum-verified official
 [Litestream v0.5.11 release](https://github.com/benbjohnson/litestream/releases/tag/v0.5.11);
 all six output hashes matched the committed known answers. This external oracle
 run is intentionally not part of normal CI.
+
+The outbound qualification follows Celld's
+[`D4` compaction test](https://github.com/denoland/celld/blob/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx/tests/differential_xtool.rs#L510-L585):
+a current flagged L1 file covers a prefix, legacy unflagged L0 files retain the
+tail, and a real Litestream reader must restore the mixed plan. Zig compacts
+the captured TX1–TX4 inputs under limits of four inputs, 20 aggregate decoded
+page events, and five output pages. The output is published only after complete
+verification. The pinned Go oracle independently compacts the same four input
+files with `HeaderFlagNoChecksum`, byte-compares the entire output, requires
+the current flagged page representation, and decodes the exact TX4 image hash
+`27d2e8ad59731445c4798eec1c76146e85bd931383728d89fbd96f91d97b0f6a`.
+
+The deployment gate places that Zig file at L1 for TX1–TX4 and retains the
+unaltered legacy TX5 and TX6 objects at L0. The checksum-verified official
+[Litestream v0.5.16 release](https://github.com/benbjohnson/litestream/releases/tag/v0.5.16)
+must restore both the TX4 boundary and the final TX6 image. Their SHA-256 values
+are respectively the TX4 hash above and
+`ee705e74c9788b64f5dc63b9c3dc028ae05aae34f240bad1362d9436c65150e0`;
+the final database must also pass full SQLite integrity and contain the exact
+eight captured rows. The official archive SHA-256 values used by release and
+CI qualification are:
+
+- Linux x86_64: `9e29112380a942e4a62ee07773684396cb8b308dc4d67e130bef41f75e937f0a`
+- Linux arm64: `678022e4103145302598e35d37f8718392d42e153feeb1e2d4a64dd0cd3aaf10`
+- macOS x86_64: `eb554b93c9e2833351b017707e9ba5ac97ffd91d07e8b8b836b3ca7661399c36`
+- macOS arm64: `3e64028ff3522caca7a5ab67244e0373b25f3db68b6e25cac0056bf71c30c337`
+
+The published `checksums.txt` itself has SHA-256
+`074cd89d41b46561c8c087d2728842dad32356c4192171c2488d3eff03a9f317`.
+The Linux x86_64 archive is fetched and checked in hosted Linux CI and the
+pinned `act` rehearsal. Normal tests remain hermetic; they apply the identical
+Zig L1 plus legacy L0 sequence through `StagedApplier` and pin the TX4, TX5,
+and TX6 database hashes without spawning Litestream.
 
 Celld's
 [reader assertions](https://github.com/denoland/celld/blob/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx/src/ltx.rs#L578-L614)
@@ -392,9 +432,12 @@ the output mode from its input headers. These files are generated during the
 interop build rather than treated as committed Go-derived corpus.
 
 `mise exec -- zig build interop` performs the snapshot verification plus all
-compaction checks from the build graph. For compaction, the exact pinned Go
-module independently reconstructs inputs, runs `ltx.NewCompactor`, byte-compares
-the full output with Zig, and decodes it for semantic checks. This is pinned
-library-level interoperability, not a real Litestream deployment test. The Go
-module uses the checksum-locked pseudo-version resolving exactly to the
-recorded commit; unlike the normal test suite, it may download modules.
+synthetic and real-capture compaction checks from the build graph. For
+compaction, the exact pinned Go module independently reconstructs or reads the
+inputs, runs `ltx.NewCompactor`, byte-compares the full output with Zig, and
+decodes it for semantic checks. `mise exec -- zig build litestream-interop
+-Dlitestream=/absolute/path/to/litestream` adds the real v0.5.16 deployment
+reader over the mixed-level tree described above. The Go module uses the
+checksum-locked pseudo-version resolving exactly to the recorded commit;
+unlike the normal test suite, the interop gates may require downloaded tools
+or modules.

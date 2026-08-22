@@ -117,17 +117,28 @@ mise exec -- zig build compaction-fixture -Dcompaction-fixture=deletion > /tmp/d
 mise exec -- zig build compaction-fixture -Dcompaction-fixture=no-checksum > /tmp/no-checksum.ltx
 ```
 
-`mise exec -- zig build interop` performs the stronger optional check. The
-exact pinned Go module independently constructs the same inputs, runs
+`mise exec -- zig build interop` performs the stronger optional Go check. The
+exact pinned module independently constructs the synthetic inputs, runs
 `ltx.NewCompactor`, and byte-compares its output with Zig before decoding and
 checking it semantically. The merge case covers three checksummed inputs,
 newest-page precedence, final-commit shrinkage, current page flags, and zeroed
 source metadata. The deletion case covers a contiguous incremental deletion to
 commit zero. The no-checksum case covers the mode emitted by Celld's
 storage-level compactor and configures the Go oracle explicitly for that output
-mode. This establishes library-level wire interoperability with the pinned Go
-oracle; it is not an end-to-end Litestream integration test. Normal tests do not
-run Go or access the network.
+mode.
+
+The same Go gate also compacts TX1 through TX4 of the immutable real
+Litestream capture. It byte-matches the Zig output, requires current flagged
+raw-LZ4 pages, and decodes the exact known TX4 SQLite image. For the deployment
+boundary, `mise exec -- zig build litestream-interop
+-Dlitestream=/absolute/path/to/litestream` requires a binary reporting exactly
+v0.5.16. Release qualification and CI use the checksum-pinned official archive.
+The harness builds a forced replica plan containing the Zig TX1–TX4 L1 object
+and the legacy-frame TX5/TX6 L0 tail, restores at TX4 and TX6, and checks both
+database hashes plus final SQLite integrity and rows. Hosted Linux CI extracts
+and runs the archive only after verifying its pinned SHA-256. Normal Zig tests
+do not run Go or Litestream and never access the network; they reproduce the
+same mixed-representation chain with the bounded staged applier.
 
 The pinned Go and Celld source evidence and deliberate strictness differences
 are recorded in [`upstream.md`](upstream.md).

@@ -75,6 +75,23 @@ jobs:
         run: mise exec -- zig build -Doptimize=ReleaseSafe
       - name: Verify Zig output with pinned Go oracle
         run: mise exec -- zig build interop -Doptimize=ReleaseSafe
+      - name: Install checksum-pinned Litestream reader
+        if: runner.os == 'Linux'
+        env:
+          LITESTREAM_ARCHIVE_SHA256: 9e29112380a942e4a62ee07773684396cb8b308dc4d67e130bef41f75e937f0a
+        run: |
+          archive="$RUNNER_TEMP/litestream-0.5.16-linux-x86_64.tar.gz"
+          install_dir="$RUNNER_TEMP/litestream-v0.5.16"
+          curl --fail --location --silent --show-error --output "$archive" \
+            https://github.com/benbjohnson/litestream/releases/download/v0.5.16/litestream-0.5.16-linux-x86_64.tar.gz
+          printf '%s  %s\n' "$LITESTREAM_ARCHIVE_SHA256" "$archive" | sha256sum --check
+          mkdir "$install_dir"
+          tar --extract --gzip --file "$archive" --directory "$install_dir"
+      - name: Restore Zig compaction with Litestream v0.5.16
+        if: runner.os == 'Linux'
+        run: >-
+          mise exec -- zig build litestream-interop -Doptimize=ReleaseSafe
+          -Dlitestream="$RUNNER_TEMP/litestream-v0.5.16/litestream"
 
   portability:
     name: portability (${{ matrix.target }})

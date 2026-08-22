@@ -10,7 +10,8 @@ check is manual; pinned upstream vectors are identified in the evidence.
 | Decode current Go output | Tested | Byte-exact snapshot, incremental, no-checksum, maximum-page, and near-lock fixtures |
 | Decode Celld/Go v0.5.2 vector | Tested | Pinned byte-exact two-page, multi-index-entry fixture |
 | Real Litestream capture chain | Tested | Immutable v0.5.11 L0 snapshot plus five incrementals from Celld; exact artifact and per-prefix database hashes, nonzero WAL metadata, legacy frames, and final SQLite integrity/row checks |
-| Go decodes Zig output | Tested | Optional `zig build interop` uses the exact pinned Go module for a fresh snapshot plus byte-exact compaction outputs for checked merge, checked deletion, and a no-checksum chain |
+| Go decodes Zig output | Tested | Optional `zig build interop` uses the exact pinned Go module for a fresh snapshot, byte-exact synthetic compactions, and a byte-exact TX1–TX4 real-capture compaction with the expected database hash |
+| Real Litestream reads Zig compaction | Tested | Checksum-pinned v0.5.16 restores a current flagged Zig L1 object followed by the legacy-frame TX5/TX6 L0 tail; TX4/final image hashes, SQLite integrity, and all eight rows are exact |
 | Flagged raw LZ4 block frames | Tested | Zig reproduces complete pinned Go and Celld match-compressed files byte for byte |
 | Normal compressed matches | Tested | Exact pierrec/Celld vectors cover overlap, extension lengths, workspace reset, and 512..65536-byte pages |
 | Legacy unflagged v3 frames | Tested | Historical Go compressed and stored-block fixtures; canonical one-block 64 KiB profile |
