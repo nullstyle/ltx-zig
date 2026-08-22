@@ -217,6 +217,22 @@ lock release, and deterministic visible old/new selection after an application
 crash. They do not simulate a machine power loss; the sync/rename ordering and
 filesystem contract are the basis for that guarantee.
 
+`zig build sqlite-integration` also creates three bounded database images using
+the host SQLite library in WAL mode. It publishes A as a checksummed snapshot,
+then publishes image-derived A-to-B and B-to-C incrementals while the database
+grows and shrinks. The test requires an old reader to block a truncate
+checkpoint, a generation lease to block slot reuse, late LTX corruption to
+leave A authoritative, exact active and retained slot bytes, balanced lifecycle
+ownership, read-only semantic queries, `PRAGMA integrity_check`, and no SQLite
+sidecars after closure.
+
+Those incrementals are deterministic page differences between fully
+checkpointed SQLite images. They qualify staged application and publication;
+they are not a live WAL-frame capture implementation, do not preserve redundant
+same-byte WAL frames or WAL offsets and salts, and do not claim to stress the
+SQLite WAL-reset race described below. Hosted Linux and macOS lanes run this
+test in Debug and ReleaseSafe; local `act` rehearses only the Linux lane.
+
 ## Deployment boundary
 
 The adapter targets local filesystems on macOS and Linux whose rename, advisory

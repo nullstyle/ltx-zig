@@ -47,6 +47,7 @@ extern fn sqlite3_wal_checkpoint_v2(
 ) c_int;
 
 const sqlite_ok: c_int = 0;
+const sqlite_busy: c_int = 5;
 const sqlite_readonly: c_int = 8;
 const sqlite_row: c_int = 100;
 const sqlite_done: c_int = 101;
@@ -65,10 +66,10 @@ const database_journal_name = database_name ++ "-journal";
 const adversarial_directory_name = "db ?mode=rw&immutable=0#x%2F\xc3\xa9";
 const encoded_directory_name = "db%20%3Fmode%3Drw%26immutable%3D0%23x%252F%C3%A9";
 const page_size: u32 = 1024;
-const max_pages: u32 = 32;
+const max_pages: u32 = 64;
 const max_database_bytes = max_pages * page_size;
 const max_compressed_bytes: u32 = 1100;
-const max_ltx_bytes: u32 = 64 * 1024;
+const max_ltx_bytes: u32 = 128 * 1024;
 
 const codec_limits = ltx.Limits{
     .max_input_bytes = max_ltx_bytes,
@@ -76,10 +77,28 @@ const codec_limits = ltx.Limits{
     .max_pages = max_pages,
     .max_page_size = page_size,
     .max_compressed_page_size = max_compressed_bytes,
-    .max_page_index_bytes = 1024,
+    .max_page_index_bytes = 2048,
     .max_page_index_entries = max_pages,
     .max_varint_bytes = 10,
     .max_transaction_span = 1,
+};
+
+const DatabaseImage = struct {
+    bytes: [max_database_bytes]u8 = undefined,
+    length_bytes: u32 = 0,
+    page_count: u32 = 0,
+    checksum: ltx.Checksum = .init(0),
+};
+
+const EncodedTransition = struct {
+    length_bytes: usize,
+    verified: ltx.VerifiedLTX,
+};
+
+const ChainState = enum {
+    a,
+    b,
+    c,
 };
 
 const DatabasePath = struct {
@@ -256,7 +275,7 @@ test "real SQLite WAL lifecycle and checksummed generation apply" {
         lifecycle.lifecycle(),
         .{},
     );
-    const verified = try apply_snapshot(
+    const verified = try apply_encoded(
         &store,
         encoded_ltx[0..encoded_length],
         .contiguous,
@@ -281,6 +300,79 @@ test "real SQLite WAL lifecycle and checksummed generation apply" {
         database_dir,
         current,
         encoded_ltx[0..encoded_length],
+    );
+}
+
+test "real SQLite checksummed incrementals grow and shrink generations" {
+    try std.testing.expect(sqlite3_libversion_number() >= 3_022_000);
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const seed_path = try DatabasePath.init(temporary.dir, database_name);
+    try create_and_drain_wal_database(temporary.dir, seed_path.sentinel());
+    try expect_source_sidecars_absent(temporary.dir);
+
+    var image_a: DatabaseImage = .{};
+    var image_b: DatabaseImage = .{};
+    var image_c: DatabaseImage = .{};
+    try load_database_image(temporary.dir, database_name, &image_a);
+    var encoded_bytes: [max_ltx_bytes]u8 = undefined;
+    const encoded_a = try encode_transition(null, &image_a, 1, &encoded_bytes);
+
+    var lifecycle: ManagedLifecycle = .{};
+    var copy_workspace: [4096]u8 = undefined;
+    var store = try sqlite_store.Store.init(
+        std.testing.io,
+        temporary.dir,
+        &copy_workspace,
+        lifecycle.lifecycle(),
+        .{},
+    );
+    var access_storage: sqlite_store.GenerationAccessStorage = .{};
+    var access_workspace: sqlite_store.GenerationAccessWorkspace = .{};
+    _ = try apply_and_expect(&store, encoded_bytes[0..encoded_a.length_bytes], encoded_a);
+    const current_a = try open_and_expect_generation(
+        &store,
+        &lifecycle,
+        &access_storage,
+        &access_workspace,
+        temporary.dir,
+        &image_a,
+        1,
+        .a,
+        .a,
+    );
+
+    try mutate_seed_to_b(temporary.dir, seed_path.sentinel());
+    try load_database_image(temporary.dir, database_name, &image_b);
+    try std.testing.expect(image_b.page_count > image_a.page_count);
+    const encoded_b = try encode_transition(&image_a, &image_b, 2, &encoded_bytes);
+    try exercise_corrupt_then_valid_b(
+        &store,
+        &lifecycle,
+        &access_storage,
+        &access_workspace,
+        temporary.dir,
+        current_a,
+        &image_a,
+        &image_b,
+        &encoded_bytes,
+        encoded_b,
+    );
+
+    try mutate_seed_to_c(temporary.dir, seed_path.sentinel());
+    try load_database_image(temporary.dir, database_name, &image_c);
+    try std.testing.expect(image_c.page_count < image_b.page_count);
+    const encoded_c = try encode_transition(&image_b, &image_c, 3, &encoded_bytes);
+    try exercise_blocked_then_valid_c(
+        &store,
+        &lifecycle,
+        &access_storage,
+        &access_workspace,
+        temporary.dir,
+        &image_b,
+        &image_c,
+        encoded_bytes[0..encoded_c.length_bytes],
+        encoded_c,
     );
 }
 
@@ -358,7 +450,7 @@ fn exercise_competing_publication(
     try std.testing.expectEqual(current, (try competing_store.current()).?);
     try std.testing.expectError(
         error.ApplyBeginFailure,
-        apply_snapshot(&competing_store, encoded_ltx, .replace_snapshot),
+        apply_encoded(&competing_store, encoded_ltx, .replace_snapshot),
     );
     try std.testing.expectEqual(.store_busy, competing_store.last_failure());
     try expect_integer_query(database, "SELECT count(*) FROM items", 3);
@@ -366,7 +458,7 @@ fn exercise_competing_publication(
 
     try lifecycle.close();
     try expect_no_slot_sidecars(database_dir, current.slot);
-    _ = try apply_snapshot(&competing_store, encoded_ltx, .replace_snapshot);
+    _ = try apply_encoded(&competing_store, encoded_ltx, .replace_snapshot);
     const replaced = (try competing_store.current()).?;
     try std.testing.expectEqual(current.generation + 1, replaced.generation);
     try std.testing.expect(current.slot != replaced.slot);
@@ -377,6 +469,319 @@ fn exercise_competing_publication(
     try expect_no_slot_sidecars(database_dir, replaced.slot);
 }
 
+fn apply_and_expect(
+    store: *sqlite_store.Store,
+    bytes: []const u8,
+    encoded: EncodedTransition,
+) !ltx.VerifiedLTX {
+    const applied = try apply_encoded(store, bytes, .contiguous);
+    try std.testing.expectEqualDeep(encoded.verified, applied);
+    return applied;
+}
+
+fn open_and_expect_generation(
+    store: *sqlite_store.Store,
+    lifecycle: *ManagedLifecycle,
+    access_storage: *sqlite_store.GenerationAccessStorage,
+    access_workspace: *sqlite_store.GenerationAccessWorkspace,
+    database_dir: std.Io.Dir,
+    image: *const DatabaseImage,
+    generation: u64,
+    slot: sqlite_store.Slot,
+    state: ChainState,
+) !sqlite_store.Current {
+    const current = try lifecycle.open_generation(store, access_storage, access_workspace);
+    try expect_chain_generation(lifecycle, database_dir, current, image, generation, slot, state);
+    return current;
+}
+
+fn expect_chain_generation(
+    lifecycle: *ManagedLifecycle,
+    database_dir: std.Io.Dir,
+    current: sqlite_store.Current,
+    image: *const DatabaseImage,
+    generation: u64,
+    slot: sqlite_store.Slot,
+    state: ChainState,
+) !void {
+    try std.testing.expectEqual(generation, current.generation);
+    try std.testing.expectEqual(slot, current.slot);
+    try std.testing.expectEqual(@as(u64, @intFromEnum(state) + 1), current.position.txid.value);
+    try std.testing.expectEqual(image.checksum, current.position.post_apply_checksum);
+    try std.testing.expectEqual(page_size, current.page_size);
+    try std.testing.expectEqual(@as(u64, image.length_bytes), current.database_size_bytes);
+    try expect_file_image(database_dir, current.database_name(), image);
+    try expect_wal_header(database_dir, current.database_name());
+    try expect_no_slot_sidecars(database_dir, current.slot);
+
+    const database = lifecycle.database orelse return error.ExpectedDatabase;
+    try expect_text_query(database, "PRAGMA integrity_check", "ok");
+    try expect_integer_query(database, "SELECT length(payload) FROM stable WHERE id=1", 2048);
+    try expect_integer_query(
+        database,
+        "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='items_value_idx'",
+        1,
+    );
+    try expect_read_only_statement(database, "DELETE FROM items");
+    try expect_chain_rows(database, state);
+}
+
+fn expect_chain_rows(database: *SQLite, state: ChainState) !void {
+    switch (state) {
+        .a => {
+            try expect_integer_query(database, "SELECT count(*) FROM items", 3);
+            try expect_text_query(
+                database,
+                "SELECT group_concat(value, ',') FROM (SELECT value FROM items ORDER BY id)",
+                "alpha,beta,gamma",
+            );
+        },
+        .b => {
+            try expect_integer_query(database, "SELECT count(*) FROM items", 14);
+            try expect_text_query(database, "SELECT value FROM items WHERE id=2", "beta-v2");
+            try expect_integer_query(database, "SELECT count(*) FROM items WHERE id=3", 0);
+            try expect_integer_query(database, "SELECT count(*) FROM items WHERE id BETWEEN 4 AND 15", 12);
+            try expect_integer_query(database, "SELECT min(length(value)) FROM items WHERE id>=4", 708);
+        },
+        .c => {
+            try expect_integer_query(database, "SELECT count(*) FROM items", 2);
+            try expect_text_query(
+                database,
+                "SELECT group_concat(value, ',') FROM (SELECT value FROM items ORDER BY id)",
+                "alpha-v3,beta-v2",
+            );
+        },
+    }
+}
+
+fn exercise_corrupt_then_valid_b(
+    store: *sqlite_store.Store,
+    lifecycle: *ManagedLifecycle,
+    access_storage: *sqlite_store.GenerationAccessStorage,
+    access_workspace: *sqlite_store.GenerationAccessWorkspace,
+    database_dir: std.Io.Dir,
+    current_a: sqlite_store.Current,
+    image_a: *const DatabaseImage,
+    image_b: *const DatabaseImage,
+    encoded_bytes: *[max_ltx_bytes]u8,
+    encoded_b: EncodedTransition,
+) !void {
+    try expect_incremental(encoded_b, image_a, image_b, 2);
+    try std.testing.expect(encoded_b.verified.page_count < image_b.page_count);
+    const checksum_byte = encoded_b.length_bytes - 1;
+    encoded_bytes[checksum_byte] ^= 1;
+    try std.testing.expectError(
+        error.ChecksumMismatch,
+        apply_encoded(store, encoded_bytes[0..encoded_b.length_bytes], .contiguous),
+    );
+    encoded_bytes[checksum_byte] ^= 1;
+    try std.testing.expectEqual(lifecycle.quiesce_count, lifecycle.release_count);
+    try std.testing.expectEqual(current_a, (try store.current()).?);
+    try expect_file_image(database_dir, current_a.database_name(), image_a);
+
+    _ = try open_and_expect_generation(
+        store,
+        lifecycle,
+        access_storage,
+        access_workspace,
+        database_dir,
+        image_a,
+        1,
+        .a,
+        .a,
+    );
+    _ = try apply_and_expect(store, encoded_bytes[0..encoded_b.length_bytes], encoded_b);
+    _ = try open_and_expect_generation(
+        store,
+        lifecycle,
+        access_storage,
+        access_workspace,
+        database_dir,
+        image_b,
+        2,
+        .b,
+        .b,
+    );
+    try expect_file_image(database_dir, sqlite_store.database_a_name, image_a);
+    try std.testing.expectEqual(lifecycle.quiesce_count, lifecycle.release_count);
+}
+
+fn exercise_blocked_then_valid_c(
+    store: *sqlite_store.Store,
+    lifecycle: *ManagedLifecycle,
+    access_storage: *sqlite_store.GenerationAccessStorage,
+    access_workspace: *sqlite_store.GenerationAccessWorkspace,
+    database_dir: std.Io.Dir,
+    image_b: *const DatabaseImage,
+    image_c: *const DatabaseImage,
+    encoded_bytes: []const u8,
+    encoded_c: EncodedTransition,
+) !void {
+    try expect_incremental(encoded_c, image_b, image_c, 3);
+    try lifecycle.hold_read_transaction();
+    var competing_lifecycle: ManagedLifecycle = .{};
+    var competing_copy_workspace: [4096]u8 = undefined;
+    var competing_store = try sqlite_store.Store.init(
+        std.testing.io,
+        database_dir,
+        &competing_copy_workspace,
+        competing_lifecycle.lifecycle(),
+        .{},
+    );
+    try std.testing.expectError(
+        error.ApplyBeginFailure,
+        apply_encoded(&competing_store, encoded_bytes, .contiguous),
+    );
+    try std.testing.expectEqual(.store_busy, competing_store.last_failure());
+    try std.testing.expectEqual(
+        competing_lifecycle.quiesce_count,
+        competing_lifecycle.release_count,
+    );
+    try expect_chain_rows(lifecycle.database.?, .b);
+    try expect_file_image(database_dir, sqlite_store.database_b_name, image_b);
+
+    try lifecycle.close();
+    _ = try apply_and_expect(&competing_store, encoded_bytes, encoded_c);
+    _ = try open_and_expect_generation(
+        store,
+        lifecycle,
+        access_storage,
+        access_workspace,
+        database_dir,
+        image_c,
+        3,
+        .a,
+        .c,
+    );
+    try expect_file_image(database_dir, sqlite_store.database_b_name, image_b);
+    try lifecycle.close();
+    try expect_no_slot_sidecars(database_dir, .a);
+    try expect_no_slot_sidecars(database_dir, .b);
+}
+
+fn mutate_seed_to_b(
+    database_dir: std.Io.Dir,
+    path: [:0]const u8,
+) !void {
+    var writer: ?*SQLite = try open_database(
+        path,
+        sqlite_open_readwrite | sqlite_open_fullmutex,
+    );
+    defer {
+        if (writer) |database| _ = sqlite3_close(database);
+    }
+    try configure_wal(writer.?);
+
+    var reader: ?*SQLite = try open_database(path, sqlite_open_readonly | sqlite_open_fullmutex);
+    var held_reader: ?*Statement = null;
+    defer {
+        if (held_reader) |statement| _ = sqlite3_finalize(statement);
+        if (reader) |database| _ = sqlite3_close(database);
+    }
+    try execute(reader.?, "BEGIN");
+    held_reader = try prepare(reader.?, "SELECT value FROM items ORDER BY id");
+    try expect_result(reader.?, sqlite3_step(held_reader.?), sqlite_row);
+    try expect_statement_text(held_reader.?, "alpha");
+
+    try execute(writer.?, "BEGIN IMMEDIATE");
+    try execute(writer.?, "UPDATE items SET value='beta-v2' WHERE id=2");
+    try execute(writer.?, "DELETE FROM items WHERE id=3");
+    try execute(
+        writer.?,
+        "WITH RECURSIVE seq(id) AS (SELECT 4 UNION ALL SELECT id+1 FROM seq WHERE id<15) " ++
+            "INSERT INTO items SELECT id,printf('bulk-%02d-',id)||hex(zeroblob(350)) FROM seq",
+    );
+    try execute(writer.?, "COMMIT");
+    try expect_chain_rows(writer.?, .b);
+    try std.testing.expect(try path_size(database_dir, database_wal_name) > 0);
+    try expect_result(reader.?, sqlite3_step(held_reader.?), sqlite_row);
+    try expect_statement_text(held_reader.?, "beta");
+    try expect_result(reader.?, sqlite3_step(held_reader.?), sqlite_row);
+    try expect_statement_text(held_reader.?, "gamma");
+    try expect_result(reader.?, sqlite3_step(held_reader.?), sqlite_done);
+
+    var log_frames: c_int = -1;
+    var checkpointed_frames: c_int = -1;
+    try std.testing.expectEqual(sqlite_busy, sqlite3_wal_checkpoint_v2(
+        writer.?,
+        "main",
+        sqlite_checkpoint_truncate,
+        &log_frames,
+        &checkpointed_frames,
+    ));
+    try std.testing.expect(try path_size(database_dir, database_wal_name) > 0);
+    try std.testing.expectEqual(sqlite_ok, sqlite3_finalize(held_reader));
+    held_reader = null;
+    try std.testing.expectEqual(sqlite_ok, sqlite3_close(reader));
+    reader = null;
+
+    try drain_wal(writer.?);
+    try std.testing.expectEqual(sqlite_ok, sqlite3_close(writer));
+    writer = null;
+    try expect_source_sidecars_absent(database_dir);
+}
+
+fn mutate_seed_to_c(database_dir: std.Io.Dir, path: [:0]const u8) !void {
+    var writer: ?*SQLite = try open_database(
+        path,
+        sqlite_open_readwrite | sqlite_open_fullmutex,
+    );
+    defer {
+        if (writer) |database| _ = sqlite3_close(database);
+    }
+    try configure_wal(writer.?);
+    try execute(writer.?, "BEGIN IMMEDIATE");
+    try execute(writer.?, "DELETE FROM items WHERE id>=4");
+    try execute(writer.?, "UPDATE items SET value='alpha-v3' WHERE id=1");
+    try execute(writer.?, "COMMIT");
+    try expect_chain_rows(writer.?, .c);
+    try drain_wal(writer.?);
+    try std.testing.expectEqual(sqlite_ok, sqlite3_close(writer));
+    writer = null;
+    try expect_source_sidecars_absent(database_dir);
+}
+
+fn configure_wal(database: *SQLite) !void {
+    try execute(database, "PRAGMA journal_mode=WAL");
+    try execute(database, "PRAGMA synchronous=FULL");
+    try execute(database, "PRAGMA wal_autocheckpoint=0");
+    try expect_integer_query(database, "PRAGMA auto_vacuum", 1);
+}
+
+fn drain_wal(database: *SQLite) !void {
+    var persist_wal: c_int = 0;
+    try expect_result(
+        database,
+        sqlite3_file_control(database, "main", sqlite_fcntl_persist_wal, &persist_wal),
+        sqlite_ok,
+    );
+    var log_frames: c_int = -1;
+    var checkpointed_frames: c_int = -1;
+    try expect_result(database, sqlite3_wal_checkpoint_v2(
+        database,
+        "main",
+        sqlite_checkpoint_truncate,
+        &log_frames,
+        &checkpointed_frames,
+    ), sqlite_ok);
+    try std.testing.expectEqual(@as(c_int, 0), log_frames);
+    try std.testing.expectEqual(@as(c_int, 0), checkpointed_frames);
+}
+
+fn expect_source_sidecars_absent(database_dir: std.Io.Dir) !void {
+    try std.testing.expect(!try path_exists(database_dir, database_wal_name));
+    try std.testing.expect(!try path_exists(database_dir, database_shm_name));
+    try std.testing.expect(!try path_exists(database_dir, database_journal_name));
+}
+
+fn path_size(database_dir: std.Io.Dir, name: []const u8) !u64 {
+    return (try database_dir.statFile(
+        std.testing.io,
+        name,
+        .{ .follow_symlinks = false },
+    )).size;
+}
+
 fn create_and_drain_wal_database(dir: std.Io.Dir, path: [:0]const u8) !void {
     const writer = try open_database(
         path,
@@ -384,11 +789,15 @@ fn create_and_drain_wal_database(dir: std.Io.Dir, path: [:0]const u8) !void {
     );
     errdefer _ = sqlite3_close(writer);
     try execute(writer, "PRAGMA page_size=1024");
+    try execute(writer, "PRAGMA auto_vacuum=FULL");
     try execute(writer, "PRAGMA journal_mode=WAL");
     try execute(writer, "PRAGMA synchronous=FULL");
     try execute(writer, "PRAGMA wal_autocheckpoint=0");
     try execute(writer, "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
+    try execute(writer, "CREATE INDEX items_value_idx ON items(value)");
+    try execute(writer, "CREATE TABLE stable(id INTEGER PRIMARY KEY, payload BLOB NOT NULL)");
     try execute(writer, "INSERT INTO items VALUES(1,'alpha'),(2,'beta'),(3,'gamma')");
+    try execute(writer, "INSERT INTO stable VALUES(1,zeroblob(2048))");
     var persist_wal: c_int = 1;
     try expect_result(
         writer,
@@ -412,28 +821,22 @@ fn create_and_drain_wal_database(dir: std.Io.Dir, path: [:0]const u8) !void {
     try std.testing.expectEqual(sqlite_ok, sqlite3_close(reader));
     reader = null;
 
-    persist_wal = 0;
-    try expect_result(
-        writer,
-        sqlite3_file_control(writer, "main", sqlite_fcntl_persist_wal, &persist_wal),
-        sqlite_ok,
-    );
-    var log_frames: c_int = -1;
-    var checkpointed_frames: c_int = -1;
-    try expect_result(writer, sqlite3_wal_checkpoint_v2(
-        writer,
-        "main",
-        sqlite_checkpoint_truncate,
-        &log_frames,
-        &checkpointed_frames,
-    ), sqlite_ok);
-    try std.testing.expectEqual(@as(c_int, 0), log_frames);
-    try std.testing.expectEqual(@as(c_int, 0), checkpointed_frames);
+    try drain_wal(writer);
     try std.testing.expectEqual(sqlite_ok, sqlite3_close(writer));
 }
 
 fn encode_seed_snapshot(dir: std.Io.Dir, output: []u8) !usize {
-    var database = try dir.openFile(std.testing.io, database_name, .{
+    var image: DatabaseImage = .{};
+    try load_database_image(dir, database_name, &image);
+    return (try encode_transition(null, &image, 1, output)).length_bytes;
+}
+
+fn load_database_image(
+    dir: std.Io.Dir,
+    name: []const u8,
+    image: *DatabaseImage,
+) !void {
+    var database = try dir.openFile(std.testing.io, name, .{
         .mode = .read_only,
         .allow_directory = false,
         .follow_symlinks = false,
@@ -441,10 +844,35 @@ fn encode_seed_snapshot(dir: std.Io.Dir, output: []u8) !usize {
     defer database.close(std.testing.io);
     const stat = try database.stat(std.testing.io);
     if (stat.size == 0 or stat.size % page_size != 0) return error.InvalidDatabaseSize;
-    const page_count_u64 = stat.size / page_size;
-    if (page_count_u64 > max_pages) return error.DatabaseTooLarge;
-    const page_count: u32 = @intCast(page_count_u64);
+    if (stat.size > image.bytes.len) return error.DatabaseTooLarge;
+    image.length_bytes = @intCast(stat.size);
+    image.page_count = @intCast(stat.size / page_size);
+    const destination = image.bytes[0..image.length_bytes];
+    const read = try database.readPositionalAll(std.testing.io, destination, 0);
+    if (read != destination.len) return error.ShortDatabaseRead;
+    try validate_database_image(image);
+    image.checksum = try database_image_checksum(image);
+}
 
+fn validate_database_image(image: *const DatabaseImage) !void {
+    try std.testing.expectEqualStrings("SQLite format 3\x00", image.bytes[0..16]);
+    try std.testing.expectEqual(
+        page_size,
+        @as(u32, std.mem.readInt(u16, image.bytes[16..18], .big)),
+    );
+    try std.testing.expectEqualSlices(u8, &.{ 2, 2 }, image.bytes[18..20]);
+    try std.testing.expectEqual(
+        image.page_count,
+        std.mem.readInt(u32, image.bytes[28..32], .big),
+    );
+}
+
+fn encode_transition(
+    previous: ?*const DatabaseImage,
+    next: *const DatabaseImage,
+    txid: u64,
+    output: []u8,
+) !EncodedTransition {
     var sink = ltx.SliceWriter.init(output);
     var compressed_workspace: [max_compressed_bytes]u8 = undefined;
     var compression_workspace: ltx.LZ4CompressionWorkspace = undefined;
@@ -457,29 +885,104 @@ fn encode_seed_snapshot(dir: std.Io.Dir, output: []u8) !usize {
         &compression_workspace,
         &index_workspace,
     );
-    try encoder.write_header(snapshot_header(page_count));
-    var rolling = ltx.rolling_checksum_initial();
-    var page: [page_size]u8 = undefined;
-    var page_index: u32 = 0;
-    while (page_index < page_count) : (page_index += 1) {
-        const page_number = page_index + 1;
-        const read = try database.readPositionalAll(
-            std.testing.io,
-            &page,
-            @as(u64, page_index) * page_size,
-        );
-        if (read != page.len) return error.ShortDatabaseRead;
-        try encoder.write_page(page_number, &page);
-        rolling = try ltx.rolling_checksum_add(
-            rolling,
-            try ltx.checksum_page(page_number, &page),
-        );
+    try encoder.write_header(transition_header(previous, next, txid));
+    const lock_page = try ltx.lock_page_number(page_size);
+    var page_number: u32 = 1;
+    while (page_number <= next.page_count) : (page_number += 1) {
+        if (page_number == lock_page) continue;
+        const next_page = database_page(next, page_number);
+        const changed = if (previous) |prior|
+            page_number > prior.page_count or
+                !std.mem.eql(u8, database_page(prior, page_number), next_page)
+        else
+            true;
+        if (changed) try encoder.write_page(page_number, next_page);
     }
-    _ = try encoder.finish(rolling);
-    return sink.written().len;
+    const verified = try encoder.finish(next.checksum);
+    return .{ .length_bytes = sink.written().len, .verified = verified };
 }
 
-fn apply_snapshot(
+fn transition_header(
+    previous: ?*const DatabaseImage,
+    next: *const DatabaseImage,
+    txid: u64,
+) ltx.Header {
+    return .{
+        .flags = 0,
+        .page_size = page_size,
+        .commit = next.page_count,
+        .min_txid = .init(txid),
+        .max_txid = .init(txid),
+        .timestamp_ms = @intCast(txid),
+        .pre_apply_checksum = if (previous) |prior| prior.checksum else .init(0),
+        .wal_offset = 0,
+        .wal_size = 0,
+        .wal_salt_1 = 0,
+        .wal_salt_2 = 0,
+        .node_id = 0,
+    };
+}
+
+fn database_image_checksum(image: *const DatabaseImage) !ltx.Checksum {
+    var checksum = ltx.rolling_checksum_initial();
+    const lock_page = try ltx.lock_page_number(page_size);
+    var page_number: u32 = 1;
+    while (page_number <= image.page_count) : (page_number += 1) {
+        if (page_number == lock_page) continue;
+        checksum = try ltx.rolling_checksum_add(
+            checksum,
+            try ltx.checksum_page(page_number, database_page(image, page_number)),
+        );
+    }
+    return checksum;
+}
+
+fn database_page(image: *const DatabaseImage, page_number: u32) []const u8 {
+    std.debug.assert(page_number >= 1 and page_number <= image.page_count);
+    const start: usize = @intCast((page_number - 1) * page_size);
+    return image.bytes[start .. start + page_size];
+}
+
+fn expect_incremental(
+    encoded: EncodedTransition,
+    previous: *const DatabaseImage,
+    next: *const DatabaseImage,
+    txid: u64,
+) !void {
+    try std.testing.expect(!encoded.verified.header.is_snapshot());
+    try std.testing.expect(encoded.verified.page_count > 0);
+    try std.testing.expectEqual(txid, encoded.verified.header.min_txid.value);
+    try std.testing.expectEqual(txid, encoded.verified.header.max_txid.value);
+    try std.testing.expectEqual(previous.checksum, encoded.verified.header.pre_apply_checksum);
+    try std.testing.expectEqual(next.checksum, encoded.verified.trailer.post_apply_checksum);
+    try std.testing.expectEqual(next.page_count, encoded.verified.header.commit);
+}
+
+fn expect_file_image(
+    dir: std.Io.Dir,
+    name: []const u8,
+    expected: *const DatabaseImage,
+) !void {
+    var file = try dir.openFile(std.testing.io, name, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer file.close(std.testing.io);
+    const stat = try file.stat(std.testing.io);
+    try std.testing.expectEqual(@as(u64, expected.length_bytes), stat.size);
+    var actual: [max_database_bytes]u8 = undefined;
+    const destination = actual[0..expected.length_bytes];
+    const read = try file.readPositionalAll(std.testing.io, destination, 0);
+    try std.testing.expectEqual(destination.len, read);
+    try std.testing.expectEqualSlices(
+        u8,
+        expected.bytes[0..expected.length_bytes],
+        destination,
+    );
+}
+
+fn apply_encoded(
     store: *sqlite_store.Store,
     encoded: []const u8,
     mode: ltx.ApplyMode,
@@ -503,23 +1006,6 @@ fn apply_snapshot(
         &index_workspace,
     );
     return applier.apply();
-}
-
-fn snapshot_header(page_count: u32) ltx.Header {
-    return .{
-        .flags = 0,
-        .page_size = page_size,
-        .commit = page_count,
-        .min_txid = .init(1),
-        .max_txid = .init(1),
-        .timestamp_ms = 0,
-        .pre_apply_checksum = .init(0),
-        .wal_offset = 0,
-        .wal_size = 0,
-        .wal_salt_1 = 0,
-        .wal_salt_2 = 0,
-        .node_id = 0,
-    };
 }
 
 fn open_database(path: [:0]const u8, flags: c_int) !*SQLite {
@@ -570,11 +1056,15 @@ fn expect_text_query(database: *SQLite, sql: [*:0]const u8, expected: []const u8
     const statement = try prepare(database, sql);
     defer _ = sqlite3_finalize(statement);
     try expect_result(database, sqlite3_step(statement), sqlite_row);
+    try expect_statement_text(statement, expected);
+    try expect_result(database, sqlite3_step(statement), sqlite_done);
+}
+
+fn expect_statement_text(statement: *Statement, expected: []const u8) !void {
     const text = sqlite3_column_text(statement, 0) orelse return error.SQLiteNullText;
     const length = sqlite3_column_bytes(statement, 0);
     if (length < 0) return error.SQLiteInvalidText;
     try std.testing.expectEqualStrings(expected, text[0..@intCast(length)]);
-    try expect_result(database, sqlite3_step(statement), sqlite_done);
 }
 
 fn expect_read_only_statement(database: *SQLite, sql: [*:0]const u8) !void {

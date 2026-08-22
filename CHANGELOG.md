@@ -17,6 +17,9 @@ All notable changes to this project are documented here. The format follows
 - Bounded storage-neutral compaction and staged apply orchestration.
 - Optional crash-qualified two-generation SQLite storage with typed read-only
   generation leases and explicit recovery after indeterminate publication.
+- Real WAL-mode SQLite A-to-B-to-C qualification for checksummed snapshot and
+  incremental publication, including growth, shrink, blocked reset and lease
+  paths, late input corruption, exact generation bytes, and semantic queries.
 - Pinned Go and Celld interoperability fixtures, mutation and fuzz suites, and
   byte-for-byte Go-oracle compaction checks.
 - MIT licensing with the required separate BSD-3-Clause LZ4 attribution.

@@ -43,7 +43,8 @@ also used as a secondary format and deployment reference:
   connection lifecycle hooks, typed shared generation access, two immutable
   database generations, a checksummed atomic manifest with a durable empty
   baseline, sidecar rejection, durability barriers, and explicit recovery after
-  an indeterminate commit.
+  an indeterminate commit, qualified with real checksummed snapshot and
+  incremental SQLite generations that grow and shrink.
 
 The decoder covers both page encodings emitted across upstream v3 history. The
 encoder always emits the current flagged raw-block representation. Valid LZ4
@@ -307,6 +308,8 @@ constraints and crash outcomes are in [the SQLite store guide](docs/sqlite-store
 
 Store changes are qualified with real child-process termination at every
 baseline and publication sync/rename boundary. `zig build sqlite-integration`
-additionally exercises the host SQLite library's WAL drain, read-only generation
-access, data queries, and `PRAGMA integrity_check` without linking SQLite into
-either library module.
+additionally builds a real WAL-mode SQLite A -> B -> C chain, applies its
+checksummed snapshot and incrementals through alternating generations, and
+checks blocked WAL reset and publication, exact bytes, read-only queries,
+retained prior-generation bytes, and `PRAGMA integrity_check`. SQLite remains
+linked only into the integration test executable, not either library module.
