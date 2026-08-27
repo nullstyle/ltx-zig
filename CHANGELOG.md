@@ -31,7 +31,10 @@ version is zero, the Zig source API is intentionally unstable.
 
 - The S3 conformance, TLS, and virtual-host lanes each run their own
   MinIO instance in the gate runner; manual `zig build s3-integration`
-  without the runner skips the TLS and virtual-host lanes.
+  without the runner skips the TLS and virtual-host lanes. The
+  virtual-host lane runs on Linux only — some macOS CI runners do not
+  resolve `*.localhost` to loopback — while plain and TLS lanes cover
+  both platforms.
 ## [0.3.0] - 2026-08-27
 
 ### Added
