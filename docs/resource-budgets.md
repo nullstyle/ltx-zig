@@ -49,6 +49,39 @@ independently bounded by `Limits`. The output encoder owns its own workspace.
 `CompactionLimits.max_total_pages` separately bounds all decoded page events,
 including pages later overwritten or dropped. `K` must be at least one.
 
+## WAL page-map workspace
+
+The `ltx_wal` module adds one scan operation with its own workspace. Let
+`A = ltx_wal.Limits.max_pages`; the committed-page-map scan requires:
+
+```text
+wal page-map bytes = A * @sizeOf(ltx_wal.PageSlot)
+  + A * @sizeOf(u32)
+  + ceil(A / 8)
+  + A * @sizeOf(ltx_wal.PageMapEntry)
+```
+
+covering the per-page committed/pending slots, the in-transaction page list,
+its dedupe bitmap, and the ascending result entries. The `Reader` value and
+the whole WAL input slice are separate resources: `ltx_wal` borrows frame
+pages directly from the caller's slice and performs no allocation.
+`max_frames` bounds every scan loop and must cover the whole input including
+any torn tail. `wal_page_map_workspace_bytes` in
+[`benchmarks/resource_model.zig`](../benchmarks/resource_model.zig) checks
+this formula.
+
+## Replication-layer workspaces
+
+The replication modules add no formulas beyond the two above; they compose
+them. `ltx_replica` executors use one decoder workspace per restore or
+compaction input plus one encoder workspace for compaction output, exactly as
+the codec table prescribes, with the fetched-object storage bounded by
+`Limits.max_input_bytes` per input. `ltx_capture` uses the WAL page-map
+workspace above, the encoder workspace for the emitted L0, one
+`Limits.max_page_size` page buffer for database-file reads, and two
+plain storage regions bounded by the accepted WAL size and
+`Limits.max_output_bytes` respectively.
+
 ## Compression capacity
 
 For a valid SQLite page size `P`, the current fast LZ4 encoder's checked output

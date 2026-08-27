@@ -52,6 +52,24 @@
   before handing off changes. Run `mise exec -- zig build interop` for encoder
   compactor, or wire-format changes when Go is available; normal tests stay
   network-free.
+- The replication modules extend the core without weakening it: `ltx_wal`
+  parses SQLite WAL bytes over caller-owned slices and workspaces, `ltx_object`
+  defines the storage-neutral object contract plus the filesystem backend,
+  `ltx_replica` holds the level ladder and pure planners plus the restore and
+  compaction executors, and `ltx_capture` holds the SQLite capture session.
+  All four stay allocation-free after initialization and reuse the core's
+  limits, poisoning, and explicit-width discipline. The first three import
+  only `std` and `ltx`; only `ltx_capture` touches SQLite, through a
+  hand-written extern surface that the host build links.
+- For `ltx_wal`, `ltx_object`, `ltx_replica`, or `ltx_capture` changes, also
+  run `mise exec -- zig build capture-integration -Doptimize=ReleaseSafe`,
+  which links the host system SQLite and libc for the test executable only;
+  no library module may link either.
+- For `ltx_s3` changes, run `mise run s3-integration`. The runner script
+  starts the pinned MinIO tool outside the test executable — MinIO spawned
+  from inside a Zig test binary hangs on this host platform — and always
+  tears the server down. The SigV4 clock is injected; never read ambient
+  time inside the module.
 - For `ltx_sqlite` store or lifecycle changes, also run `mise exec -- zig build
   sqlite-integration -Doptimize=ReleaseSafe`. This host-only test may link the
   system SQLite and libc; neither library module may do so.

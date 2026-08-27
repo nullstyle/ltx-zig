@@ -191,6 +191,11 @@ snapshot through private staging and atomic publication in a fixed-capacity
 single-owner memory backend. Its callback has no concurrent observers and does
 no fallible work after the publication boundary; durable or concurrent backends
 must supply their own atomic commit mechanism.
+[`examples/replicate_once.zig`](examples/replicate_once.zig) is the
+consumer template for the replication modules: live SQLite capture through a
+checkpoint, tree listing, and a full restore, in one run of
+`mise exec -- zig build example-replicate-once` (it links the host SQLite
+for the executable only).
 [`examples/sqlite_store_lifecycle.zig`](examples/sqlite_store_lifecycle.zig)
 demonstrates store initialization and recovery, verified snapshot publication,
 a held generation access and SQLite open specification, and the lock/lifecycle
@@ -372,11 +377,31 @@ while (event_count < decoder.event_budget()) : (event_count += 1) {
 ```
 
 See [docs/design.md](docs/design.md) for trust, memory, and state-machine
-details, [docs/compaction.md](docs/compaction.md) for the bounded merge API,
+details, [docs/replication.md](docs/replication.md) for the replication
+deployment contract, [docs/compaction.md](docs/compaction.md) for the bounded merge API,
 [docs/apply.md](docs/apply.md) for the storage backend contract, and
 [docs/resource-budgets.md](docs/resource-budgets.md) for workspace formulas.
 The exact feature matrix is in
 [docs/compatibility.md](docs/compatibility.md).
+
+## Replication modules
+
+Four additional modules extend the package toward a full SQLite-to-S3
+replication library; see [docs/replication-roadmap.md](docs/replication-roadmap.md)
+for the plan and current status. Import `ltx_wal` for bounded SQLite WAL
+parsing with committed page maps and salt censes, `ltx_object` for the
+storage-neutral object contract with its filesystem backend and conformance
+suite, `ltx_s3` for S3-compatible stores (path-style SigV4, paginated
+listings, object read/write/delete, and bucket creation over the
+standard-library HTTP client), `ltx_replica` for the Litestream level ladder, restore planning, and
+restore/compaction/retention executors over caller-owned workspaces, and
+`ltx_capture` for the SQLite capture session that publishes no-checksum L0
+transitions through an object client. The first three import only `std` and
+`ltx`; `ltx_capture` declares its own minimal SQLite C surface and expects
+the host build to link SQLite. Its live gate is
+`mise exec -- zig build capture-integration -Doptimize=ReleaseSafe`, and the
+S3 backend's gate is `mise run s3-integration`, which starts a pinned local
+MinIO server and runs the backend-agnostic conformance suite against it.
 
 ## Quiescent SQLite store
 

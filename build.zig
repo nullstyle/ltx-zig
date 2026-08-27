@@ -32,6 +32,84 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "ltx", .module = host_ltx }},
     });
+    const ltx_wal = b.addModule("ltx_wal", .{
+        .root_source_file = b.path("src/wal.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const host_wal = b.createModule(.{
+        .root_source_file = b.path("src/wal.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const ltx_object_module = b.addModule("ltx_object", .{
+        .root_source_file = b.path("src/object.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ltx", .module = ltx }},
+    });
+    const host_object = b.createModule(.{
+        .root_source_file = b.path("src/object.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ltx", .module = host_ltx }},
+    });
+    _ = b.addModule("ltx_replica", .{
+        .root_source_file = b.path("src/replica.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ltx", .module = ltx },
+            .{ .name = "ltx_object", .module = ltx_object_module },
+        },
+    });
+    const host_replica = b.createModule(.{
+        .root_source_file = b.path("src/replica.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ltx", .module = host_ltx },
+            .{ .name = "ltx_object", .module = host_object },
+        },
+    });
+    _ = b.addModule("ltx_capture", .{
+        .root_source_file = b.path("src/capture.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ltx", .module = ltx },
+            .{ .name = "ltx_wal", .module = ltx_wal },
+            .{ .name = "ltx_object", .module = ltx_object_module },
+        },
+    });
+    const host_capture = b.createModule(.{
+        .root_source_file = b.path("src/capture.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ltx", .module = host_ltx },
+            .{ .name = "ltx_wal", .module = host_wal },
+            .{ .name = "ltx_object", .module = host_object },
+        },
+    });
+    _ = b.addModule("ltx_s3", .{
+        .root_source_file = b.path("src/s3.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ltx", .module = ltx },
+            .{ .name = "ltx_object", .module = ltx_object_module },
+        },
+    });
+    const host_s3 = b.createModule(.{
+        .root_source_file = b.path("src/s3.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ltx", .module = host_ltx },
+            .{ .name = "ltx_object", .module = host_object },
+        },
+    });
     const host_lz4 = b.createModule(.{
         .root_source_file = b.path("src/lz4_block.zig"),
         .target = b.graph.host,
@@ -49,6 +127,50 @@ pub fn build(b: *std.Build) void {
         .name = "ltx-sqlite-portability-tests",
         .root_module = ltx_sqlite,
     });
+    const wal_unit_tests = b.addTest(.{ .root_module = ltx_wal });
+    const run_wal_unit_tests = b.addRunArtifact(wal_unit_tests);
+    const wal_tests = b.addTest(.{
+        .name = "ltx-wal-fixture-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/wal.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ltx_wal", .module = host_wal }},
+        }),
+    });
+    const run_wal_tests = b.addRunArtifact(wal_tests);
+    run_wal_tests.has_side_effects = true;
+    const object_tests = b.addTest(.{
+        .name = "ltx-object-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/object.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ltx", .module = host_ltx },
+                .{ .name = "ltx_object", .module = host_object },
+            },
+        }),
+    });
+    const run_object_tests = b.addRunArtifact(object_tests);
+    run_object_tests.has_side_effects = true;
+    const replica_tests = b.addTest(.{
+        .name = "ltx-replica-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/replica.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ltx", .module = host_ltx },
+                .{ .name = "ltx_object", .module = host_object },
+                .{ .name = "ltx_replica", .module = host_replica },
+            },
+        }),
+    });
+    const run_replica_tests = b.addRunArtifact(replica_tests);
+    run_replica_tests.has_side_effects = true;
+    const s3_unit_tests = b.addTest(.{ .root_module = host_s3 });
+    const run_s3_unit_tests = b.addRunArtifact(s3_unit_tests);
 
     const interoperability = b.addTest(.{
         .root_module = b.createModule(.{
@@ -205,6 +327,32 @@ pub fn build(b: *std.Build) void {
         "Run live host-SQLite WAL and generation-store integration tests",
     );
     sqlite_integration_step.dependOn(&run_sqlite_integration_tests.step);
+    const capture_integration_module = b.createModule(.{
+        .root_source_file = b.path("tests/capture.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "ltx", .module = host_ltx },
+            .{ .name = "ltx_wal", .module = host_wal },
+            .{ .name = "ltx_object", .module = host_object },
+            .{ .name = "ltx_capture", .module = host_capture },
+            .{ .name = "ltx_replica", .module = host_replica },
+        },
+    });
+    capture_integration_module.linkSystemLibrary("sqlite3", .{});
+    const capture_integration_tests = b.addTest(.{
+        .name = "ltx-capture-integration-tests",
+        .root_module = capture_integration_module,
+    });
+    const run_capture_integration_tests = b.addRunArtifact(capture_integration_tests);
+    run_capture_integration_tests.has_side_effects = true;
+    const capture_integration_step = b.step(
+        "capture-integration",
+        "Run live host-SQLite capture and restore integration tests",
+    );
+    capture_integration_step.dependOn(&run_capture_integration_tests.step);
+
     const fuzz_lz4_tests = b.addTest(.{
         .name = "ltx-lz4-fuzz-tests",
         .root_module = b.createModule(.{
@@ -216,11 +364,55 @@ pub fn build(b: *std.Build) void {
     });
     const run_fuzz_lz4_tests = b.addRunArtifact(fuzz_lz4_tests);
     run_fuzz_lz4_tests.has_side_effects = true;
+    const minio_path = b.option(
+        []const u8,
+        "minio",
+        "Path to the MinIO server binary for the s3-integration gate",
+    ) orelse "minio";
+    const s3_gate_options = b.addOptions();
+    s3_gate_options.addOption([]const u8, "minio_path", minio_path);
+    s3_gate_options.addOption([]const u8, "minio_ca", b.option(
+        []const u8,
+        "minio-ca",
+        "CA certificate file for the TLS gate lane (empty disables it)",
+    ) orelse "");
+    s3_gate_options.addOption(u16, "minio_tls_port", b.option(
+        u16,
+        "minio-tls-port",
+        "TLS port of the MinIO gate instance",
+    ) orelse 0);
+    const s3_gate_options_module = s3_gate_options.createModule();
+    const s3_integration_tests = b.addTest(.{
+        .name = "ltx-s3-integration-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/s3.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ltx", .module = host_ltx },
+                .{ .name = "ltx_object", .module = host_object },
+                .{ .name = "ltx_replica", .module = host_replica },
+                .{ .name = "ltx_s3", .module = host_s3 },
+                .{ .name = "s3_options", .module = s3_gate_options_module },
+            },
+        }),
+    });
+    const run_s3_integration_tests = b.addRunArtifact(s3_integration_tests);
+    run_s3_integration_tests.has_side_effects = true;
+    const s3_integration_step = b.step(
+        "s3-integration",
+        "Run the S3 backend conformance gate against local MinIO",
+    );
+    s3_integration_step.dependOn(&run_s3_integration_tests.step);
+
     const resource_model = b.createModule(.{
         .root_source_file = b.path("benchmarks/resource_model.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "ltx", .module = ltx }},
+        .imports = &.{
+            .{ .name = "ltx", .module = ltx },
+            .{ .name = "ltx_wal", .module = ltx_wal },
+        },
     });
     const resource_model_tests = b.addTest(.{
         .name = "ltx-resource-model-tests",
@@ -230,6 +422,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ltx", .module = ltx },
+                .{ .name = "ltx_wal", .module = ltx_wal },
                 .{ .name = "resource_model", .module = resource_model },
             },
         }),
@@ -243,6 +436,11 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all LTX tests");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_wal_unit_tests.step);
+    test_step.dependOn(&run_wal_tests.step);
+    test_step.dependOn(&run_object_tests.step);
+    test_step.dependOn(&run_replica_tests.step);
+    test_step.dependOn(&run_s3_unit_tests.step);
     test_step.dependOn(&run_interoperability.step);
     test_step.dependOn(&run_malformed.step);
     test_step.dependOn(&run_fuzz_decoder_tests.step);
@@ -271,6 +469,7 @@ pub fn build(b: *std.Build) void {
     fuzz_step.dependOn(&run_fuzz_decoder_tests.step);
     fuzz_step.dependOn(&run_apply_tests.step);
     fuzz_step.dependOn(&run_compactor_tests.step);
+    fuzz_step.dependOn(&run_wal_tests.step);
     fuzz_step.dependOn(&run_fuzz_lz4_tests.step);
 
     const fmt = b.addFmt(.{
@@ -345,6 +544,31 @@ pub fn build(b: *std.Build) void {
         "Run the quiescent SQLite generation-store lifecycle example",
     );
     sqlite_store_example_step.dependOn(&run_sqlite_store_example.step);
+
+    const replicate_once_module = b.createModule(.{
+        .root_source_file = b.path("examples/replicate_once.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "ltx", .module = host_ltx },
+            .{ .name = "ltx_wal", .module = host_wal },
+            .{ .name = "ltx_object", .module = host_object },
+            .{ .name = "ltx_capture", .module = host_capture },
+            .{ .name = "ltx_replica", .module = host_replica },
+        },
+    });
+    replicate_once_module.linkSystemLibrary("sqlite3", .{});
+    const replicate_once_example = b.addExecutable(.{
+        .name = "ltx-replicate-once-example",
+        .root_module = replicate_once_module,
+    });
+    const run_replicate_once_example = b.addRunArtifact(replicate_once_example);
+    const replicate_once_example_step = b.step(
+        "example-replicate-once",
+        "Run the one-shot SQLite-to-LTX replication and restore example",
+    );
+    replicate_once_example_step.dependOn(&run_replicate_once_example.step);
 
     const consumer_smoke = b.addSystemCommand(&.{
         b.graph.zig_exe,
@@ -672,6 +896,12 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
         .link_libc = true,
+        .imports = &.{
+            .{ .name = "ltx", .module = host_ltx },
+            .{ .name = "ltx_wal", .module = host_wal },
+            .{ .name = "ltx_object", .module = host_object },
+            .{ .name = "ltx_capture", .module = host_capture },
+        },
     });
     litestream_interop_module.linkSystemLibrary("sqlite3", .{});
     const litestream_interop = b.addExecutable(.{
@@ -716,7 +946,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("benchmarks/resource_model.zig"),
         .target = b.graph.host,
         .optimize = bench_optimize,
-        .imports = &.{.{ .name = "ltx", .module = benchmark_ltx }},
+        .imports = &.{
+            .{ .name = "ltx", .module = benchmark_ltx },
+            .{ .name = "ltx_wal", .module = host_wal },
+        },
     });
     const benchmark_lz4 = b.createModule(.{
         .root_source_file = b.path("src/lz4_block.zig"),

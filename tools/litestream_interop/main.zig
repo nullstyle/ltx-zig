@@ -1,5 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const ltx = @import("ltx");
+const ltx_capture = @import("ltx_capture");
+const ltx_object = @import("ltx_object");
+const ltx_wal = @import("ltx_wal");
 
 const SQLite = opaque {};
 const Statement = opaque {};
@@ -183,6 +187,8 @@ pub fn main(init: std.process.Init) !void {
     try restore(init, args[1], max_page_url, &max_page_database, null, "restore max-page chain");
     try expect_file_sha256(init.io, &max_page_database, max_page_database_bytes, max_page_sha256);
 
+    try run_captured_replica_scenario(init, args[1], temporary.dir);
+
     var stdout_buffer: [192]u8 = undefined;
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     try stdout_writer.interface.writeAll(
@@ -190,6 +196,162 @@ pub fn main(init: std.process.Init) !void {
     );
     try stdout_writer.interface.flush();
 }
+
+/// Builds a real database through the capture session (snapshot, an
+/// incremental, a session-initiated passive checkpoint, and a post-checkpoint
+/// incremental), then requires Litestream to restore the captured tree to
+/// the exact checkpointed image of the live database.
+fn run_captured_replica_scenario(
+    init: std.process.Init,
+    executable: []const u8,
+    dir: std.Io.Dir,
+) !void {
+    var store = try ltx_object.FileClient.init(dir, init.io, "captured-replica");
+    var session = try ltx_capture.Session.init(
+        dir,
+        init.io,
+        "captured.db",
+        captured_codec_limits,
+        captured_wal_limits,
+        store.client(),
+    );
+    defer session.finish();
+
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one'), (2, 'two')");
+    _ = try session.sync(&capture_storage, 1000);
+    try session.exec("INSERT INTO kv VALUES (3, 'three')");
+    _ = try session.sync(&capture_storage, 2000);
+    try session.checkpoint_passive(2500);
+    try session.exec("INSERT INTO kv VALUES (4, 'four')");
+    _ = try session.sync(&capture_storage, 3000);
+    if (session.position.txid.value != 3) return error.CapturedPositionMismatch;
+
+    // Freeze the live image at the captured position; the restored file
+    // must be byte-identical to it.
+    try session.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    var root = try directory_path(init.io, dir);
+    const live_database = try BoundedPath.join(&root, "captured.db");
+
+    var restore_url_buffer: ["file://".len + std.fs.max_path_bytes]u8 = undefined;
+    const replica = try BoundedPath.join(&root, "captured-replica");
+    const restore_url = try std.fmt.bufPrint(
+        &restore_url_buffer,
+        "file://{s}",
+        .{replica.slice()},
+    );
+    const restored_database = try BoundedPath.join(&root, "captured-restore.sqlite");
+    try restore(init, executable, restore_url, &restored_database, null, "restore captured tree");
+    try expect_files_identical(init.io, dir, &live_database, &restored_database);
+    try expect_captured_rows(init.io, dir, &restored_database);
+}
+
+fn expect_files_identical(
+    io: std.Io,
+    dir: std.Io.Dir,
+    live: *const BoundedPath,
+    restored: *const BoundedPath,
+) !void {
+    var live_hash: [32]u8 = undefined;
+    try hash_file(io, dir, live, &live_hash);
+    var restored_hash: [32]u8 = undefined;
+    try hash_file(io, dir, restored, &restored_hash);
+    if (!std.mem.eql(u8, &live_hash, &restored_hash)) {
+        return error.CapturedImageMismatch;
+    }
+}
+
+fn hash_file(
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: *const BoundedPath,
+    out: *[32]u8,
+) !void {
+    var file = try dir.openFile(io, path.slice(), .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    const size = std.math.cast(usize, stat.size) orelse return error.CapturedImageTooLarge;
+    var buffer: [1 << 16]u8 = undefined;
+    if (size > buffer.len) return error.CapturedImageTooLarge;
+    const read = try file.readPositionalAll(io, buffer[0..size], 0);
+    if (read != size) return error.CapturedImageTooLarge;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(buffer[0..size]);
+    hasher.final(out);
+}
+
+/// Opens the restored capture read-only and requires the four captured rows.
+fn expect_captured_rows(io: std.Io, dir: std.Io.Dir, path: *const BoundedPath) !void {
+    _ = io;
+    _ = dir;
+    var uri_buffer: [std.fs.max_path_bytes + 64]u8 = undefined;
+    const uri = try std.fmt.bufPrintZ(
+        &uri_buffer,
+        "file:{s}?mode=ro&immutable=1",
+        .{path.slice()},
+    );
+    var database: ?*SQLite = null;
+    if (sqlite3_open_v2(uri.ptr, &database, sqlite_open_readonly | sqlite_open_uri, null) != sqlite_ok) {
+        return error.CapturedRestoreOpenFailure;
+    }
+    defer _ = sqlite3_close(database);
+    var statement: ?*Statement = null;
+    if (sqlite3_prepare_v2(database.?, "SELECT COUNT(*), MAX(k) FROM kv", -1, &statement, null) != sqlite_ok) {
+        return error.CapturedRestoreQueryFailure;
+    }
+    defer _ = sqlite3_finalize(statement);
+    if (sqlite3_step(statement.?) != sqlite_row) return error.CapturedRestoreQueryFailure;
+    const count = sqlite3_column_text(statement.?, 0) orelse return error.CapturedRestoreQueryFailure;
+    const max = sqlite3_column_text(statement.?, 1) orelse return error.CapturedRestoreQueryFailure;
+    if (!std.mem.eql(u8, std.mem.span(count), "4") or
+        !std.mem.eql(u8, std.mem.span(max), "4"))
+    {
+        return error.CapturedRowsMismatch;
+    }
+}
+
+const captured_codec_limits = ltx.Limits{
+    .max_input_bytes = 1 << 20,
+    .max_output_bytes = 1 << 20,
+    .max_pages = 64,
+    .max_page_size = 4096,
+    .max_compressed_page_size = 4200,
+    .max_page_index_bytes = 1 << 16,
+    .max_page_index_entries = 64,
+    .max_varint_bytes = 10,
+    .max_transaction_span = 64,
+};
+
+const captured_wal_limits = ltx_wal.Limits{
+    .max_page_size = 4096,
+    .max_pages = 64,
+    .max_frames = 256,
+};
+
+var capture_wal_storage: [1 << 20]u8 = undefined;
+var capture_map_slots: [64]ltx_wal.PageSlot = @splat(.{});
+var capture_map_pending: [64]u32 = @splat(0);
+var capture_map_seen: [8]u8 = @splat(0);
+var capture_map_entries: [64]ltx_wal.PageMapEntry =
+    @splat(.{ .page_number = 0, .frame_offset_bytes = 0 });
+var capture_output: [1 << 20]u8 = undefined;
+var capture_page: [4096]u8 = undefined;
+var capture_compressed: [4200]u8 = undefined;
+var capture_compression: ltx.LZ4CompressionWorkspace = undefined;
+var capture_index: [64]ltx.PageIndexEntry =
+    @splat(.{ .page_number = 0, .frame_offset_bytes = 0, .frame_size_bytes = 0 });
+var capture_storage: ltx_capture.Workspaces = .{
+    .wal_storage = &capture_wal_storage,
+    .map_slots = &capture_map_slots,
+    .map_pending = &capture_map_pending,
+    .map_seen = &capture_map_seen,
+    .map_entries = &capture_map_entries,
+    .output_storage = &capture_output,
+    .page_workspace = &capture_page,
+    .compressed_workspace = &capture_compressed,
+    .compression_workspace = &capture_compression,
+    .index_workspace = &capture_index,
+};
 
 fn require_bounded_argument(argument: []const u8) !void {
     if (argument.len == 0 or argument.len > std.fs.max_path_bytes) return error.InvalidPath;

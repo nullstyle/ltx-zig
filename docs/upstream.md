@@ -69,9 +69,10 @@ whole-block LZ4 framing, and no page index.
 For `denoland/celld`: `crates/ltx/README.md`, `Cargo.toml`,
 `reference/ltx-format.md`, `src/codec.rs`, `src/ltx.rs`, `src/lz4_block.rs`,
 `src/compactor.rs`, `src/replica_compactor.rs`, `src/replica.rs`,
-`src/faults_inject.rs`, `tests/differential_xtool.rs`, the golden-fixture
-manifest and capture script, the low-level reader assertions, and the
-file-restore integration test. Celld's writer remains a secondary
+`src/wal.rs`, `src/faults_inject.rs`, `tests/differential_xtool.rs`, the
+golden-fixture manifest and capture script, the low-level reader assertions,
+the Litestream Go WAL testdata under `reference/litestream-go/testdata/`, and
+the file-restore integration test. Celld's writer remains a secondary
 interoperability and deployment reference rather than the valid-output oracle.
 Its immutable golden replica is separately a real-Litestream reader oracle.
 The crate pins Go LTX v0.5.2 and provides a byte-exact port of Go's block
@@ -138,6 +139,39 @@ constructed `FileSpec` outputs from the current Go pin. Attempting to initialize
 encoding or compactor output as `.v2` returns `UnsupportedFormatVersion`. Celld
 independently informs v3 compaction and deployment behavior but supplies no v2
 implementation or oracle.
+
+## SQLite WAL reader evidence
+
+The `ltx_wal` module ports the pinned Celld crate's `wal.rs`, itself a port of
+Litestream v0.5.11 `wal_reader.go` and the `WALChecksum` helper. The Zig port
+keeps the byte format, validation order (magic, header checksum, version,
+page size), frame salt checks before cumulative checksums, commit-record
+promotion with newest-page precedence, final-commit filtering, the salt
+census, and the mid-WAL resume that re-reads the previous frame to seed the
+running checksum. Two deliberate structural divergences are documented here:
+
+1. **Terminal stops stay distinguishable.** Go collapses a clean end, a torn
+   frame, a salt mismatch, and a checksum mismatch into one `io.EOF` sentinel;
+   Celld models that sentinel as `WalError::Eof`. Zig reports four terminal
+   errors (`WalEnd`, `TruncatedFrame`, `SaltMismatch`,
+   `FrameChecksumMismatch`) and records the cause, including the foreign salt
+   pair, in a `Stop` value. Scans treat all four as the end of the valid
+   region, exactly as upstream does.
+2. **No page copy and no hash map.** Frames borrow page bytes directly from
+   the caller's WAL slice, and the committed page map uses caller-owned page
+   slots, a bounded in-transaction page list, and a dedupe bitmap instead of
+   Celld's `HashMap`s. Workspace sizing is checked by
+   [`docs/resource-budgets.md`](resource-budgets.md).
+
+The committed fixtures under `tests/fixtures/wal/` are copied verbatim from
+that pinned tree: the four Litestream v0.5.11 `wal-reader` testdata WALs and
+the golden `sample.wal` captured by SQLite 3.51.0. Every asserted frame fact
+in `tests/wal.zig` is a ported Litestream or Celld known answer; the page map
+is additionally cross-checked against an independent structural reference
+implementation in the test file, and the Go `BadHeaderVersion` vector pins the
+big-endian checksum algorithm (`0x157b2092`, `0xbbf8341d`). Mutations and the
+native fuzz corpus reuse these fixtures; see
+[`tests/fixtures/wal/README.md`](../tests/fixtures/wal/README.md).
 
 ## Compaction evidence
 
@@ -255,6 +289,13 @@ files with `HeaderFlagNoChecksum`, byte-compares the entire output, requires
 the current flagged page representation, and decodes the exact TX4 image hash
 `27d2e8ad59731445c4798eec1c76146e85bd931383728d89fbd96f91d97b0f6a`.
 
+A fourth scenario covers the producer side end to end: the tool builds a
+real database through `ltx_capture` (a snapshot, an incremental, a
+session-initiated passive checkpoint, and a post-checkpoint incremental),
+checkpoints the live database, and requires Litestream v0.5.16 to restore
+the captured tree to a file byte-identical (SHA-256) to the live image that
+also answers queries read-only with the captured rows.
+
 The deployment gate places that Zig file at L1 for TX1–TX4 and retains the
 unaltered legacy TX5 and TX6 objects at L0. The checksum-verified official
 [Litestream v0.5.16 release](https://github.com/benbjohnson/litestream/releases/tag/v0.5.16)
@@ -322,6 +363,44 @@ the rename succeeds and the following directory sync fails, the visible commit
 may have changed while crash durability is unknown. That outcome is reported
 separately as `ApplyPublishIndeterminate` and requires manifest recovery; it is
 never treated as an ordinary failure followed by stage deletion.
+
+## Replication-layer evidence
+
+The `ltx_wal`, `ltx_object`, `ltx_replica`, and `ltx_capture` modules port
+the pinned Celld crate's replication layers. Naming (`parse_txid` accepts
+exactly sixteen hex digits in either case, the filename codec requires the
+lowercase `.ltx` extension, filesystem levels are decimal while object levels
+are four hex digits), the compaction ladder (L0 immediate, then 30 seconds,
+5 minutes, 1 hour, snapshot level 9, interval boundaries truncated), and the
+restore planner (newest qualifying snapshot anchor, per-level cursors
+extending the longest contiguous range, candidate preference by reach, then
+coverage, then level, then timestamp, tail-contiguity rejection for latest
+restores) follow Celld's `lib.rs`, `compaction_level.rs`, and `replica.rs`
+(`calc_restore_plan`) exactly, with ported planner truth-table tests.
+
+The compaction planner follows Celld's `replica_compactor.rs`: the
+destination's maximum plus one is the required continuation TXID, the source
+prefix is bounded by file count and aggregate bytes, and gap repair is left
+to the codec compactor. `ltx_capture` follows the `db.rs` capture path at
+snapshot/incremental/fallback granularity: one TXID per sync batch, the
+no-checksum L0 profile, Litestream control tables, a checkpoint-blocking read
+lock, DB-file page backfill, and snapshot fallback whenever the WAL segment
+salts stop matching the captured segment. Celld's checkpoint policy tiers,
+writer barrier, and mid-WAL resume optimization are documented as remaining
+work in the roadmap, not silently dropped.
+
+The `ltx_object` filesystem backend writes the Litestream replica tree
+(`<root>/ltx/<level>/<min>-<max>.ltx`) with temp-write, sync, and rename
+publication, matching Celld's `client/file.rs`; its backend-agnostic
+conformance suite plays the role of Celld's `run_client_suite`. The
+`ltx_s3` backend implements the same contract with path-style AWS Signature
+Version 4 requests, the four-hex level layout of Litestream's object-store
+replica, `ListObjectsV2` with prefix scoping and `start-after` seeking, and
+the `litestream-timestamp` object metadata header. Its signing decisions —
+strict AWS URI encoding with uppercase percent escapes in canonical query
+values, the payload hash covering every request, and 204 accepted for
+deletes — are verified against real MinIO by the `s3-integration` gate
+rather than by round trip.
 
 ## Compatibility decisions and disagreements
 
