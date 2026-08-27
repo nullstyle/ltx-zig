@@ -1,6 +1,7 @@
 const checksum_impl = @import("checksum.zig");
 const format = @import("format.zig");
 const limits = @import("limits.zig");
+const naming = @import("naming.zig");
 const transport = @import("transport.zig");
 
 pub const Error = format.Error;
@@ -43,6 +44,23 @@ pub const checksum_page = checksum_impl.checksum_page;
 pub const rolling_checksum_initial = checksum_impl.rolling_initial;
 pub const rolling_checksum_add = checksum_impl.rolling_add;
 
+pub const NamingError = naming.Error;
+pub const FileIdentity = naming.FileIdentity;
+pub const FileInfo = naming.FileInfo;
+pub const format_txid = naming.format_txid;
+pub const parse_txid = naming.parse_txid;
+pub const format_file_name = naming.format_file_name;
+pub const parse_file_name = naming.parse_file_name;
+pub const format_filesystem_level_name = naming.format_filesystem_level_name;
+pub const format_object_level_name = naming.format_object_level_name;
+pub const format_file_path = naming.format_file_path;
+pub const snapshot_level = naming.snapshot_level;
+pub const max_level = naming.max_level;
+pub const ltx_directory_name = naming.ltx_directory_name;
+pub const is_valid_page_size = format.is_valid_page_size;
+pub const file_name_bytes = naming.file_name_bytes;
+pub const txid_text_bytes = naming.txid_text_bytes;
+
 pub const checksum_flag = format.checksum_flag;
 pub const header_flag_no_checksum = format.header_flag_no_checksum;
 pub const page_header_flag_size = format.page_header_flag_size;
@@ -59,6 +77,7 @@ test {
     _ = @import("limits.zig");
     _ = @import("transport.zig");
     _ = @import("checksum.zig");
+    _ = @import("naming.zig");
     _ = @import("lz4_block.zig");
     _ = @import("lz4_frame.zig");
     _ = @import("page_index.zig");
