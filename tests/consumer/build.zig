@@ -16,6 +16,11 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "ltx", .module = ltx_zig.module("ltx") },
                 .{ .name = "ltx_sqlite", .module = ltx_zig.module("ltx_sqlite") },
+                .{ .name = "ltx_wal", .module = ltx_zig.module("ltx_wal") },
+                .{ .name = "ltx_object", .module = ltx_zig.module("ltx_object") },
+                .{ .name = "ltx_s3", .module = ltx_zig.module("ltx_s3") },
+                .{ .name = "ltx_replica", .module = ltx_zig.module("ltx_replica") },
+                .{ .name = "ltx_capture", .module = ltx_zig.module("ltx_capture") },
             },
         }),
     });

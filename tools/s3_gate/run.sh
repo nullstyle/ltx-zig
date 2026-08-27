@@ -24,6 +24,13 @@ TLS_DATA_DIR=".zig-cache/s3-gate-tls"
 TLS_PID_FILE=".zig-cache/s3-gate-tls.pid"
 TLS_LOG_FILE=".zig-cache/s3-gate-tls.log"
 
+# Not every CI image ships lsof; fall back to the pid file alone.
+kill_port() {
+    if command -v lsof > /dev/null 2>&1; then
+        lsof -ti "tcp:$1" | xargs kill -9 2>/dev/null || true
+    fi
+}
+
 cleanup() {
     if [ -f "$PID_FILE" ]; then
         kill -9 "$(cat "$PID_FILE")" 2>/dev/null || true
@@ -31,15 +38,15 @@ cleanup() {
     if [ -f "$TLS_PID_FILE" ]; then
         kill -9 "$(cat "$TLS_PID_FILE")" 2>/dev/null || true
     fi
-    lsof -ti "tcp:$PORT" | xargs kill -9 2>/dev/null || true
-    lsof -ti "tcp:$TLS_PORT" | xargs kill -9 2>/dev/null || true
+    kill_port "$PORT"
+    kill_port "$TLS_PORT"
     rm -rf "$DATA_DIR" "$PID_FILE" "$LOG_FILE" \
         "$TLS_DATA_DIR" "$TLS_PID_FILE" "$TLS_LOG_FILE"
 }
 trap cleanup EXIT INT TERM
 
 # Clear any stale instance from an interrupted earlier run.
-lsof -ti "tcp:$PORT" | xargs kill -9 2>/dev/null || true
+kill_port "$PORT"
 rm -rf "$DATA_DIR"
 mkdir -p .zig-cache
 

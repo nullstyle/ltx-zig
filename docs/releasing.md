@@ -9,7 +9,7 @@ authority.
 1. Start from a clean `main` worktree whose hosted CI run is green.
 2. Set `.version` in `build.zig.zon`, add the matching version section to
    `CHANGELOG.md`, and update versioned command examples in `README.md` and this
-   checklist. During release-candidate work, keep the `0.2.0` changelog heading
+   checklist. During release-candidate work, keep the `0.3.0` changelog heading
    as `## [0.2.0] - TBD`.
 3. On the final release commit, replace `TBD` with the real release date in
    `YYYY-MM-DD` form. Do not create the tag while the heading is still pending.
@@ -19,7 +19,7 @@ authority.
 5. Validate the intended tag, including its leading `v`:
 
    ```sh
-   mise exec -- zig build release-check -Drelease-tag=v0.2.0
+   mise exec -- zig build release-check -Drelease-tag=v0.3.0
    ```
 
 Without `-Drelease-tag`, the release checker accepts the matching `TBD` heading
@@ -102,7 +102,7 @@ tagging.
 
 ## Tag and publish
 
-1. Confirm `git status --short` is empty, the `0.2.0` changelog heading contains
+1. Confirm `git status --short` is empty, the `0.3.0` changelog heading contains
    the real release date rather than `TBD`, and the hosted commit is green.
 2. Create an annotated `v${package_version}` tag on that exact commit.
 3. Push the tag and require the tag-triggered release check and full CI matrix

@@ -7,6 +7,54 @@ version is zero, the Zig source API is intentionally unstable.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-27
+
+### Added
+
+- `ltx_wal`: bounded SQLite WAL parsing with committed page maps, salt
+  censes, torn-tail tolerance, and mid-WAL resume, ported from the pinned
+  Celld crate with Go-ported known answers, a differential page-map
+  reference, pinned Litestream WAL fixtures, a mutation suite, and a
+  native fuzz corpus.
+- LTX naming helpers in the core: TXID text, the filename codec, level
+  names for both replica layouts, and Litestream-exact path joins.
+- `ltx_object`: the storage-neutral object contract, the filesystem
+  backend in the Litestream replica layout with atomic publication, and a
+  backend-agnostic conformance suite.
+- `ltx_s3`: the S3 backend with path-style SigV4, prefix-scoped paginated
+  listings with `start-after` seek, object read/write/delete, bucket
+  creation, signed conditional writes for first-writer fencing, TLS with
+  a custom or system certificate authority, and part-streamed multipart
+  upload. Gated against a local MinIO server over both plain HTTP and
+  TLS, including the full conformance suite and multipart round trips.
+- `ltx_replica`: the Litestream compaction ladder, restore planning with
+  per-level cursors and tail-gap rejection, compaction and retention
+  planning, restore-to-path and level-compaction executors over
+  caller-owned workspaces, with exact restored-image end-to-end tests.
+- `ltx_capture`: the SQLite capture session with Litestream control
+  tables, a checkpoint-blocking read lock, snapshot/incremental
+  transitions with mid-WAL resume, DB-file page backfill, snapshot
+  fallback on foreign WAL discontinuity, no-checksum L0 publication, and
+  two-tier passive checkpointing where session-initiated restarts
+  continue with small incrementals. Integration-qualified against host
+  SQLite by querying restored images read-only.
+- Outbound Litestream v0.5.16 binary interop over a live `ltx_capture`
+  tree: the pinned release binary restores the captured tree to a
+  byte-identical image of the checkpointed database.
+- A runnable one-shot replication-and-restore example as the consumer
+  template, a replication deployment contract (`docs/replication.md`),
+  and the replication roadmap with milestone status.
+- Corrected the darwin-arm64 Litestream archive and `checksums.txt`
+  SHA-256 pins in `docs/upstream.md` against the release manifest.
+
+### Changed
+
+- The core remains unchanged; the replication modules are additive and
+  keep the core free of filesystem, SQLite, and libc linkage. Only
+  `ltx_capture` declares a SQLite C surface that the host build links.
+- `S3Client.init` returns an error union because TLS certificate
+  loading can fail; pre-1.0 source instability applies.
+
 ## [0.2.0] - 2026-08-22
 
 ### Added
