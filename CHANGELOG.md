@@ -7,6 +7,31 @@ version is zero, the Zig source API is intentionally unstable.
 
 ## [Unreleased]
 
+### Added
+
+- `ltx_s3`: replace-if-generation lease renewal (`object_etag` plus
+  `put_if_match` with `ETagMismatch` on a shifted generation), an optional
+  caller-injected retry policy for transient transport failures and
+  retryable statuses on idempotent requests, and virtual-host bucket
+  addressing alongside path style.
+- `ltx_capture`: a frame-count checkpoint tier (`checkpoint_max_frames`)
+  alongside the byte and interval tiers, and `seed_position` for
+  continuing a restored replica at the recovered TXID instead of
+  restarting the numbering at one.
+- A capture crash drill in `capture-integration`: kill a writer between
+  durable batches, restore the tree to exactly the last reported batch,
+  seed the position, and continue capture without history repair.
+- An opt-in scale qualification tool (`zig build scale-check`) with
+  measured capture, compaction, and restore throughput and byte-identical
+  verification at hundreds of MiB; numbers recorded in
+  `docs/replication.md`.
+- CI runs the S3 MinIO gate on the macOS lane as well as Linux.
+
+### Changed
+
+- The S3 conformance, TLS, and virtual-host lanes each run their own
+  MinIO instance in the gate runner; manual `zig build s3-integration`
+  without the runner skips the TLS and virtual-host lanes.
 ## [0.3.0] - 2026-08-27
 
 ### Added

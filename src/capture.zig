@@ -140,6 +140,13 @@ pub const Session = struct {
     /// after the last checkpoint runs one, bounding WAL age for
     /// sparse-but-large writers.
     checkpoint_interval_ms: u64 = 0,
+    /// When nonzero, a successful sync whose WAL holds at least this many
+    /// frames runs a checkpoint. Together with the byte threshold and the
+    /// interval this is the page-count tier; the frame count derives from
+    /// the WAL size and page size, so it stays exact without tracking
+    /// frames. The writer-barrier tier from the ported daemon does not
+    /// apply: this session is the single writer of its database.
+    checkpoint_max_frames: u32 = 0,
     last_checkpoint_ms: i64 = std.math.minInt(i64),
 
     /// Opens `database_name` (created when absent) under `dir` in WAL mode
@@ -222,6 +229,16 @@ pub const Session = struct {
                 else => error.SQLiteExecFailure,
             };
         }
+    }
+
+    /// Continues a replica recovered from the object store: seeds the
+    /// position so the next capture publishes at the following TXID instead
+    /// of restarting the numbering at one. Only valid before the first
+    /// sync; the recovered database's WAL is a new segment, so the next
+    /// transition is a full snapshot at the seeded position plus one.
+    pub fn seed_position(self: *Session, position: ltx.Position) Error!void {
+        if (self.position.txid.value != 0) return error.InvalidState;
+        self.position = position;
     }
 
     /// Runs one capture under the checkpoint-blocking read lock, classifies

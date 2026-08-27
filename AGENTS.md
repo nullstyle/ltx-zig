@@ -65,7 +65,10 @@
   run `mise exec -- zig build capture-integration -Doptimize=ReleaseSafe`,
   which links the host system SQLite and libc for the test executable only;
   no library module may link either.
-- For `ltx_s3` changes, run `mise run s3-integration`. The runner script
+- For `ltx_s3` changes, run `mise run s3-integration`. For capture
+  throughput or restore-path changes, also run
+  `mise exec -- zig build scale-check -Dscale-mb=64` and re-record the
+  numbers in `docs/replication.md` if they moved materially. The runner script
   starts the pinned MinIO tool outside the test executable — MinIO spawned
   from inside a Zig test binary hangs on this host platform — and always
   tears the server down. The SigV4 clock is injected; never read ambient

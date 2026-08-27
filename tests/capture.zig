@@ -500,3 +500,44 @@ test "checkpoint interval bounds wal age for sparse writers" {
 
     try restore_and_expect(&temporary, client, 4);
 }
+
+test "frame-count checkpoint tier bounds WAL length" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    session.checkpoint_max_frames = 3;
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    _ = try session.sync(&capture_workspaces, 1000);
+    // One batch of two frames stays under the tier; no restart.
+    try std.testing.expect(!session.segment_restarted);
+
+    // Enough batches to cross three frames triggers the tier; the next
+    // committed frames continue as an incremental.
+    var batch: u64 = 0;
+    while (batch < 4) : (batch += 1) {
+        const statement = try std.fmt.bufPrintZ(
+            &sql_buffer,
+            "INSERT INTO kv VALUES ({d}, 'v{d}')",
+            .{ batch + 2, batch + 2 },
+        );
+        try session.exec(statement);
+        _ = try session.sync(&capture_workspaces, @intCast(2000 + batch));
+    }
+    try std.testing.expect(session.segment_restarted or session.last_checkpoint_ms != std.math.minInt(i64));
+    try restore_and_expect(&temporary, client, 5);
+}

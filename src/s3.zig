@@ -25,6 +25,38 @@ const object = @import("ltx_object");
 
 pub const Error = object.Error;
 
+/// Why a request is being considered for retry.
+pub const RetryCause = union(enum) {
+    /// The transport failed before a complete response arrived.
+    transport,
+    /// The store answered with a retryable HTTP status (5xx or 429).
+    status: u16,
+};
+
+/// Caller-injected retry policy. Retries apply to transport failures and
+/// to retryable statuses on idempotent methods only (GET, HEAD, DELETE,
+/// PUT); POST requests such as multipart initiation are never retried,
+/// because a retry could duplicate an upload. The library sleeps for the
+/// returned delay through its Io between attempts; hosts that want jitter
+/// or caps encode them in `next_delay_ms_fn`.
+pub const RetryPolicy = struct {
+    context: *anyopaque,
+    next_delay_ms_fn: *const fn (context: *anyopaque, attempt: u32, cause: RetryCause) ?u64,
+    /// Total attempts including the first.
+    max_attempts: u32 = 3,
+};
+
+/// The conditional header applied to a request. All conditional headers are
+/// signed, so the same variant feeds the canonical request.
+pub const Conditional = union(enum) {
+    none,
+    /// `If-None-Match: *` — succeed only when the key is absent.
+    create_only,
+    /// `If-Match: <etag>` — succeed only when the stored ETag equals the
+    /// given one, quotes included.
+    match_etag: []const u8,
+};
+
 /// Injected wall clock returning Unix milliseconds.
 pub const Clock = struct {
     context: *anyopaque,
@@ -45,6 +77,10 @@ pub const Config = struct {
     region: []const u8 = "us-east-1",
     access_key: []const u8,
     secret_key: []const u8,
+    /// Address the bucket as a host-name prefix (`bucket.host`) instead of
+    /// a path prefix. Some stores require this; MinIO defaults to path
+    /// style. The bucket name must be valid DNS material.
+    virtual_host: bool = false,
     /// Connect with TLS (HTTPS). The standard-library client validates
     /// the server certificate against `ca_file` when provided, otherwise
     /// against the system bundle.
@@ -58,6 +94,9 @@ pub const Config = struct {
     /// Maximum keys requested per listing page. Pages also fit the internal
     /// XML workspace, bounding the response body size.
     max_keys_per_page: u32 = 512,
+    /// Optional retry policy for transient transport failures and
+    /// retryable statuses on idempotent requests.
+    retry: ?RetryPolicy = null,
 };
 
 /// One in-flight multipart upload. A client tracks a single upload at a
@@ -150,7 +189,7 @@ pub const S3Client = struct {
 
     /// Creates the bucket when absent; an already-owned bucket is success.
     pub fn ensure_bucket(self: *S3Client) Error!void {
-        const outcome = try self.perform(.PUT, "/", "", null, null, null, false);
+        const outcome = try self.perform(.PUT, "/", "", null, null, null, .none);
         switch (outcome.status) {
             .ok, .conflict => {},
             else => return error.StorageFailure,
@@ -204,7 +243,7 @@ pub const S3Client = struct {
                 self.config.prefix,
                 continuation,
             );
-            const outcome = try self.perform(.GET, "/", query, null, null, &self.xml_workspace, false);
+            const outcome = try self.perform(.GET, "/", query, null, null, &self.xml_workspace, .none);
             if (outcome.status != .ok) return error.StorageFailure;
             const page = try self.parse_list_page(outcome.bytes);
             for (page.keys) |key| {
@@ -235,7 +274,7 @@ pub const S3Client = struct {
     ) Error![]const u8 {
         const self: *S3Client = @ptrCast(@alignCast(context));
         const key = try self.key_path(level, identity);
-        const outcome = try self.perform(.GET, key, "", null, null, destination, false);
+        const outcome = try self.perform(.GET, key, "", null, null, destination, .none);
         if (outcome.status == .not_found) return error.ObjectNotFound;
         if (outcome.status != .ok) return error.StorageFailure;
         return outcome.bytes;
@@ -259,7 +298,7 @@ pub const S3Client = struct {
             self.send_workspace[0..bytes.len],
             created_at_ms,
             null,
-            false,
+            .none,
         );
         if (outcome.status != .ok) return error.StorageFailure;
     }
@@ -285,7 +324,7 @@ pub const S3Client = struct {
             null,
             created_at_ms,
             &self.xml_workspace,
-            false,
+            .none,
         );
         if (outcome.status != .ok) return error.StorageFailure;
         var state = MultipartState{ .level = level, .identity = identity };
@@ -327,7 +366,7 @@ pub const S3Client = struct {
             self.send_workspace[0..bytes.len],
             null,
             null,
-            false,
+            .none,
         );
         if (outcome.status != .ok) return error.StorageFailure;
         const etag = outcome.etag orelse return error.StorageFailure;
@@ -370,7 +409,7 @@ pub const S3Client = struct {
             body_buffer[0..body_offset],
             null,
             &self.xml_workspace,
-            false,
+            .none,
         );
         self.multipart = null;
         if (outcome.status != .ok) return error.StorageFailure;
@@ -391,7 +430,7 @@ pub const S3Client = struct {
             null,
             null,
             null,
-            false,
+            .none,
         );
         self.multipart = null;
         switch (outcome.status) {
@@ -424,11 +463,66 @@ pub const S3Client = struct {
             self.send_workspace[0..bytes.len],
             created_at_ms,
             null,
-            true,
+            .create_only,
         );
         switch (outcome.status) {
             .ok, .created => {},
             .precondition_failed => return error.ObjectExists,
+            else => return error.StorageFailure,
+        }
+    }
+
+    /// Reads one object's current ETag (quotes included) without fetching
+    /// its body. The returned slice lives in client storage until the next
+    /// request. Lease renewal composes this with `put_if_match`.
+    pub fn object_etag(
+        self: *S3Client,
+        level: u8,
+        identity: ltx.FileIdentity,
+    ) Error![]const u8 {
+        if (level > ltx.max_level) return error.InvalidLevel;
+        if (identity.min_txid.value > identity.max_txid.value) {
+            return error.InvalidIdentity;
+        }
+        const key = try self.key_path(level, identity);
+        const outcome = try self.perform(.HEAD, key, "", null, null, null, .none);
+        if (outcome.status == .not_found) return error.ObjectNotFound;
+        if (outcome.status != .ok) return error.StorageFailure;
+        return outcome.etag orelse error.StorageFailure;
+    }
+
+    /// Writes one object only when its stored ETag equals `expected_etag`
+    /// (as returned by `object_etag`, quotes included). This is the
+    /// replace-if-generation primitive for lease renewal: a contender that
+    /// renewed between the caller's read and write shifts the ETag and this
+    /// call fails with `ETagMismatch`.
+    pub fn put_if_match(
+        self: *S3Client,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+        bytes: []const u8,
+        expected_etag: []const u8,
+    ) Error!void {
+        if (level > ltx.max_level) return error.InvalidLevel;
+        if (identity.min_txid.value > identity.max_txid.value) {
+            return error.InvalidIdentity;
+        }
+        if (bytes.len > self.send_workspace.len) return error.ObjectTooLarge;
+        const key = try self.key_path(level, identity);
+        @memcpy(self.send_workspace[0..bytes.len], bytes);
+        const outcome = try self.perform(
+            .PUT,
+            key,
+            "",
+            self.send_workspace[0..bytes.len],
+            created_at_ms,
+            null,
+            .{ .match_etag = expected_etag },
+        );
+        switch (outcome.status) {
+            .ok => {},
+            .precondition_failed => return error.ETagMismatch,
             else => return error.StorageFailure,
         }
     }
@@ -443,7 +537,7 @@ pub const S3Client = struct {
                 info.level,
                 .{ .min_txid = info.min_txid, .max_txid = info.max_txid },
             );
-            const outcome = try self.perform(.DELETE, key, "", null, null, null, false);
+            const outcome = try self.perform(.DELETE, key, "", null, null, null, .none);
             switch (outcome.status) {
                 // S3 answers a successful delete with 204 No Content.
                 .ok, .no_content, .not_found => {},
@@ -462,9 +556,10 @@ pub const S3Client = struct {
         etag: ?[]const u8 = null,
     };
 
-    /// Signs and performs one request. The response body, when requested, is
-    /// read fully into `body_destination` before the connection returns to
-    /// the pool, so the returned bytes stay valid afterwards.
+    /// Signs and performs one request, retrying transient failures when a
+    /// policy is configured. The response body, when requested, is read
+    /// fully into `body_destination` before the connection returns to the
+    /// pool, so the returned bytes stay valid afterwards.
     fn perform(
         self: *S3Client,
         method: std.http.Method,
@@ -473,7 +568,60 @@ pub const S3Client = struct {
         payload: ?[]u8,
         metadata_ms: ?i64,
         body_destination: ?[]u8,
-        create_only: bool,
+        conditional: Conditional,
+    ) Error!Outcome {
+        const policy = self.config.retry orelse
+            return self.perform_once(method, key, query, payload, metadata_ms, body_destination, conditional);
+        var attempt: u32 = 1;
+        while (true) : (attempt += 1) {
+            const outcome = self.perform_once(
+                method,
+                key,
+                query,
+                payload,
+                metadata_ms,
+                body_destination,
+                conditional,
+            ) catch |err| {
+                if (err != error.StorageFailure) return err;
+                if (retry_delay(policy, attempt, .transport, method)) |delay| {
+                    try self.sleep_retry(delay);
+                    continue;
+                }
+                return err;
+            };
+            const retryable = @intFromEnum(outcome.status) >= 500 or
+                outcome.status == .too_many_requests;
+            if (retryable) {
+                if (retry_delay(policy, attempt, .{
+                    .status = @intFromEnum(outcome.status),
+                }, method)) |delay| {
+                    try self.sleep_retry(delay);
+                    continue;
+                }
+            }
+            return outcome;
+        }
+    }
+
+    fn sleep_retry(self: *S3Client, delay_ms: u64) Error!void {
+        const timeout = std.Io.Timeout{ .duration = .{
+            .raw = std.Io.Duration.fromMilliseconds(@intCast(delay_ms)),
+            .clock = std.Io.Clock.real,
+        } };
+        timeout.sleep(self.io) catch return error.StorageFailure;
+    }
+
+    /// Signs and performs exactly one request attempt.
+    fn perform_once(
+        self: *S3Client,
+        method: std.http.Method,
+        key: []const u8,
+        query: []const u8,
+        payload: ?[]u8,
+        metadata_ms: ?i64,
+        body_destination: ?[]u8,
+        conditional: Conditional,
     ) Error!Outcome {
         const now_ms = self.config.clock.now_ms();
         var amz_date: [amz_date_bytes]u8 = undefined;
@@ -491,6 +639,24 @@ pub const S3Client = struct {
             ) catch return error.StorageFailure;
         }
 
+        var path_buffer: [1024]u8 = undefined;
+        var host_buffer: [256]u8 = undefined;
+        const host_header = if (self.config.virtual_host)
+            std.fmt.bufPrint(&host_buffer, "{s}.{s}", .{
+                self.config.bucket,
+                self.config.host,
+            }) catch return error.PathTooLong
+        else
+            self.config.host;
+        const path = if (self.config.virtual_host)
+            std.fmt.bufPrint(&path_buffer, "{s}", .{key}) catch return error.PathTooLong
+        else
+            std.fmt.bufPrint(&path_buffer, "/{s}{s}", .{
+                self.config.bucket,
+                key,
+            }) catch return error.PathTooLong;
+        std.debug.assert(key.len >= 1 and key[0] == '/');
+
         const authorization = try self.sign(
             method,
             key,
@@ -498,15 +664,9 @@ pub const S3Client = struct {
             &amz_date,
             &payload_hash,
             if (metadata_ms == null) null else timestamp_text,
-            create_only,
+            conditional,
+            host_header,
         );
-
-        var path_buffer: [1024]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buffer, "/{s}{s}", .{
-            self.config.bucket,
-            key,
-        }) catch return error.PathTooLong;
-        std.debug.assert(key.len >= 1 and key[0] == '/');
 
         var extra_headers: [4]std.http.Header = undefined;
         var extra_count: usize = 0;
@@ -527,17 +687,27 @@ pub const S3Client = struct {
             };
             extra_count += 1;
         }
-        if (create_only) {
-            extra_headers[extra_count] = .{
-                .name = "if-none-match",
-                .value = "*",
-            };
-            extra_count += 1;
+        switch (conditional) {
+            .none => {},
+            .create_only => {
+                extra_headers[extra_count] = .{
+                    .name = "if-none-match",
+                    .value = "*",
+                };
+                extra_count += 1;
+            },
+            .match_etag => |etag| {
+                extra_headers[extra_count] = .{
+                    .name = "if-match",
+                    .value = etag,
+                };
+                extra_count += 1;
+            },
         }
 
         const uri = std.Uri{
             .scheme = if (self.config.use_tls) "https" else "http",
-            .host = .{ .raw = self.config.host },
+            .host = .{ .raw = host_header },
             .port = self.config.port,
             // Both components are already AWS-URI-encoded; `.raw` would be
             // percent-encoded a second time on the wire.
@@ -603,14 +773,20 @@ pub const S3Client = struct {
         amz_date: *const [amz_date_bytes]u8,
         payload_hash: *const [sha256_hex_bytes]u8,
         timestamp_text: ?[]const u8,
-        create_only: bool,
+        conditional: Conditional,
+        host_header: []const u8,
     ) Error![]const u8 {
         var canonical_offset: usize = 0;
         const canonical = &self.canonical_workspace;
         try append_canonical(canonical, &canonical_offset, @tagName(method));
-        try append_canonical(canonical, &canonical_offset, "\n/");
-        try append_canonical(canonical, &canonical_offset, self.config.bucket);
-        try append_canonical(canonical, &canonical_offset, key);
+        if (self.config.virtual_host) {
+            try append_canonical(canonical, &canonical_offset, "\n");
+            try append_canonical(canonical, &canonical_offset, key);
+        } else {
+            try append_canonical(canonical, &canonical_offset, "\n/");
+            try append_canonical(canonical, &canonical_offset, self.config.bucket);
+            try append_canonical(canonical, &canonical_offset, key);
+        }
         try append_canonical(canonical, &canonical_offset, "\n");
         try append_canonical(canonical, &canonical_offset, query);
         var port_buffer: [8]u8 = undefined;
@@ -618,11 +794,18 @@ pub const S3Client = struct {
             self.config.port,
         }) catch return error.StorageFailure;
         try append_canonical(canonical, &canonical_offset, "\nhost:");
-        try append_canonical(canonical, &canonical_offset, self.config.host);
+        try append_canonical(canonical, &canonical_offset, host_header);
         try append_canonical(canonical, &canonical_offset, ":");
         try append_canonical(canonical, &canonical_offset, port_text);
-        if (create_only) {
-            try append_canonical(canonical, &canonical_offset, "\nif-none-match:*");
+        switch (conditional) {
+            .none => {},
+            .create_only => {
+                try append_canonical(canonical, &canonical_offset, "\nif-none-match:*");
+            },
+            .match_etag => |etag| {
+                try append_canonical(canonical, &canonical_offset, "\nif-match:");
+                try append_canonical(canonical, &canonical_offset, etag);
+            },
         }
         try append_canonical(
             canonical,
@@ -641,15 +824,12 @@ pub const S3Client = struct {
             try append_canonical(canonical, &canonical_offset, text);
         }
 
-        const signed_headers = if (timestamp_text != null)
-            if (create_only)
-                "host;if-none-match;x-amz-content-sha256;x-amz-date;x-amz-meta-litestream-timestamp"
-            else
-                "host;x-amz-content-sha256;x-amz-date;x-amz-meta-litestream-timestamp"
-        else if (create_only)
-            "host;if-none-match;x-amz-content-sha256;x-amz-date"
-        else
-            "host;x-amz-content-sha256;x-amz-date";
+        const conditional_name: ?[]const u8 = switch (conditional) {
+            .none => null,
+            .create_only => "if-none-match",
+            .match_etag => "if-match",
+        };
+        const signed_headers = signed_headers_text(timestamp_text != null, conditional_name);
         try append_canonical(canonical, &canonical_offset, "\n\n");
         try append_canonical(canonical, &canonical_offset, signed_headers);
         try append_canonical(canonical, &canonical_offset, "\n");
@@ -930,6 +1110,50 @@ fn append_canonical(destination: []u8, offset: *usize, bytes: []const u8) Error!
     try append_key_part(destination, offset, bytes);
 }
 
+/// The signed-headers list is alphabetical; the optional conditional header
+/// sorts between `host` and the `x-amz-*` headers.
+fn signed_headers_text(
+    has_metadata: bool,
+    conditional_name: ?[]const u8,
+) []const u8 {
+    if (conditional_name) |name| {
+        if (std.mem.eql(u8, name, "if-match")) {
+            return if (has_metadata)
+                "host;if-match;x-amz-content-sha256;x-amz-date;x-amz-meta-litestream-timestamp"
+            else
+                "host;if-match;x-amz-content-sha256;x-amz-date";
+        }
+        return if (has_metadata)
+            "host;if-none-match;x-amz-content-sha256;x-amz-date;x-amz-meta-litestream-timestamp"
+        else
+            "host;if-none-match;x-amz-content-sha256;x-amz-date";
+    }
+    return if (has_metadata)
+        "host;x-amz-content-sha256;x-amz-date;x-amz-meta-litestream-timestamp"
+    else
+        "host;x-amz-content-sha256;x-amz-date";
+}
+
+/// The retry decision: within budget, allowed for the method, and the
+/// policy still returning a delay.
+fn retry_delay(
+    policy: RetryPolicy,
+    attempt: u32,
+    cause: RetryCause,
+    method: std.http.Method,
+) ?u64 {
+    if (attempt >= policy.max_attempts) return null;
+    if (!method_retryable(method)) return null;
+    return policy.next_delay_ms_fn(policy.context, attempt, cause);
+}
+
+fn method_retryable(method: std.http.Method) bool {
+    return switch (method) {
+        .GET, .HEAD, .DELETE, .PUT => true,
+        else => false,
+    };
+}
+
 fn file_info_before(_: void, left: ltx.FileInfo, right: ltx.FileInfo) bool {
     if (left.min_txid.value != right.min_txid.value) {
         return left.min_txid.value < right.min_txid.value;
@@ -974,6 +1198,58 @@ test "empty payload hash is the standard constant" {
     var out: [sha256_hex_bytes]u8 = undefined;
     sha256_hex("", &out);
     try std.testing.expectEqualStrings(empty_payload_sha256, &out);
+}
+
+test "retry decisions respect budget, method, and policy callback" {
+    const Probe = struct {
+        calls: u32 = 0,
+        stop_after: u32 = std.math.maxInt(u32),
+        fn next(context: *anyopaque, attempt: u32, cause: RetryCause) ?u64 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            if (attempt >= self.stop_after) return null;
+            return switch (cause) {
+                .transport => 10,
+                .status => |code| if (code == 429) 20 else null,
+            };
+        }
+    };
+    var probe = Probe{};
+    const policy = RetryPolicy{
+        .context = &probe,
+        .next_delay_ms_fn = Probe.next,
+        .max_attempts = 3,
+    };
+
+    // First failure within budget yields the callback's delay.
+    try std.testing.expectEqual(@as(?u64, 10), retry_delay(policy, 1, .transport, .GET));
+    // POST is never retried.
+    try std.testing.expectEqual(@as(?u64, null), retry_delay(policy, 1, .transport, .POST));
+    // The last allowed attempt produces no further delay.
+    try std.testing.expectEqual(@as(?u64, null), retry_delay(policy, 3, .transport, .GET));
+    // A non-429 status stops through the callback.
+    try std.testing.expectEqual(@as(?u64, null), retry_delay(policy, 1, .{ .status = 503 }, .PUT));
+    try std.testing.expectEqual(@as(?u64, 20), retry_delay(policy, 1, .{ .status = 429 }, .PUT));
+    try std.testing.expectEqual(@as(u32, 3), probe.calls);
+}
+
+test "signed header lists stay alphabetical across conditional variants" {
+    try std.testing.expectEqualStrings(
+        "host;x-amz-content-sha256;x-amz-date",
+        signed_headers_text(false, null),
+    );
+    try std.testing.expectEqualStrings(
+        "host;if-match;x-amz-content-sha256;x-amz-date",
+        signed_headers_text(false, "if-match"),
+    );
+    try std.testing.expectEqualStrings(
+        "host;if-none-match;x-amz-content-sha256;x-amz-date",
+        signed_headers_text(false, "if-none-match"),
+    );
+    try std.testing.expectEqualStrings(
+        "host;if-none-match;x-amz-content-sha256;x-amz-date;x-amz-meta-litestream-timestamp",
+        signed_headers_text(true, "if-none-match"),
+    );
 }
 
 test "uri encoding preserves safe characters and escapes the rest" {

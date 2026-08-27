@@ -18,6 +18,10 @@ export MINIO_ROOT_PASSWORD=tester-secret-and-long-enough
 export MINIO_BROWSER=off
 
 TLS_PORT=19443
+VH_PORT=19445
+VH_DATA_DIR=".zig-cache/s3-gate-vh"
+VH_PID_FILE=".zig-cache/s3-gate-vh.pid"
+VH_LOG_FILE=".zig-cache/s3-gate-vh.log"
 CERT_DIR="$(pwd)/.zig-cache/s3-gate-certs"
 CERT_ABS="$CERT_DIR"
 TLS_DATA_DIR=".zig-cache/s3-gate-tls"
@@ -41,7 +45,8 @@ cleanup() {
     kill_port "$PORT"
     kill_port "$TLS_PORT"
     rm -rf "$DATA_DIR" "$PID_FILE" "$LOG_FILE" \
-        "$TLS_DATA_DIR" "$TLS_PID_FILE" "$TLS_LOG_FILE"
+        "$TLS_DATA_DIR" "$TLS_PID_FILE" "$TLS_LOG_FILE" \
+        "$VH_DATA_DIR" "$VH_PID_FILE" "$VH_LOG_FILE"
 }
 trap cleanup EXIT INT TERM
 
@@ -102,5 +107,32 @@ if [ "$tls_ready" -ne 1 ]; then
     exit 1
 fi
 
+# Virtual-host lane: MinIO with MINIO_DOMAIN accepts bucket.localhost
+# addressing. macOS resolves *.localhost to loopback automatically.
+rm -rf "$VH_DATA_DIR"
+MINIO_DOMAIN=localhost \
+nohup minio server "$VH_DATA_DIR" \
+    --address "localhost:$VH_PORT" > "$VH_LOG_FILE" 2>&1 &
+echo $! > "$VH_PID_FILE"
+
+vh_ready=0
+i=0
+while [ "$i" -lt 60 ]; do
+    if curl -sf "http://ltx-gate-vh.localhost:$VH_PORT/minio/health/live" \
+        > /dev/null 2>&1 || \
+        curl -sf "http://localhost:$VH_PORT/minio/health/live" > /dev/null 2>&1; then
+        vh_ready=1
+        break
+    fi
+    sleep 0.5
+    i=$((i + 1))
+done
+if [ "$vh_ready" -ne 1 ]; then
+    echo "minio virtual-host did not become healthy; server log:" >&2
+    cat "$VH_LOG_FILE" >&2 || true
+    exit 1
+fi
+
 zig build s3-integration -Doptimize=ReleaseSafe \
-    -Dminio-ca="$CERT_DIR/ca.crt" -Dminio-tls-port="$TLS_PORT"
+    -Dminio-ca="$CERT_DIR/ca.crt" -Dminio-tls-port="$TLS_PORT" \
+    -Dminio-vh-port="$VH_PORT"

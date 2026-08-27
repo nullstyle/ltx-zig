@@ -21,6 +21,9 @@ pub const Error = error{
     InvalidIdentity,
     ObjectNotFound,
     ObjectExists,
+    /// A conditional replace saw a different stored generation than the
+    /// caller expected; the caller must re-read and decide.
+    ETagMismatch,
     InvalidState,
     ObjectTooLarge,
     StorageFailure,

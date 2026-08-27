@@ -80,7 +80,6 @@ jobs:
       - name: Test live capture integration in release-safe
         run: mise exec -- zig build capture-integration -Doptimize=ReleaseSafe
       - name: Run S3 backend gate against local MinIO
-        if: runner.os == 'Linux'
         run: mise run s3-integration
       - name: Exercise fuzz corpus and native search
         if: runner.os == 'Linux'

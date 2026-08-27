@@ -45,9 +45,11 @@ explicit limits, workspaces, and timestamps. Consult
   committed transaction; whether a write is acknowledged before or after the
   upload is the host's decision.
 - Lease and fencing policy for actor migration. `S3Client.put_if_absent`
-  provides the conditional-write primitive (`If-None-Match: *`, first writer
-  wins, contenders receive `ObjectExists`); turning it into a lease protocol
-  is the host's decision.
+  provides create-only fencing and `object_etag` + `put_if_match` provide
+  replace-if-generation renewal (a shifted generation fails with
+  `ETagMismatch`); turning these into a lease protocol is the host's
+  decision. A `RetryPolicy` on the S3 config covers transient transport
+  failures and retryable statuses on idempotent requests.
 - Checkpoint cadence beyond the byte threshold: call
   `Session.checkpoint_passive` (or set `checkpoint_threshold_bytes`) as your
   retention loop requires.
@@ -99,18 +101,35 @@ names the lower-level files fully absorbed by a durable higher level.
   live `ltx_capture` tree to byte-identical images.
 - `mise exec -- zig build example-replicate-once` — the runnable consumer
   template covering the whole lifecycle.
+- `mise exec -- zig build scale-check -Dscale-mb=512` — opt-in scale
+  qualification: capture, compaction, and restore of a real database with
+  per-phase throughput, byte-identical image, and row-count verification.
+
+## Measured throughput (512 MiB, 4096-byte pages, local filesystem)
+
+From the scale tool on the development host, one thread, ReleaseSafe:
+capture with per-batch syncs 63–74 MiB/s of database, level compaction
+about 62–72 MiB/s of logical volume, and full restore 377–395 MiB/s
+(1.8 s for a 684 MiB image). The restored file is byte-identical to the
+checkpointed original across 512 compacted L0 files. Remote object stores
+will be bounded by network rather than these codec paths; re-run the tool
+per deployment and record the numbers where this section points.
 
 ## Known boundaries
 
-- `ltx_s3`: virtual-host addressing is not implemented; path-style only.
-  TLS uses the standard-library client against `ca_file` or the system
-  bundle, and multipart uploads stream one part at a time through the send
-  workspace (single in-flight upload per client, parts numbered from one
-  without gaps, every part but the last at the store's 5 MiB minimum).
-- `ltx_capture`: passive checkpointing only — no writer barrier. Two tiers
-  bound the WAL: `checkpoint_threshold_bytes` and
-  `checkpoint_interval_ms`. Syncs on a continuing segment resume mid-WAL
+- `ltx_s3`: both path-style and virtual-host addressing
+  (`virtual_host = true`). TLS uses the standard-library client against
+  `ca_file` or the system bundle, and multipart uploads stream one part at
+  a time through the send workspace (single in-flight upload per client,
+  parts numbered from one without gaps, every part but the last at the
+  store's 5 MiB minimum).
+- `ltx_capture`: passive checkpointing only — no writer barrier, which the
+  single-writer-per-database model makes unnecessary. Three tiers bound the
+  WAL: `checkpoint_threshold_bytes`, `checkpoint_interval_ms`, and
+  `checkpoint_max_frames`. Syncs on a continuing segment resume mid-WAL
   from the last captured frame; only the first capture and post-restart
-  syncs scan from the beginning.
+  syncs scan from the beginning. After restoring a replica, call
+  `seed_position` before the first sync so the continuation numbers its
+  TXIDs after the recovered position instead of restarting at one.
 - Restore requires the plan's first file to start at TXID 1 from the empty
   position; chains that begin mid-history need an earlier snapshot.

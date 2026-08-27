@@ -271,3 +271,160 @@ test "multipart upload streams parts into one readable object" {
     try std.testing.expectEqualSlices(u8, &multipart_tail, stored[2 * multipart_part_bytes ..]);
     try client.delete(&.{.{ .level = 0, .min_txid = identity.min_txid, .max_txid = identity.max_txid }});
 }
+
+const RetryProbe = struct {
+    calls: u32 = 0,
+    fn next(context: *anyopaque, attempt: u32, cause: ltx_s3.RetryCause) ?u64 {
+        _ = attempt;
+        const self: *RetryProbe = @ptrCast(@alignCast(context));
+        self.calls += 1;
+        return switch (cause) {
+            .transport => 5,
+            .status => 25,
+        };
+    }
+};
+
+test "a configured retry policy is not consulted on success" {
+    var probe = RetryProbe{};
+    var s3 = try ltx_s3.S3Client.init(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .host = minio_host,
+            .port = minio_port,
+            .bucket = "ltx-gate",
+            .access_key = minio_root_user,
+            .secret_key = minio_root_password,
+            .prefix = "replica",
+            .clock = .{
+                .context = &plain_clock_context,
+                .now_ms_fn = TestClock.now_ms,
+            },
+            .retry = .{
+                .context = &probe,
+                .next_delay_ms_fn = RetryProbe.next,
+                .max_attempts = 3,
+            },
+        },
+        &plain_send_workspace,
+    );
+    defer s3.deinit();
+    const client = s3.client();
+    const identity = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(31),
+        .max_txid = ltx.TXID.init(31),
+    };
+    try client.write(0, identity, 8000, "retry-probe");
+    var storage: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "retry-probe",
+        try client.open(0, identity, &storage),
+    );
+    try client.delete(&.{.{ .level = 0, .min_txid = identity.min_txid, .max_txid = identity.max_txid }});
+    try std.testing.expectEqual(@as(u32, 0), probe.calls);
+}
+
+test "etag replace renews only against the observed generation" {
+    var s3 = try ltx_s3.S3Client.init(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .host = minio_host,
+            .port = minio_port,
+            .bucket = "ltx-gate",
+            .access_key = minio_root_user,
+            .secret_key = minio_root_password,
+            .prefix = "replica",
+            .clock = .{
+                .context = &plain_clock_context,
+                .now_ms_fn = TestClock.now_ms,
+            },
+        },
+        &plain_send_workspace,
+    );
+    defer s3.deinit();
+    const client = s3.client();
+
+    const identity = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(21),
+        .max_txid = ltx.TXID.init(21),
+    };
+    var storage: [64]u8 = undefined;
+    try std.testing.expectError(
+        error.ObjectNotFound,
+        s3.object_etag(0, identity),
+    );
+
+    // Claim, read the generation, renew against it, then lose to a shift.
+    try s3.put_if_absent(0, identity, 7000, "first");
+    // ETag slices live only until the next request, so keep copies.
+    var etag_one: [128]u8 = @splat(0);
+    {
+        const live = try s3.object_etag(0, identity);
+        try std.testing.expect(live.len <= etag_one.len);
+        @memcpy(etag_one[0..live.len], live);
+    }
+    try s3.put_if_match(0, identity, 7100, "second", etag_one[0..etag_len(&etag_one)]);
+    try std.testing.expectEqualStrings(
+        "second",
+        try client.open(0, identity, &storage),
+    );
+
+    var etag_two: [128]u8 = @splat(0);
+    {
+        const live = try s3.object_etag(0, identity);
+        try std.testing.expect(live.len <= etag_two.len);
+        @memcpy(etag_two[0..live.len], live);
+    }
+    // A contender renews between our read and our write.
+    try s3.put_if_match(0, identity, 7200, "contender", etag_two[0..etag_len(&etag_two)]);
+    try std.testing.expectError(
+        error.ETagMismatch,
+        s3.put_if_match(0, identity, 7300, "stale-writer", etag_one[0..etag_len(&etag_one)]),
+    );
+    try std.testing.expectError(
+        error.ETagMismatch,
+        s3.put_if_match(0, identity, 7300, "stale-writer", etag_two[0..etag_len(&etag_two)]),
+    );
+    try std.testing.expectEqualStrings(
+        "contender",
+        try client.open(0, identity, &storage),
+    );
+    try client.delete(&.{.{ .level = 0, .min_txid = identity.min_txid, .max_txid = identity.max_txid }});
+}
+
+/// The ETag copy keeps its length in a sentinel-free fixed buffer by
+/// tracking the quoted length explicitly.
+fn etag_len(buffer: *const [128]u8) usize {
+    var index: usize = 0;
+    while (index < buffer.len and buffer[index] != 0) : (index += 1) {}
+    return index;
+}
+
+test "virtual-host addressing serves the same objects" {
+    if (s3_options.minio_vh_port == 0) {
+        return error.SkipZigTest;
+    }
+    var s3 = try ltx_s3.S3Client.init(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .host = "localhost",
+            .port = s3_options.minio_vh_port,
+            .bucket = "ltx-gate-vh",
+            .access_key = minio_root_user,
+            .secret_key = minio_root_password,
+            .prefix = "replica",
+            .virtual_host = true,
+            .clock = .{
+                .context = &plain_clock_context,
+                .now_ms_fn = TestClock.now_ms,
+            },
+        },
+        &plain_send_workspace,
+    );
+    defer s3.deinit();
+    try s3.ensure_bucket();
+    try ltx_object.run_conformance(s3.client());
+}

@@ -327,6 +327,46 @@ pub fn build(b: *std.Build) void {
         "Run live host-SQLite WAL and generation-store integration tests",
     );
     sqlite_integration_step.dependOn(&run_sqlite_integration_tests.step);
+    const capture_crash_child = b.addExecutable(.{
+        .name = "ltx-capture-crash-child",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/capture_crash_child.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "ltx", .module = host_ltx },
+                .{ .name = "ltx_wal", .module = host_wal },
+                .{ .name = "ltx_object", .module = host_object },
+                .{ .name = "ltx_capture", .module = host_capture },
+            },
+        }),
+    });
+    capture_crash_child.root_module.linkSystemLibrary("sqlite3", .{});
+    const capture_crash_options = b.addOptions();
+    capture_crash_options.addOptionPath("child_path", capture_crash_child.getEmittedBin());
+    const capture_crash_options_module = capture_crash_options.createModule();
+    const capture_crash_tests = b.addTest(.{
+        .name = "ltx-capture-crash-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/capture_crash.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "ltx", .module = host_ltx },
+                .{ .name = "ltx_wal", .module = host_wal },
+                .{ .name = "ltx_object", .module = host_object },
+                .{ .name = "ltx_capture", .module = host_capture },
+                .{ .name = "ltx_replica", .module = host_replica },
+                .{ .name = "crash_options", .module = capture_crash_options_module },
+            },
+        }),
+    });
+    capture_crash_tests.root_module.linkSystemLibrary("sqlite3", .{});
+    const run_capture_crash_tests = b.addRunArtifact(capture_crash_tests);
+    run_capture_crash_tests.has_side_effects = true;
+
     const capture_integration_module = b.createModule(.{
         .root_source_file = b.path("tests/capture.zig"),
         .target = b.graph.host,
@@ -352,6 +392,7 @@ pub fn build(b: *std.Build) void {
         "Run live host-SQLite capture and restore integration tests",
     );
     capture_integration_step.dependOn(&run_capture_integration_tests.step);
+    capture_integration_step.dependOn(&run_capture_crash_tests.step);
 
     const fuzz_lz4_tests = b.addTest(.{
         .name = "ltx-lz4-fuzz-tests",
@@ -380,6 +421,11 @@ pub fn build(b: *std.Build) void {
         u16,
         "minio-tls-port",
         "TLS port of the MinIO gate instance",
+    ) orelse 0);
+    s3_gate_options.addOption(u16, "minio_vh_port", b.option(
+        u16,
+        "minio-vh-port",
+        "Virtual-host (MINIO_DOMAIN) port of the MinIO gate instance",
     ) orelse 0);
     const s3_gate_options_module = s3_gate_options.createModule();
     const s3_integration_tests = b.addTest(.{
@@ -564,6 +610,41 @@ pub fn build(b: *std.Build) void {
         .root_module = replicate_once_module,
     });
     const run_replicate_once_example = b.addRunArtifact(replicate_once_example);
+    const scale_mb = b.option(
+        u64,
+        "scale-mb",
+        "Target database size in MiB for the scale qualification tool",
+    ) orelse 256;
+    const scale_options = b.addOptions();
+    scale_options.addOption(u64, "default_mb", scale_mb);
+    const scale_module = b.createModule(.{
+        .root_source_file = b.path("tools/scale_qualification/main.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "scale_options", .module = scale_options.createModule() },
+            .{ .name = "ltx", .module = host_ltx },
+            .{ .name = "ltx_wal", .module = host_wal },
+            .{ .name = "ltx_object", .module = host_object },
+            .{ .name = "ltx_capture", .module = host_capture },
+            .{ .name = "ltx_replica", .module = host_replica },
+        },
+    });
+    scale_module.linkSystemLibrary("sqlite3", .{});
+    const scale_tool = b.addExecutable(.{
+        .name = "ltx-scale-check",
+        .root_module = scale_module,
+    });
+    const run_scale_tool = b.addRunArtifact(scale_tool);
+    run_scale_tool.addArg(b.fmt("--mb={d}", .{scale_mb}));
+    run_scale_tool.has_side_effects = true;
+    const scale_check_step = b.step(
+        "scale-check",
+        "Qualify capture, compaction, and restore at scale",
+    );
+    scale_check_step.dependOn(&run_scale_tool.step);
+
     const replicate_once_example_step = b.step(
         "example-replicate-once",
         "Run the one-shot SQLite-to-LTX replication and restore example",
