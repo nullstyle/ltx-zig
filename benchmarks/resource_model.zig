@@ -1,5 +1,6 @@
 const std = @import("std");
 const ltx = @import("ltx");
+const wal = @import("ltx_wal");
 
 pub const Error = error{
     InvalidLimits,
@@ -50,6 +51,19 @@ pub fn compactor_workspace_bytes(
 /// the final database image, and the applier value are separate resources.
 pub fn staged_apply_workspace_bytes(limits: ltx.Limits) Error!usize {
     return decoder_workspace_bytes(limits);
+}
+
+/// Caller-owned variable storage for one WAL committed-page-map scan: page
+/// slots, the pending-page list, its bitmap, and the result entries. The
+/// reader value and the whole WAL input slice are separate resources.
+pub fn wal_page_map_workspace_bytes(limits: wal.Limits) Error!usize {
+    limits.validate() catch return error.InvalidLimits;
+    const pages = try cast_usize(limits.max_pages);
+    const slots = try mul_usize(pages, @sizeOf(wal.PageSlot));
+    const pending = try mul_usize(pages, @sizeOf(u32));
+    const bitmap = (pages + 7) / 8;
+    const entries = try mul_usize(pages, @sizeOf(wal.PageMapEntry));
+    return add_usize(try add_usize(try add_usize(slots, pending), bitmap), entries);
 }
 
 /// Exact logical database length for a commit and page size.

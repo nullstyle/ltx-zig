@@ -1,6 +1,7 @@
 const std = @import("std");
 const ltx = @import("ltx");
 const resource_model = @import("resource_model");
+const wal = @import("ltx_wal");
 
 test "workspace formulas use symbolic public type sizes" {
     const limits = test_limits(4096, 4128, 256);
@@ -229,4 +230,29 @@ fn test_limits(
         .max_varint_bytes = 10,
         .max_transaction_span = std.math.maxInt(u64),
     };
+}
+
+test "wal page-map workspace formula covers slots, pending, bitmap, entries" {
+    const wal_limits = wal.Limits{
+        .max_page_size = 4096,
+        .max_pages = 64,
+        .max_frames = 256,
+    };
+    const pages: usize = wal_limits.max_pages;
+    const expected = pages * @sizeOf(wal.PageSlot) +
+        pages * @sizeOf(u32) +
+        (pages + 7) / 8 +
+        pages * @sizeOf(wal.PageMapEntry);
+    try std.testing.expectEqual(
+        expected,
+        try resource_model.wal_page_map_workspace_bytes(wal_limits),
+    );
+    try std.testing.expectError(
+        error.InvalidLimits,
+        resource_model.wal_page_map_workspace_bytes(.{
+            .max_page_size = 4097,
+            .max_pages = 64,
+            .max_frames = 256,
+        }),
+    );
 }
