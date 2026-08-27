@@ -1,8 +1,15 @@
 [tools]
 go = "1.24.13"
 zig = "0.16.0"
+minio = "latest"
 
 [tasks.ci-local]
 description = "Run the Linux GitHub Actions lane locally"
 tools.act = "0.2.89"
+tools.minio = "2025.01.20.14.49.07"
 run = "act push"
+
+[tasks.s3-integration]
+description = "Run the S3 backend conformance gate against local MinIO"
+tools.minio = "2025.01.20.14.49.07"
+run = "sh tools/s3_gate/run.sh"
