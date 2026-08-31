@@ -272,22 +272,11 @@ pub fn main(init: std.process.Init) !void {
         );
     }
     if (level_lists[0].len < 2) return error.ChainTooShort;
-    const sizes = try allocator.alloc(u64, level_lists[0].len);
-    defer allocator.free(sizes);
-    for (level_lists[0], 0..) |info, index| {
-        const bytes = try client.open(
-            0,
-            .{ .min_txid = info.min_txid, .max_txid = info.max_txid },
-            workspaces.output,
-        );
-        sizes[index] = bytes.len;
-    }
     const compaction_plan = try ltx_replica.plan_compaction(
         level_lists[0],
         level_lists[1],
         @intCast(level_lists[0].len),
         8 << 30,
-        sizes,
     );
     if (compaction_plan.input_count < 2) return error.ChainTooShort;
 
@@ -348,7 +337,7 @@ pub fn main(init: std.process.Init) !void {
     }
     var plan_storage: [4096]ltx.FileInfo = undefined;
     const plan = try ltx_replica.calc_restore_plan(&level_lists, ltx.TXID.init(0), &plan_storage);
-    const backend = try ltx_replica.RestoreBackend.init(dir, io, "restored.db");
+    var backend = try ltx_replica.RestoreBackend.init(dir, io, "restored.db");
     var job = ltx_replica.RestoreJob{
         .client = client,
         .codec_limits = limits,
@@ -356,7 +345,7 @@ pub fn main(init: std.process.Init) !void {
             .max_database_pages = max_pages,
             .max_database_bytes = 1 << 30,
         },
-        .backend = backend,
+        .backend = backend.backend(),
         .storage = workspaces.output,
         .page_workspace = workspaces.page,
         .compressed_workspace = workspaces.compressed,

@@ -42,6 +42,24 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
+    const ltx_resources = b.addModule("ltx_resources", .{
+        .root_source_file = b.path("src/resources.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ltx", .module = ltx },
+            .{ .name = "ltx_wal", .module = ltx_wal },
+        },
+    });
+    const host_resources = b.createModule(.{
+        .root_source_file = b.path("src/resources.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ltx", .module = host_ltx },
+            .{ .name = "ltx_wal", .module = host_wal },
+        },
+    });
     const ltx_object_module = b.addModule("ltx_object", .{
         .root_source_file = b.path("src/object.zig"),
         .target = target,
@@ -54,7 +72,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "ltx", .module = host_ltx }},
     });
-    _ = b.addModule("ltx_replica", .{
+    const ltx_replica = b.addModule("ltx_replica", .{
         .root_source_file = b.path("src/replica.zig"),
         .target = target,
         .optimize = optimize,
@@ -72,7 +90,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ltx_object", .module = host_object },
         },
     });
-    _ = b.addModule("ltx_capture", .{
+    const ltx_capture = b.addModule("ltx_capture", .{
         .root_source_file = b.path("src/capture.zig"),
         .target = target,
         .optimize = optimize,
@@ -90,6 +108,32 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ltx", .module = host_ltx },
             .{ .name = "ltx_wal", .module = host_wal },
             .{ .name = "ltx_object", .module = host_object },
+        },
+    });
+    _ = b.addModule("ltx_replication", .{
+        .root_source_file = b.path("src/replication.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ltx", .module = ltx },
+            .{ .name = "ltx_wal", .module = ltx_wal },
+            .{ .name = "ltx_object", .module = ltx_object_module },
+            .{ .name = "ltx_replica", .module = ltx_replica },
+            .{ .name = "ltx_capture", .module = ltx_capture },
+            .{ .name = "ltx_resources", .module = ltx_resources },
+        },
+    });
+    const host_replication = b.createModule(.{
+        .root_source_file = b.path("src/replication.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ltx", .module = host_ltx },
+            .{ .name = "ltx_wal", .module = host_wal },
+            .{ .name = "ltx_object", .module = host_object },
+            .{ .name = "ltx_replica", .module = host_replica },
+            .{ .name = "ltx_capture", .module = host_capture },
+            .{ .name = "ltx_resources", .module = host_resources },
         },
     });
     _ = b.addModule("ltx_s3", .{
@@ -387,11 +431,33 @@ pub fn build(b: *std.Build) void {
     });
     const run_capture_integration_tests = b.addRunArtifact(capture_integration_tests);
     run_capture_integration_tests.has_side_effects = true;
+    const replication_integration_module = b.createModule(.{
+        .root_source_file = b.path("tests/replication.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "ltx", .module = host_ltx },
+            .{ .name = "ltx_wal", .module = host_wal },
+            .{ .name = "ltx_object", .module = host_object },
+            .{ .name = "ltx_replica", .module = host_replica },
+            .{ .name = "ltx_capture", .module = host_capture },
+            .{ .name = "ltx_replication", .module = host_replication },
+        },
+    });
+    replication_integration_module.linkSystemLibrary("sqlite3", .{});
+    const replication_integration_tests = b.addTest(.{
+        .name = "ltx-replication-integration-tests",
+        .root_module = replication_integration_module,
+    });
+    const run_replication_integration_tests = b.addRunArtifact(replication_integration_tests);
+    run_replication_integration_tests.has_side_effects = true;
     const capture_integration_step = b.step(
         "capture-integration",
-        "Run live host-SQLite capture and restore integration tests",
+        "Run live host-SQLite capture, restore, and controller integration tests",
     );
     capture_integration_step.dependOn(&run_capture_integration_tests.step);
+    capture_integration_step.dependOn(&run_replication_integration_tests.step);
     capture_integration_step.dependOn(&run_capture_crash_tests.step);
 
     const fuzz_lz4_tests = b.addTest(.{
@@ -428,8 +494,17 @@ pub fn build(b: *std.Build) void {
         "Virtual-host (MINIO_DOMAIN) port of the MinIO gate instance",
     ) orelse 0);
     const s3_gate_options_module = s3_gate_options.createModule();
+    const s3_test_filters: []const []const u8 = if (b.option(
+        []const u8,
+        "s3-test-filter",
+        "Run only S3 integration tests whose names contain this text",
+    )) |filter|
+        b.allocator.dupe([]const u8, &.{filter}) catch @panic("out of memory")
+    else
+        &.{};
     const s3_integration_tests = b.addTest(.{
         .name = "ltx-s3-integration-tests",
+        .filters = s3_test_filters,
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/s3.zig"),
             .target = b.graph.host,
@@ -451,15 +526,6 @@ pub fn build(b: *std.Build) void {
     );
     s3_integration_step.dependOn(&run_s3_integration_tests.step);
 
-    const resource_model = b.createModule(.{
-        .root_source_file = b.path("benchmarks/resource_model.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "ltx", .module = ltx },
-            .{ .name = "ltx_wal", .module = ltx_wal },
-        },
-    });
     const resource_model_tests = b.addTest(.{
         .name = "ltx-resource-model-tests",
         .root_module = b.createModule(.{
@@ -469,7 +535,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "ltx", .module = ltx },
                 .{ .name = "ltx_wal", .module = ltx_wal },
-                .{ .name = "resource_model", .module = resource_model },
+                .{ .name = "ltx_resources", .module = ltx_resources },
             },
         }),
     });
@@ -502,7 +568,7 @@ pub fn build(b: *std.Build) void {
 
     const compile_tests_step = b.step(
         "compile-tests",
-        "Compile the core and SQLite module tests without running them",
+        "Compile all public modules and portability tests without running them",
     );
     compile_tests_step.dependOn(&unit_tests.step);
     compile_tests_step.dependOn(&portability_sqlite_tests.step);
@@ -600,8 +666,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ltx", .module = host_ltx },
             .{ .name = "ltx_wal", .module = host_wal },
             .{ .name = "ltx_object", .module = host_object },
-            .{ .name = "ltx_capture", .module = host_capture },
             .{ .name = "ltx_replica", .module = host_replica },
+            .{ .name = "ltx_replication", .module = host_replication },
         },
     });
     replicate_once_module.linkSystemLibrary("sqlite3", .{});
@@ -663,7 +729,7 @@ pub fn build(b: *std.Build) void {
     consumer_smoke.has_side_effects = true;
     const consumer_smoke_step = b.step(
         "consumer-smoke",
-        "Test both public modules through an external path dependency",
+        "Test the public modules through an external path dependency",
     );
     consumer_smoke_step.dependOn(&consumer_smoke.step);
 
@@ -685,6 +751,8 @@ pub fn build(b: *std.Build) void {
         "Compile the current external package consumer",
     );
     consumer_compile_step.dependOn(&consumer_compile.step);
+    // The hosted portability matrix invokes `compile-tests`; include the
+    // external consumer so every shipped module is compiled for each target.
     compile_tests_step.dependOn(&consumer_compile.step);
 
     const source_archive_smoke = b.addExecutable(.{
@@ -1024,7 +1092,7 @@ pub fn build(b: *std.Build) void {
         .optimize = bench_optimize,
     });
     const benchmark_resource_model = b.createModule(.{
-        .root_source_file = b.path("benchmarks/resource_model.zig"),
+        .root_source_file = b.path("src/resources.zig"),
         .target = b.graph.host,
         .optimize = bench_optimize,
         .imports = &.{
@@ -1058,7 +1126,7 @@ pub fn build(b: *std.Build) void {
             .optimize = bench_optimize,
             .imports = &.{
                 .{ .name = "ltx", .module = benchmark_ltx },
-                .{ .name = "resource_model", .module = benchmark_resource_model },
+                .{ .name = "ltx_resources", .module = benchmark_resource_model },
             },
         }),
     });

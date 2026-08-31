@@ -15,6 +15,8 @@ exact revisions:
   `ceabe1fe1b3076094805244ee6a3acff4d43d1e8`
 - [`denoland/celld` LTX crate](https://github.com/denoland/celld/tree/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx):
   `89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9`
+- [`denoland/celld` v0.4.0 LTX crate (architecture re-audit)](https://github.com/denoland/celld/tree/a52f9905425bc41134d817694bdc2c50bcc5e856/crates/ltx):
+  `a52f9905425bc41134d817694bdc2c50bcc5e856`
 - [`benbjohnson/litestream` v0.5.11](https://github.com/benbjohnson/litestream/tree/016c368704e63db0088b9b61e2e96c0019f11832):
   `016c368704e63db0088b9b61e2e96c0019f11832`
 - [`benbjohnson/litestream` v0.5.16](https://github.com/benbjohnson/litestream/tree/6d61ef5d007756d62e473daee4c760ac395a55c6):
@@ -66,7 +68,7 @@ For Rust: `README.md`, `Cargo.toml`, every file under `src/`, and
 only: it implements an obsolete pre-v3 layout with four-byte page headers,
 whole-block LZ4 framing, and no page index.
 
-For `denoland/celld`: `crates/ltx/README.md`, `Cargo.toml`,
+For `denoland/celld` v0.3.0: `crates/ltx/README.md`, `Cargo.toml`,
 `reference/ltx-format.md`, `src/codec.rs`, `src/ltx.rs`, `src/lz4_block.rs`,
 `src/compactor.rs`, `src/replica_compactor.rs`, `src/replica.rs`,
 `src/wal.rs`, `src/faults_inject.rs`, `tests/differential_xtool.rs`, the
@@ -83,6 +85,16 @@ read-to-end design is intentionally not a memory model for this
 allocation-free Zig core, and it does not perform Zig's exact one-to-one
 index/frame cross-check. This pinned crate is v3-only: it contains no LTX v2
 decoder, writer, fixture corpus, or oracle.
+
+The v0.4.0 architecture re-audit covered the same production modules. It found
+no new LTX wire profile. Relevant deployment changes are a tail-shaped WAL
+resume reader, reusable restore plans with bounded concurrent downloads, and a
+single-request `has_any_object` startup probe. Its object client still formats
+`litestream-timestamp` as RFC3339Nano; it also permits an ambient AWS credential
+chain when explicit keys are empty, which Zig deliberately does not import.
+The v0.4.0 tree removed the earlier golden fixtures and most crate-local tests,
+so the immutable v0.3.0 fixture pin remains the interoperability reference while
+v0.4.0 informs resource and controller design.
 
 For Litestream v0.5.16: the release archive manifest, `go.mod`,
 `cmd/litestream/restore.go`, `replica.go` restore planning and decode path, and
@@ -385,22 +397,29 @@ to the codec compactor. `ltx_capture` follows the `db.rs` capture path at
 snapshot/incremental/fallback granularity: one TXID per sync batch, the
 no-checksum L0 profile, Litestream control tables, a checkpoint-blocking read
 lock, DB-file page backfill, and snapshot fallback whenever the WAL segment
-salts stop matching the captured segment. Celld's checkpoint policy tiers,
-writer barrier, and mid-WAL resume optimization are documented as remaining
-work in the roadmap, not silently dropped.
+salts stop matching the captured segment. It now also implements seeded
+mid-WAL resume, byte-, age-, and frame-count checkpoint tiers,
+restored-position seeding, and crash-replay continuation. Celld's writer
+barrier is deliberately not ported: `ltx_capture.Session` is the single writer
+for its database, so the host schedules capture without a second
+writer-admission mechanism.
 
 The `ltx_object` filesystem backend writes the Litestream replica tree
 (`<root>/ltx/<level>/<min>-<max>.ltx`) with temp-write, sync, and rename
 publication, matching Celld's `client/file.rs`; its backend-agnostic
 conformance suite plays the role of Celld's `run_client_suite`. The
-`ltx_s3` backend implements the same contract with path-style AWS Signature
-Version 4 requests, the four-hex level layout of Litestream's object-store
-replica, `ListObjectsV2` with prefix scoping and `start-after` seeking, and
-the `litestream-timestamp` object metadata header. Its signing decisions —
-strict AWS URI encoding with uppercase percent escapes in canonical query
-values, the payload hash covering every request, and 204 accepted for
-deletes — are verified against real MinIO by the `s3-integration` gate
-rather than by round trip.
+`ltx_s3` backend implements the same contract with path-style or virtual-host
+AWS Signature Version 4 requests, the four-hex level layout of Litestream's
+object-store replica, `ListObjectsV2` with prefix scoping and `start-after`
+seeking, TLS with a custom or system CA, conditional create and ETag-matched
+replacement, bounded retry of idempotent requests, transactional writer
+sessions with automatic single-or-multipart publication, and the
+`litestream-timestamp` object metadata header. Its signing
+decisions — strict AWS URI encoding with uppercase percent escapes in
+canonical query values, the payload hash covering every request, and 204
+accepted for deletes — are verified against isolated real MinIO lanes for
+plain HTTP, TLS, and supported virtual-host addressing by the
+`s3-integration` gate rather than by a Zig-only round trip.
 
 ## Compatibility decisions and disagreements
 

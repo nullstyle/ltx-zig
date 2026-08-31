@@ -24,8 +24,46 @@ relax those byte-level compatibility or safety requirements.
   both formats use `LTX1`. The encoder accepts only `.v3`. Compaction can select
   a version per input and always emits canonical v3.
 - `ltx_sqlite` provides the optional host-filesystem generation store. It uses
-  `ltx` and can publish a verified image decoded from v2 or v3, but neither
-  public module links SQLite or libc.
+  `ltx` and can publish a verified image decoded from v2 or v3 without linking
+  SQLite or libc.
+- `ltx_wal` parses bounded caller-owned SQLite WAL bytes into committed page
+  maps, validates salts and cumulative checksums, tolerates a torn tail, and
+  supports seeded mid-WAL resume without linking SQLite.
+- `ltx_object` defines the synchronous storage-neutral object contract and its
+  filesystem adapter in the Litestream layout, including the reusable backend
+  conformance suite. Optional transactional write sessions expose a bounded
+  `ltx.Writer`; `finish` is their only publication attempt and `abort`
+  discards private staging. `PublicationIndeterminate` means the adapter
+  crossed its commit point but could not confirm durable publication, so the
+  caller must reconcile the object identity.
+- `ltx_s3` implements that object contract over the standard-library HTTP
+  client with path-style or virtual-host SigV4, TLS, bounded retry, paginated
+  listings, conditional writes, and automatic single-or-multipart
+  transactional upload. Its pooled HTTP connections use the allocator supplied
+  at initialization. Remote post-send failures can be publication-indeterminate;
+  fenced writes report that condition explicitly, while transactional writers
+  require reconciliation by object identity before durable progress advances.
+- `ltx_replica` provides the Litestream level ladder, restore, compaction, and
+  retention planners, plus restore and compaction executors over caller-owned
+  workspaces. They remain public lower-level escape hatches beneath the
+  controller.
+- `ltx_capture` provides the WAL-mode SQLite capture session, no-checksum L0
+  publication, seeded continuation after restore, mid-WAL resume, snapshot
+  fallback on foreign WAL discontinuity, and byte-, age-, and frame-bounded
+  passive checkpoint policy. `checkpoint_pending` exposes an automatic
+  checkpoint retry that could not complete after a successful capture. It
+  alone declares a SQLite C surface; the host executable links the system
+  SQLite library.
+- `ltx_resources` is the public checked source of truth for codec, apply, WAL,
+  and wire capacities. `ArenaCursor` binds typed and byte workspaces out of one
+  fixed caller-owned arena without overlap or allocation.
+- `ltx_replication` provides the synchronous per-database `Controller`. It
+  owns capture position, all-level listing, startup restore, one selected
+  adjacent-level maintenance quantum, safe retention, and restore execution;
+  the host retains scheduling, concurrency, acknowledgement, and fencing.
+  Restore-latest startup requires a host-quiesced target with no SQLite
+  sidecars, and initialization copies the level ladder and validates every
+  simultaneously live resource range.
 
 The core remains synchronous and allocation-free after initialization. Page
 events are unverified; publication and trusted post-apply positions are valid
@@ -47,8 +85,8 @@ provided flags and verified `query_only` statement. `FaultPoint` and
 
 ## Current-consumer qualification
 
-The external path-dependency fixture verifies that the package exposes working
-`ltx` and `ltx_sqlite` modules through normal Zig dependency wiring:
+The external path-dependency fixture verifies that the package exposes all
+nine current public modules through normal Zig dependency wiring:
 
 ```sh
 mise exec -- zig build consumer-compile
@@ -60,5 +98,6 @@ source-compatibility guarantee. It may be updated alongside intentional 0.x
 source changes.
 `source-archive-smoke` additionally creates Zig's canonical local `zig fetch`
 tarball, extracts it with isolated caches, and runs the archived consumer plus
-all shipped examples. That gate checks package completeness without promising
-future source compatibility.
+all four shipped examples, including the SQLite-linked replication lifecycle.
+That gate checks package completeness without promising future source
+compatibility.

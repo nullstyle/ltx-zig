@@ -94,13 +94,15 @@ pub fn parse_file_name(name: []const u8) Error!FileIdentity {
 }
 
 /// One listed replication object. The level and TXID range come from the
-/// storage layout; `created_at_ms` is the object's creation timestamp in Unix
-/// milliseconds when the backend reports one (object metadata or file mtime),
-/// and `null` otherwise. It only tie-breaks restore candidate selection.
+/// storage layout and `size_bytes` is the exact stored object length.
+/// `created_at_ms` is the object's creation timestamp in Unix milliseconds
+/// when the backend reports one (object metadata or file mtime), and `null`
+/// otherwise. It only tie-breaks restore candidate selection.
 pub const FileInfo = struct {
     level: u8,
     min_txid: TXID,
     max_txid: TXID,
+    size_bytes: u64,
     created_at_ms: ?i64 = null,
 };
 

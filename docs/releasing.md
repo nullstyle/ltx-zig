@@ -9,8 +9,8 @@ authority.
 1. Start from a clean `main` worktree whose hosted CI run is green.
 2. Set `.version` in `build.zig.zon`, add the matching version section to
    `CHANGELOG.md`, and update versioned command examples in `README.md` and this
-   checklist. During release-candidate work, keep the `0.3.0` changelog heading
-   as `## [0.2.0] - TBD`.
+   checklist. During release-candidate work, keep the new changelog heading in
+   the form `## [X.Y.Z] - TBD` (for example, `## [0.4.0] - TBD`).
 3. On the final release commit, replace `TBD` with the real release date in
    `YYYY-MM-DD` form. Do not create the tag while the heading is still pending.
 4. Review `LICENSE`, `LICENSE.pierrec-lz4`, and
@@ -41,6 +41,9 @@ mise exec -- zig build test
 mise exec -- zig build test -Doptimize=ReleaseSafe
 mise exec -- zig build sqlite-integration
 mise exec -- zig build sqlite-integration -Doptimize=ReleaseSafe
+mise exec -- zig build capture-integration
+mise exec -- zig build capture-integration -Doptimize=ReleaseSafe
+mise run s3-integration
 mise exec -- zig build consumer-compile
 mise exec -- zig build consumer-smoke -Doptimize=ReleaseSafe
 mise exec -- zig build resource-check -Doptimize=ReleaseSafe
@@ -49,6 +52,7 @@ mise exec -- zig build benchmark-smoke -Dbench-optimize=ReleaseSafe
 mise exec -- zig build example-round-trip -Doptimize=ReleaseSafe
 mise exec -- zig build example-apply-snapshot -Doptimize=ReleaseSafe
 mise exec -- zig build example-sqlite-store -Doptimize=ReleaseSafe
+mise exec -- zig build example-replicate-once -Doptimize=ReleaseSafe
 mise exec -- zig build source-archive-smoke -Doptimize=ReleaseSafe
 mise exec -- zig build fuzz --fuzz=10K -Doptimize=ReleaseSafe --seed 0
 GOTOOLCHAIN=local mise exec -- zig build interop -Doptimize=ReleaseSafe
@@ -61,9 +65,11 @@ path-dependency wiring. They are regression gates for the coordinated
 consumer, not a source-compatibility promise. `source-archive-smoke` asks the
 pinned Zig executable to create its canonical local `zig fetch` tarball,
 extracts it away from the checkout, and
-runs the archived consumer plus all three examples with isolated local and
+runs the archived consumer plus all four examples with isolated local and
 global caches. It therefore checks package-path completeness without a cached
-or live-source fallback; it does not replace fetching the final remote tag.
+or live-source fallback; the replication example makes the host SQLite
+development library a prerequisite. The gate does not replace fetching the
+final remote tag.
 `benchmark-smoke` verifies all 17 deterministic benchmark cases, including
 encoded bytes and digests, decoded images, compacted semantics, and
 callback/event/page counts. Neither it nor any other CI gate compares elapsed
@@ -74,6 +80,14 @@ SHA-256 against the values recorded in [`upstream.md`](upstream.md) before the
 `litestream-interop` command. The harness also rejects every reported version
 other than exactly `0.5.16`. It uses only a temporary local file replica and
 does not contact a configured remote replica.
+
+For capture-throughput or restore-path changes, also run the bounded scale
+qualification required by the engineering rules and update the measured
+numbers in [`replication.md`](replication.md) if they moved materially:
+
+```sh
+mise exec -- zig build scale-check -Dscale-mb=64
+```
 
 With Docker running, parse and then execute the pinned Ubuntu CI rehearsal:
 

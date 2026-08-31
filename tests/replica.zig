@@ -187,6 +187,135 @@ fn list_all_levels(
     }
 }
 
+const NeverBeginBackend = struct {
+    begin_count: u32 = 0,
+    stage_count: u32 = 0,
+    read_count: u32 = 0,
+    publish_count: u32 = 0,
+    abort_count: u32 = 0,
+
+    fn backend(self: *NeverBeginBackend) ltx.ApplyBackend {
+        return .{
+            .context = self,
+            .begin_fn = begin,
+            .stage_page_fn = stage_page,
+            .read_page_fn = read_page,
+            .publish_fn = publish,
+            .abort_fn = abort,
+        };
+    }
+
+    fn begin(
+        context: *anyopaque,
+        plan: ltx.ApplyPlan,
+    ) error{ApplyBeginFailure}!ltx.ApplyCurrent {
+        _ = plan;
+        const self: *NeverBeginBackend = @ptrCast(@alignCast(context));
+        self.begin_count += 1;
+        return error.ApplyBeginFailure;
+    }
+
+    fn stage_page(
+        context: *anyopaque,
+        page: ltx.StagedPage,
+    ) error{ApplyStageFailure}!void {
+        _ = page;
+        const self: *NeverBeginBackend = @ptrCast(@alignCast(context));
+        self.stage_count += 1;
+        return error.ApplyStageFailure;
+    }
+
+    fn read_page(
+        context: *anyopaque,
+        page_number: u32,
+        destination: []u8,
+    ) error{ApplyReadFailure}!void {
+        _ = page_number;
+        _ = destination;
+        const self: *NeverBeginBackend = @ptrCast(@alignCast(context));
+        self.read_count += 1;
+        return error.ApplyReadFailure;
+    }
+
+    fn publish(
+        context: *anyopaque,
+        expected: ltx.ApplyCurrent,
+        verified: ltx.VerifiedLTX,
+    ) error{
+        ApplyPublishFailure,
+        ApplyPublishIndeterminate,
+        NonContiguousTransition,
+        DivergentHistory,
+        DatabasePageSizeMismatch,
+    }!void {
+        _ = expected;
+        _ = verified;
+        const self: *NeverBeginBackend = @ptrCast(@alignCast(context));
+        self.publish_count += 1;
+        return error.ApplyPublishFailure;
+    }
+
+    fn abort(context: *anyopaque) void {
+        const self: *NeverBeginBackend = @ptrCast(@alignCast(context));
+        self.abort_count += 1;
+    }
+};
+
+test "restore rejects object key and header identity mismatches before staging" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    try write_chain(&store);
+    const client = store.client();
+
+    const cases = [_]struct {
+        source: ltx.FileIdentity,
+        stored_as: ltx.FileIdentity,
+    }{
+        .{
+            .source = .{ .min_txid = ltx.TXID.init(1), .max_txid = ltx.TXID.init(1) },
+            .stored_as = .{ .min_txid = ltx.TXID.init(1), .max_txid = ltx.TXID.init(9) },
+        },
+        .{
+            .source = .{ .min_txid = ltx.TXID.init(2), .max_txid = ltx.TXID.init(2) },
+            .stored_as = .{ .min_txid = ltx.TXID.init(1), .max_txid = ltx.TXID.init(2) },
+        },
+    };
+    for (cases, 0..) |case, index| {
+        var source_storage: [4096]u8 = undefined;
+        const source_bytes = try client.open(0, case.source, &source_storage);
+        try client.write(0, case.stored_as, @intCast(9000 + index), source_bytes);
+
+        var apply_backend = NeverBeginBackend{};
+        var object_storage: [4096]u8 = undefined;
+        var page_workspace: [page_size]u8 = undefined;
+        var compressed_workspace: [600]u8 = undefined;
+        var index_workspace: [4]ltx.PageIndexEntry = undefined;
+        var job = replica.RestoreJob{
+            .client = client,
+            .codec_limits = codec_limits,
+            .apply_limits = .{ .max_database_pages = 4, .max_database_bytes = 4096 },
+            .backend = apply_backend.backend(),
+            .storage = &object_storage,
+            .page_workspace = &page_workspace,
+            .compressed_workspace = &compressed_workspace,
+            .index_workspace = &index_workspace,
+        };
+        const false_info = ltx.FileInfo{
+            .level = 0,
+            .min_txid = case.stored_as.min_txid,
+            .max_txid = case.stored_as.max_txid,
+            .size_bytes = source_bytes.len,
+        };
+        try std.testing.expectError(error.ObjectIdentityMismatch, job.run(&.{false_info}));
+        try std.testing.expectEqual(@as(u32, 0), apply_backend.begin_count);
+        try std.testing.expectEqual(@as(u32, 0), apply_backend.stage_count);
+        try std.testing.expectEqual(@as(u32, 0), apply_backend.read_count);
+        try std.testing.expectEqual(@as(u32, 0), apply_backend.publish_count);
+        try std.testing.expectEqual(@as(u32, 0), apply_backend.abort_count);
+    }
+}
+
 test "restore replans and restores a level-0 chain to an exact image" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -201,7 +330,7 @@ test "restore replans and restores a level-0 chain to an exact image" {
     const plan = try replica.calc_restore_plan(&lists, ltx.TXID.init(0), &plan_storage);
     try std.testing.expectEqual(@as(usize, 3), plan.len);
 
-    const backend = try replica.RestoreBackend.init(
+    var backend = try replica.RestoreBackend.init(
         temporary.dir,
         std.testing.io,
         "database.sqlite",
@@ -214,7 +343,7 @@ test "restore replans and restores a level-0 chain to an exact image" {
         .client = client,
         .codec_limits = codec_limits,
         .apply_limits = .{ .max_database_pages = 4, .max_database_bytes = 4096 },
-        .backend = backend,
+        .backend = backend.backend(),
         .storage = &object_storage,
         .page_workspace = &page_workspace,
         .compressed_workspace = &compressed_workspace,
@@ -224,28 +353,15 @@ test "restore replans and restores a level-0 chain to an exact image" {
     try std.testing.expectEqual(@as(u64, 3), position.txid.value);
     try expect_restored_image(temporary.dir, std.testing.io);
 
-    // A targeted restore to TXID 2 stops at the second image.
-    const backend_two = try replica.RestoreBackend.init(
-        temporary.dir,
-        std.testing.io,
-        "database.sqlite",
-    );
-    var job_two = replica.RestoreJob{
-        .client = client,
-        .codec_limits = codec_limits,
-        .apply_limits = .{ .max_database_pages = 4, .max_database_bytes = 4096 },
-        .backend = backend_two,
-        .storage = &object_storage,
-        .page_workspace = &page_workspace,
-        .compressed_workspace = &compressed_workspace,
-        .index_workspace = &index_workspace,
-    };
+    // A new restore replaces the already-published TXID 3 image with the
+    // snapshot at the front of the capped plan, then continues to TXID 2.
     const capped_plan = try replica.calc_restore_plan(&lists, ltx.TXID.init(2), &plan_storage);
-    const capped_position = try job_two.run(capped_plan);
+    const capped_position = try job.run(capped_plan);
     try std.testing.expectEqual(@as(u64, 2), capped_position.txid.value);
+    try std.testing.expectEqual(@as(u64, 2), backend.current().position.txid.value);
 }
 
-test "compaction, mixed-level restore, and retention agree on the image" {
+test "zero-buffer streaming compaction, restore, and retention agree on the image" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
@@ -256,22 +372,11 @@ test "compaction, mixed-level restore, and retention agree on the image" {
     var buffers: [ltx.snapshot_level + 1][8]ltx.FileInfo = undefined;
     var lists: [ltx.snapshot_level + 1][]const ltx.FileInfo = undefined;
     try list_all_levels(client, &lists, &buffers);
-    var sizes: [8]u64 = undefined;
-    for (lists[0], 0..) |info, index| {
-        var object_storage: [4096]u8 = undefined;
-        const bytes = try client.open(
-            0,
-            .{ .min_txid = info.min_txid, .max_txid = info.max_txid },
-            &object_storage,
-        );
-        sizes[index] = bytes.len;
-    }
     const compaction_plan = try replica.plan_compaction(
         lists[0],
         lists[1],
         2,
         8192,
-        sizes[0..lists[0].len],
     );
     try std.testing.expectEqual(@as(usize, 2), compaction_plan.input_count);
 
@@ -295,7 +400,7 @@ test "compaction, mixed-level restore, and retention agree on the image" {
     };
     var compaction_inputs: [2]ltx.CompactionInput = undefined;
     var readers: [2]ltx.SliceReader = undefined;
-    var output_storage: [4096]u8 = undefined;
+    var output_storage: [0]u8 = .{};
     var output_compressed: [600]u8 = undefined;
     var output_compression: ltx.LZ4CompressionWorkspace = undefined;
     var output_index: [4]ltx.PageIndexEntry = undefined;
@@ -324,7 +429,7 @@ test "compaction, mixed-level restore, and retention agree on the image" {
     try std.testing.expectEqual(@as(usize, 2), plan.len);
     try std.testing.expectEqual(@as(u8, 1), plan[0].level);
 
-    const backend = try replica.RestoreBackend.init(
+    var backend = try replica.RestoreBackend.init(
         temporary.dir,
         std.testing.io,
         "database.sqlite",
@@ -337,7 +442,7 @@ test "compaction, mixed-level restore, and retention agree on the image" {
         .client = client,
         .codec_limits = codec_limits,
         .apply_limits = .{ .max_database_pages = 4, .max_database_bytes = 4096 },
-        .backend = backend,
+        .backend = backend.backend(),
         .storage = &restore_storage,
         .page_workspace = &page_workspace,
         .compressed_workspace = &compressed_workspace,
@@ -355,7 +460,7 @@ test "compaction, mixed-level restore, and retention agree on the image" {
     try list_all_levels(client, &lists, &buffers);
     try std.testing.expectEqual(@as(usize, 1), lists[0].len);
 
-    const backend_two = try replica.RestoreBackend.init(
+    var backend_two = try replica.RestoreBackend.init(
         temporary.dir,
         std.testing.io,
         "database.sqlite",
@@ -364,7 +469,7 @@ test "compaction, mixed-level restore, and retention agree on the image" {
         .client = client,
         .codec_limits = codec_limits,
         .apply_limits = .{ .max_database_pages = 4, .max_database_bytes = 4096 },
-        .backend = backend_two,
+        .backend = backend_two.backend(),
         .storage = &restore_storage,
         .page_workspace = &page_workspace,
         .compressed_workspace = &compressed_workspace,
@@ -373,4 +478,117 @@ test "compaction, mixed-level restore, and retention agree on the image" {
     const replay_plan = try replica.calc_restore_plan(&lists, ltx.TXID.init(0), &plan_storage);
     _ = try restore_job_two.run(replay_plan);
     try expect_restored_image(temporary.dir, std.testing.io);
+}
+
+const CompactionHarness = struct {
+    input_storage: [2][4096]u8 = undefined,
+    input_pages: [2][page_size]u8 = undefined,
+    input_compressed: [2][600]u8 = undefined,
+    input_indexes: [2][4]ltx.PageIndexEntry = undefined,
+    job_inputs: [2]replica.CompactionJobInput = undefined,
+    compaction_inputs: [2]ltx.CompactionInput = undefined,
+    readers: [2]ltx.SliceReader = undefined,
+    output_compressed: [600]u8 = undefined,
+    output_compression: ltx.LZ4CompressionWorkspace = undefined,
+    output_index: [4]ltx.PageIndexEntry = undefined,
+
+    fn job(
+        self: *CompactionHarness,
+        client: object.Client,
+        output_storage: []u8,
+    ) replica.CompactionJob {
+        for (&self.job_inputs, 0..) |*input, index| {
+            input.* = .{
+                .storage = &self.input_storage[index],
+                .page_workspace = &self.input_pages[index],
+                .compressed_workspace = &self.input_compressed[index],
+                .index_workspace = &self.input_indexes[index],
+            };
+        }
+        return .{
+            .client = client,
+            .codec_limits = codec_limits,
+            .compaction_limits = .{ .max_inputs = 2, .max_total_pages = 4 },
+            .inputs = &self.job_inputs,
+            .compaction_inputs = &self.compaction_inputs,
+            .readers = &self.readers,
+            .output_storage = output_storage,
+            .output_compressed_workspace = &self.output_compressed,
+            .output_compression_workspace = &self.output_compression,
+            .output_index_workspace = &self.output_index,
+        };
+    }
+};
+
+fn overwrite_second_payload_with_wider_txid(store: *object.FileClient) !void {
+    var page_one: Page = undefined;
+    var page_two: Page = undefined;
+    var page_three: Page = undefined;
+    fill_page(&page_one, 0xa1);
+    fill_page(&page_two, 0xb2);
+    const snapshot_checksum = try rolling_checksum(&.{ page_one, page_two }, &.{ 1, 2 });
+    fill_page(&page_two, 0xc3);
+    fill_page(&page_three, 0xd4);
+    const post_checksum = try rolling_checksum(
+        &.{ page_one, page_two, page_three },
+        &.{ 1, 2, 3 },
+    );
+    var storage: [4096]u8 = undefined;
+    var sink = ltx.SliceWriter.init(&storage);
+    try encode_transition(
+        2,
+        3,
+        snapshot_checksum,
+        3,
+        &.{ page_two, page_three },
+        &.{ 2, 3 },
+        post_checksum,
+        2000,
+        sink.writer(),
+    );
+    try store.client().write(
+        0,
+        .{ .min_txid = .init(2), .max_txid = .init(2) },
+        2000,
+        sink.written(),
+    );
+}
+
+test "compaction preserves whole-object fallback without write sessions" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    try write_chain(&store);
+    var client = store.client();
+    client.begin_write_fn = null;
+    var listing: [8]ltx.FileInfo = undefined;
+    const source = try client.list(0, ltx.TXID.init(0), &listing);
+    var harness = CompactionHarness{};
+    var output_storage: [4096]u8 = undefined;
+    var job = harness.job(client, &output_storage);
+    const verified = try job.run(source[0..2], 1);
+    try std.testing.expectEqual(@as(u64, 2), verified.header.max_txid.value);
+    const destination = try client.list(1, ltx.TXID.init(0), &listing);
+    try std.testing.expectEqual(@as(usize, 1), destination.len);
+}
+
+test "streaming compaction aborts when object keys mismatch output identity" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    try write_chain(&store);
+    try overwrite_second_payload_with_wider_txid(&store);
+    const client = store.client();
+    var listing: [8]ltx.FileInfo = undefined;
+    const source = try client.list(0, ltx.TXID.init(0), &listing);
+    var harness = CompactionHarness{};
+    var no_output_storage: [0]u8 = .{};
+    var job = harness.job(client, &no_output_storage);
+    try std.testing.expectError(
+        error.ObjectIdentityMismatch,
+        job.run(source[0..2], 1),
+    );
+    try std.testing.expect(!store.write_session_active);
+    const destination = try client.list(1, ltx.TXID.init(0), &listing);
+    try std.testing.expectEqual(@as(usize, 0), destination.len);
 }

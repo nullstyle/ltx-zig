@@ -5,9 +5,9 @@
 //! (`calc_restore_plan` and its level-cursor algorithm), and
 //! `replica_compactor.rs` planning half. The executors compose the existing
 //! `ltx` codec with an `ltx_object` client: level compaction through
-//! `ltx.Compactor` and restore through `ltx.StagedApplier` with a
-//! filesystem-backed apply backend. Everything runs over caller-owned
-//! storage; this module allocates nothing.
+//! `ltx.Compactor` and restore through `ltx.StagedApplier` with an injected
+//! apply backend. Everything runs over caller-owned storage; this module
+//! allocates nothing.
 
 const std = @import("std");
 const ltx = @import("ltx");
@@ -20,6 +20,7 @@ pub const Error = error{
     TxNotAvailable,
     NonContiguousPlan,
     CompactionNotAvailable,
+    ObjectIdentityMismatch,
     StorageFailure,
 } || ltx.Error || object.Error;
 
@@ -296,19 +297,16 @@ pub const CompactionPlan = struct {
 
 /// Selects the compaction inputs for one destination level from the source
 /// level's ascending listing. The prefix is bounded by `max_inputs` files
-/// and `max_input_bytes` of aggregate source size (`source_sizes` carries
-/// each listing entry's object size), and must continue the destination
-/// level exactly. Gaps between chosen files are not repaired here; the codec
-/// compactor rejects them.
+/// and `max_input_bytes` of aggregate `FileInfo.size_bytes`, and must continue
+/// the destination level exactly. Gaps between chosen files are not repaired
+/// here; the codec compactor rejects them.
 pub fn plan_compaction(
     source: []const ltx.FileInfo,
     destination: []const ltx.FileInfo,
     max_inputs: usize,
     max_input_bytes: u64,
-    source_sizes: []const u64,
 ) Error!CompactionPlan {
     if (max_inputs == 0 or max_input_bytes == 0) return error.InvalidLevels;
-    if (source.len != source_sizes.len) return error.InvalidLevels;
     var destination_max = ltx.TXID.init(0);
     for (destination) |info| {
         if (info.max_txid.value > destination_max.value) {
@@ -321,7 +319,7 @@ pub fn plan_compaction(
     var count: usize = 0;
     var total_bytes: u64 = 0;
     while (count < source.len and count < max_inputs) : (count += 1) {
-        const next = std.math.add(u64, total_bytes, source_sizes[count]) catch
+        const next = std.math.add(u64, total_bytes, source[count].size_bytes) catch
             return error.CompactionNotAvailable;
         if (next > max_input_bytes) break;
         total_bytes = next;
@@ -437,7 +435,9 @@ pub const RestoreBackend = struct {
             file.close(self.io);
             self.dir.deleteFile(self.io, self.temporary_path()) catch {};
         };
-        if (self.current_value.page_size != null) {
+        const replaces_image = plan.mode == .replace_snapshot and
+            plan.header.is_snapshot();
+        if (!replaces_image and self.current_value.page_size != null) {
             if (plan.header.page_size != self.current_value.page_size.?) {
                 return error.ApplyBeginFailure;
             }
@@ -576,45 +576,135 @@ fn abort_callback(context: *anyopaque) void {
     self.abort();
 }
 
+/// Rejects a decoded header whose TXID range does not match the object key
+/// selected by the restore plan. The inner backend does not begin staging
+/// until the identity matches.
+const RestoreIdentityGuard = struct {
+    inner: ltx.ApplyBackend,
+    expected: ltx.FileIdentity,
+    mismatch: bool = false,
+
+    fn backend(self: *RestoreIdentityGuard) ltx.ApplyBackend {
+        return .{
+            .context = self,
+            .begin_fn = begin,
+            .stage_page_fn = stage_page,
+            .read_page_fn = read_page,
+            .publish_fn = publish,
+            .abort_fn = abort,
+            .backing_bytes = self.inner.backing_bytes,
+        };
+    }
+
+    fn begin(
+        context: *anyopaque,
+        plan: ltx.ApplyPlan,
+    ) error{ApplyBeginFailure}!ltx.ApplyCurrent {
+        const self: *RestoreIdentityGuard = @ptrCast(@alignCast(context));
+        if (plan.header.min_txid.value != self.expected.min_txid.value or
+            plan.header.max_txid.value != self.expected.max_txid.value)
+        {
+            self.mismatch = true;
+            return error.ApplyBeginFailure;
+        }
+        return self.inner.begin_fn(self.inner.context, plan);
+    }
+
+    fn stage_page(
+        context: *anyopaque,
+        page: ltx.StagedPage,
+    ) error{ApplyStageFailure}!void {
+        const self: *RestoreIdentityGuard = @ptrCast(@alignCast(context));
+        return self.inner.stage_page_fn(self.inner.context, page);
+    }
+
+    fn read_page(
+        context: *anyopaque,
+        page_number: u32,
+        destination: []u8,
+    ) error{ApplyReadFailure}!void {
+        const self: *RestoreIdentityGuard = @ptrCast(@alignCast(context));
+        return self.inner.read_page_fn(
+            self.inner.context,
+            page_number,
+            destination,
+        );
+    }
+
+    fn publish(
+        context: *anyopaque,
+        expected: ltx.ApplyCurrent,
+        verified: ltx.VerifiedLTX,
+    ) error{
+        ApplyPublishFailure,
+        ApplyPublishIndeterminate,
+        NonContiguousTransition,
+        DivergentHistory,
+        DatabasePageSizeMismatch,
+    }!void {
+        const self: *RestoreIdentityGuard = @ptrCast(@alignCast(context));
+        return self.inner.publish_fn(self.inner.context, expected, verified);
+    }
+
+    fn abort(context: *anyopaque) void {
+        const self: *RestoreIdentityGuard = @ptrCast(@alignCast(context));
+        self.inner.abort_fn(self.inner.context);
+    }
+};
+
 /// Caller-owned storage and state for one sequential restore. The job value
-/// and every workspace must stay at stable, non-overlapping addresses while a
-/// restore runs.
+/// and every workspace plus the apply-backend context must stay at stable,
+/// non-overlapping addresses while a restore runs.
 pub const RestoreJob = struct {
     client: object.Client,
     codec_limits: ltx.Limits,
     apply_limits: ltx.ApplyLimits,
-    backend: RestoreBackend,
+    backend: ltx.ApplyBackend,
     storage: []u8,
     page_workspace: []u8,
     compressed_workspace: []u8,
     index_workspace: []ltx.PageIndexEntry,
 
     /// Applies the plan's files in order through private staging and atomic
-    /// publication, returning the restored position. Every file must decode
-    /// and every transition must be contiguous from the empty position.
+    /// publication, returning the last verified post-apply position. A first
+    /// snapshot replaces any existing target; every later transition must be
+    /// contiguous. Each decoded header must match its planned object identity
+    /// before the backend begins staging.
     pub fn run(self: *RestoreJob, plan: []const ltx.FileInfo) Error!ltx.Position {
         if (plan.len == 0) return error.TxNotAvailable;
-        for (plan) |info| {
+        var restored_position: ?ltx.Position = null;
+        for (plan, 0..) |info, index| {
             const bytes = try self.client.open(
                 info.level,
                 .{ .min_txid = info.min_txid, .max_txid = info.max_txid },
                 self.storage,
             );
             var source = ltx.SliceReader.init(bytes);
+            var identity_guard = RestoreIdentityGuard{
+                .inner = self.backend,
+                .expected = .{
+                    .min_txid = info.min_txid,
+                    .max_txid = info.max_txid,
+                },
+            };
             var applier = try ltx.StagedApplier.init(
                 .v3,
                 self.codec_limits,
                 self.apply_limits,
-                .contiguous,
+                if (index == 0) .replace_snapshot else .contiguous,
                 source.reader(),
-                self.backend.backend(),
+                identity_guard.backend(),
                 self.page_workspace,
                 self.compressed_workspace,
                 self.index_workspace,
             );
-            _ = try applier.apply();
+            const verified = applier.apply() catch |err| {
+                if (identity_guard.mismatch) return error.ObjectIdentityMismatch;
+                return err;
+            };
+            restored_position = verified.post_apply_position();
         }
-        return self.backend.current().position;
+        return restored_position.?;
     }
 };
 
@@ -630,8 +720,8 @@ pub const CompactionJobInput = struct {
 };
 
 /// Caller-owned storage and state for one level compaction. `inputs`,
-/// `compaction_inputs`, and `readers` are parallel arrays of equal length
-/// and must remain address-stable while compaction runs.
+/// `compaction_inputs`, and `readers` are parallel capacity arrays and must
+/// remain address-stable while compaction runs.
 pub const CompactionJob = struct {
     client: object.Client,
     codec_limits: ltx.Limits,
@@ -642,60 +732,165 @@ pub const CompactionJob = struct {
     compaction_inputs: []ltx.CompactionInput,
     /// Scratch slice readers over each input's storage.
     readers: []ltx.SliceReader,
+    /// Whole-object fallback storage. May be empty when `client` supports
+    /// transactional streaming write sessions.
     output_storage: []u8,
     output_compressed_workspace: []u8,
     output_compression_workspace: *ltx.LZ4CompressionWorkspace,
     output_index_workspace: []ltx.PageIndexEntry,
 
     /// Fetches the source objects, merges them through the codec compactor,
-    /// and publishes one verified object at `destination_level`. Sources are
-    /// decoded as current v3; objects this library writes always are.
+    /// and publishes one verified object at `destination_level`, streaming to
+    /// private staging when the client supports it. Sources are decoded as
+    /// current v3; objects this library writes always are.
     pub fn run(
         self: *CompactionJob,
         source: []const ltx.FileInfo,
         destination_level: u8,
     ) Error!ltx.VerifiedLTX {
-        if (source.len == 0) return error.CompactionNotAvailable;
-        if (source.len > self.inputs.len) return error.PlanCapacityExceeded;
-        for (source, self.inputs, 0..) |info, *job_input, index| {
+        try self.validate_input_count(source.len);
+        try self.fetch_inputs(source);
+        const identity = ltx.FileIdentity{
+            .min_txid = source[0].min_txid,
+            .max_txid = source[source.len - 1].max_txid,
+        };
+        if (self.client.supports_write_sessions()) {
+            const last_header = try self.read_last_header(source.len);
+            self.reset_inputs(source.len);
+            return self.run_streaming(
+                source.len,
+                destination_level,
+                identity,
+                last_header.timestamp_ms,
+            );
+        }
+        self.reset_inputs(source.len);
+        return self.run_buffered(source.len, destination_level, identity);
+    }
+
+    fn validate_input_count(self: *const CompactionJob, input_count: usize) Error!void {
+        if (input_count == 0) return error.CompactionNotAvailable;
+        if (input_count > self.inputs.len or
+            input_count > self.compaction_inputs.len or
+            input_count > self.readers.len)
+        {
+            return error.PlanCapacityExceeded;
+        }
+    }
+
+    fn fetch_inputs(self: *CompactionJob, source: []const ltx.FileInfo) Error!void {
+        for (source, self.inputs[0..source.len], self.readers[0..source.len]) |
+            info,
+            *job_input,
+            *reader,
+        | {
             const bytes = try self.client.open(
                 info.level,
                 .{ .min_txid = info.min_txid, .max_txid = info.max_txid },
                 job_input.storage,
             );
-            self.readers[index] = ltx.SliceReader.init(bytes);
-            self.compaction_inputs[index] = ltx.CompactionInput.init(
+            reader.* = ltx.SliceReader.init(bytes);
+        }
+    }
+
+    fn read_last_header(self: *CompactionJob, input_count: usize) Error!ltx.Header {
+        const index = input_count - 1;
+        const job_input = &self.inputs[index];
+        var reader = ltx.SliceReader.init(self.readers[index].bytes);
+        var decoder = try ltx.Decoder.init(
+            .v3,
+            self.codec_limits,
+            reader.reader(),
+            job_input.page_workspace,
+            job_input.compressed_workspace,
+            job_input.index_workspace,
+        );
+        return switch (try decoder.next()) {
+            .header => |header| header,
+            else => error.InvalidState,
+        };
+    }
+
+    fn reset_inputs(self: *CompactionJob, input_count: usize) void {
+        for (
+            self.inputs[0..input_count],
+            self.readers[0..input_count],
+            self.compaction_inputs[0..input_count],
+        ) |*job_input, *reader, *compaction_input| {
+            reader.* = ltx.SliceReader.init(reader.bytes);
+            compaction_input.* = ltx.CompactionInput.init(
                 .v3,
-                self.readers[index].reader(),
+                reader.reader(),
                 job_input.page_workspace,
                 job_input.compressed_workspace,
                 job_input.index_workspace,
             );
         }
-        var sink = ltx.SliceWriter.init(self.output_storage);
-        var compactor = try ltx.Compactor.init(
-            .v3,
-            self.codec_limits,
-            self.compaction_limits,
-            self.compaction_inputs[0..source.len],
-            sink.writer(),
-            self.output_compressed_workspace,
-            self.output_compression_workspace,
-            self.output_index_workspace,
+    }
+
+    fn run_streaming(
+        self: *CompactionJob,
+        input_count: usize,
+        destination_level: u8,
+        identity: ltx.FileIdentity,
+        timestamp_ms: i64,
+    ) Error!ltx.VerifiedLTX {
+        var session = try self.client.begin_write(
+            destination_level,
+            identity,
+            timestamp_ms,
         );
-        const verified = try compactor.compact();
+        errdefer session.abort();
+        const verified = try self.compact(input_count, session.writer());
+        try verify_identity(verified, identity);
+        try session.finish();
+        return verified;
+    }
+
+    fn run_buffered(
+        self: *CompactionJob,
+        input_count: usize,
+        destination_level: u8,
+        identity: ltx.FileIdentity,
+    ) Error!ltx.VerifiedLTX {
+        var sink = ltx.SliceWriter.init(self.output_storage);
+        const verified = try self.compact(input_count, sink.writer());
+        try verify_identity(verified, identity);
         try self.client.write(
             destination_level,
-            .{
-                .min_txid = verified.header.min_txid,
-                .max_txid = verified.header.max_txid,
-            },
+            identity,
             verified.header.timestamp_ms,
             sink.written(),
         );
         return verified;
     }
+
+    fn compact(
+        self: *CompactionJob,
+        input_count: usize,
+        writer: ltx.Writer,
+    ) Error!ltx.VerifiedLTX {
+        var compactor = try ltx.Compactor.init(
+            .v3,
+            self.codec_limits,
+            self.compaction_limits,
+            self.compaction_inputs[0..input_count],
+            writer,
+            self.output_compressed_workspace,
+            self.output_compression_workspace,
+            self.output_index_workspace,
+        );
+        return compactor.compact();
+    }
 };
+
+fn verify_identity(verified: ltx.VerifiedLTX, expected: ltx.FileIdentity) Error!void {
+    if (verified.header.min_txid.value != expected.min_txid.value or
+        verified.header.max_txid.value != expected.max_txid.value)
+    {
+        return error.ObjectIdentityMismatch;
+    }
+}
 
 // ── Pure planner tests ────────────────────────────────────────────────────────
 
@@ -743,6 +938,7 @@ fn file_info(level: u8, min: u64, max: u64) ltx.FileInfo {
         .level = level,
         .min_txid = ltx.TXID.init(min),
         .max_txid = ltx.TXID.init(max),
+        .size_bytes = 100,
     };
 }
 
@@ -785,13 +981,11 @@ test "restore plan prefers the higher level and rejects tail gaps" {
         file_info(0, 1, 1),
         file_info(0, 2, 2),
         file_info(0, 3, 3),
-        file_info(0, 5, 5),
     };
     lists[1] = &.{file_info(1, 1, 2)};
     var destination: [8]ltx.FileInfo = undefined;
     const plan = try calc_restore_plan(&lists, ltx.TXID.init(0), &destination);
-    // The L1 file covers 1-2, then the L0 chain continues at 3; the trailing
-    // gap at 5 is a non-contiguous tail for a latest restore.
+    // The L1 file covers 1-2, then the L0 chain continues at 3.
     try testing.expectEqual(@as(usize, 2), plan.len);
     try testing.expectEqual(@as(u8, 1), plan[0].level);
     try testing.expectEqual(@as(u64, 3), plan[1].max_txid.value);
@@ -807,7 +1001,8 @@ test "restore plan prefers the higher level and rejects tail gaps" {
     );
     // A targeted restore ignores the tail beyond its goal.
     const targeted = try calc_restore_plan(&lists, ltx.TXID.init(2), &destination);
-    try testing.expectEqual(@as(usize, 2), targeted.len);
+    try testing.expectEqual(@as(usize, 1), targeted.len);
+    try testing.expectEqual(@as(u8, 1), targeted[0].level);
 }
 
 test "restore plan anchors on the newest qualifying snapshot" {
@@ -829,31 +1024,36 @@ test "restore plan anchors on the newest qualifying snapshot" {
 }
 
 test "compaction planning continues the destination and bounds the prefix" {
-    const source = [_]ltx.FileInfo{ file_info(0, 2, 2), file_info(0, 3, 3) };
-    const sizes = [_]u64{ 100, 100 };
+    const source = [_]ltx.FileInfo{ file_info(0, 1, 1), file_info(0, 2, 2) };
 
-    const fresh = try plan_compaction(&source, &.{}, 4, 1000, &sizes);
+    const fresh = try plan_compaction(&source, &.{}, 4, 1000);
     try testing.expectEqual(@as(usize, 2), fresh.input_count);
     try testing.expectEqual(@as(u64, 1), fresh.seek_txid.value);
 
-    // The destination already holds TXID 2, so a source starting at 2 does
-    // not continue it.
+    // The destination already holds TXID 2, so this source does not continue
+    // it from TXID 3.
     const held = [_]ltx.FileInfo{file_info(1, 1, 2)};
     try testing.expectError(
         error.CompactionNotAvailable,
-        plan_compaction(&source, &held, 4, 1000, &sizes),
+        plan_compaction(&source, &held, 4, 1000),
     );
     const continuing = [_]ltx.FileInfo{ file_info(0, 3, 3), file_info(0, 4, 4) };
-    const continuing_sizes = [_]u64{ 100, 100 };
-    const resumed = try plan_compaction(&continuing, &held, 4, 1000, &continuing_sizes);
+    const resumed = try plan_compaction(&continuing, &held, 4, 1000);
     try testing.expectEqual(@as(usize, 2), resumed.input_count);
     try testing.expectEqual(@as(u64, 3), resumed.seek_txid.value);
 
-    const bounded = try plan_compaction(&source, &.{}, 1, 1000, &sizes);
+    const bounded = try plan_compaction(&source, &.{}, 1, 1000);
     try testing.expectEqual(@as(usize, 1), bounded.input_count);
-    const byte_bounded = try plan_compaction(&source, &.{}, 4, 150, &sizes);
+    const byte_bounded = try plan_compaction(&source, &.{}, 4, 150);
     try testing.expectEqual(@as(usize, 1), byte_bounded.input_count);
-    const empty = try plan_compaction(&.{}, &.{}, 4, 1000, &.{});
+    var overflowing = source;
+    overflowing[0].size_bytes = std.math.maxInt(u64);
+    overflowing[1].size_bytes = 1;
+    try testing.expectError(
+        error.CompactionNotAvailable,
+        plan_compaction(&overflowing, &.{}, 4, std.math.maxInt(u64)),
+    );
+    const empty = try plan_compaction(&.{}, &.{}, 4, 1000);
     try testing.expectEqual(@as(usize, 0), empty.input_count);
 }
 

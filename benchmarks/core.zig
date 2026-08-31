@@ -1,6 +1,6 @@
 const std = @import("std");
 const ltx = @import("ltx");
-const resource_model = @import("resource_model");
+const resource_model = @import("ltx_resources");
 const workloads = @import("core/workloads.zig");
 
 const default_iterations: u32 = 128;

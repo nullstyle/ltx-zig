@@ -1,7 +1,97 @@
 const std = @import("std");
 const ltx = @import("ltx");
-const resource_model = @import("resource_model");
+const resource_model = @import("ltx_resources");
 const wal = @import("ltx_wal");
+
+test "arena cursor binds aligned non-overlapping workspaces" {
+    var storage: [192]u8 align(64) = undefined;
+    var cursor = resource_model.ArenaCursor.init(storage[1..]);
+
+    const bytes = try cursor.bind_bytes(3);
+    const words = try cursor.bind_slice(u64, 2);
+    const aligned = try cursor.bind_aligned_bytes(5, 32);
+    const entries = try cursor.bind_slice(ltx.PageIndexEntry, 2);
+
+    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(words.ptr) % @alignOf(u64));
+    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(aligned.ptr) % 32);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        @intFromPtr(entries.ptr) % @alignOf(ltx.PageIndexEntry),
+    );
+
+    const word_bytes = std.mem.sliceAsBytes(words);
+    const entry_bytes = std.mem.sliceAsBytes(entries);
+    try expect_before(bytes, word_bytes);
+    try expect_before(word_bytes, aligned);
+    try expect_before(aligned, entry_bytes);
+    try std.testing.expectEqual(
+        storage[1..].len,
+        cursor.consumed_bytes() + cursor.remaining_bytes(),
+    );
+}
+
+test "arena cursor failures are explicit and leave the cursor unchanged" {
+    var storage: [16]u8 align(8) = undefined;
+    var cursor = resource_model.ArenaCursor.init(&storage);
+    _ = try cursor.bind_bytes(1);
+    const consumed = cursor.consumed_bytes();
+
+    try std.testing.expectError(
+        error.InvalidAlignment,
+        cursor.bind_aligned_bytes(1, 3),
+    );
+    try std.testing.expectEqual(consumed, cursor.consumed_bytes());
+    try std.testing.expectError(
+        error.ArenaCapacityExceeded,
+        cursor.bind_bytes(storage.len),
+    );
+    try std.testing.expectEqual(consumed, cursor.consumed_bytes());
+    try std.testing.expectError(
+        error.ResourceBudgetOverflow,
+        cursor.bind_aligned_bytes(std.math.maxInt(usize), 8),
+    );
+    try std.testing.expectEqual(consumed, cursor.consumed_bytes());
+    try std.testing.expectError(
+        error.ResourceBudgetOverflow,
+        cursor.bind_slice(u64, std.math.maxInt(usize)),
+    );
+    try std.testing.expectEqual(consumed, cursor.consumed_bytes());
+}
+
+test "arena cursor reports padding capacity and supports zero counts" {
+    var raw: [9]u8 align(8) = undefined;
+    var constrained = resource_model.ArenaCursor.init(raw[1..2]);
+    try std.testing.expectError(
+        error.ArenaCapacityExceeded,
+        constrained.bind_aligned_bytes(1, 8),
+    );
+    try std.testing.expectEqual(@as(usize, 0), constrained.consumed_bytes());
+
+    var empty_storage: [0]u8 = .{};
+    var empty = resource_model.ArenaCursor.init(&empty_storage);
+    try std.testing.expectEqual(@as(usize, 0), (try empty.bind_bytes(0)).len);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try empty.bind_aligned_bytes(0, 64)).len,
+    );
+    try std.testing.expectEqual(@as(usize, 0), (try empty.bind_slice(u64, 0)).len);
+    try std.testing.expectEqual(@as(usize, 0), empty.consumed_bytes());
+    try std.testing.expectEqual(@as(usize, 0), empty.remaining_bytes());
+    try std.testing.expectError(
+        error.InvalidAlignment,
+        empty.bind_aligned_bytes(0, 0),
+    );
+    try std.testing.expectError(
+        error.ZeroSizedType,
+        empty.bind_slice(struct {}, 1),
+    );
+}
+
+fn expect_before(left: []const u8, right: []const u8) !void {
+    const left_end = std.math.add(usize, @intFromPtr(left.ptr), left.len) catch
+        return error.TestUnexpectedResult;
+    try std.testing.expect(left_end <= @intFromPtr(right.ptr));
+}
 
 test "workspace formulas use symbolic public type sizes" {
     const limits = test_limits(4096, 4128, 256);

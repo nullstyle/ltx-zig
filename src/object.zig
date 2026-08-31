@@ -5,7 +5,7 @@
 //! reads, idempotent writes, and idempotent deletes — all over caller-owned
 //! buffers, with no allocation inside this module. Objects are opaque byte
 //! blobs at this layer; only their level and TXID-range identity are
-//! meaningful here.
+//! interpreted here, while listings also report their exact stored length.
 //!
 //! `FileClient` implements the contract over a directory handle using the
 //! Litestream filesystem replica layout (`<root>/ltx/<level>/<min>-<max>.ltx`)
@@ -19,6 +19,7 @@ const ltx = @import("ltx");
 pub const Error = error{
     InvalidLevel,
     InvalidIdentity,
+    InvalidTimestamp,
     ObjectNotFound,
     ObjectExists,
     /// A conditional replace saw a different stored generation than the
@@ -27,9 +28,87 @@ pub const Error = error{
     InvalidState,
     ObjectTooLarge,
     StorageFailure,
+    /// Publication crossed the adapter's commit point, but the adapter could
+    /// not confirm the durable result. The caller must reconcile the object.
+    PublicationIndeterminate,
     ListingCapacityExceeded,
+    ListingPageLimitExceeded,
     PathTooLong,
     ConformanceFailure,
+    WriteSessionUnsupported,
+    StagingCapacityExceeded,
+};
+
+pub const WriteSessionState = enum {
+    open,
+    failed,
+    final,
+};
+
+/// Adapter operations hidden behind one transactional write session. `write`
+/// only appends to private staging. `finish` is the sole publication attempt;
+/// `abort` infallibly ends the session and best-effort discards private state.
+pub const WriteSessionBackend = struct {
+    context: *anyopaque,
+    write_fn: *const fn (context: *anyopaque, bytes: []const u8) Error!void,
+    finish_fn: *const fn (context: *anyopaque) Error!void,
+    abort_fn: *const fn (context: *anyopaque) void,
+};
+
+/// A single-owner transactional object writer. Keep the value at a stable
+/// address while its `ltx.Writer` is in use, and never copy it after the first
+/// operation. A backend write or finish error poisons the session and aborts
+/// private staging. Only successful `finish` establishes trusted publication;
+/// `PublicationIndeterminate` means the adapter crossed its commit point and
+/// the caller must reconcile the object before advancing durable state.
+pub const WriteSession = struct {
+    backend: WriteSessionBackend,
+    state: WriteSessionState = .open,
+
+    pub fn init(backend: WriteSessionBackend) WriteSession {
+        return .{ .backend = backend };
+    }
+
+    pub fn writer(self: *WriteSession) ltx.Writer {
+        return .{
+            .context = self,
+            .write_all_fn = write_all,
+        };
+    }
+
+    pub fn current_state(self: *const WriteSession) WriteSessionState {
+        return self.state;
+    }
+
+    pub fn finish(self: *WriteSession) Error!void {
+        if (self.state != .open) return error.InvalidState;
+        self.backend.finish_fn(self.backend.context) catch |err| {
+            self.fail();
+            return err;
+        };
+        self.state = .final;
+    }
+
+    pub fn abort(self: *WriteSession) void {
+        if (self.state != .open) return;
+        self.state = .final;
+        self.backend.abort_fn(self.backend.context);
+    }
+
+    fn write_all(context: *anyopaque, bytes: []const u8) error{OutputFailure}!void {
+        const self: *WriteSession = @ptrCast(@alignCast(context));
+        if (self.state != .open) return error.OutputFailure;
+        self.backend.write_fn(self.backend.context, bytes) catch {
+            self.fail();
+            return error.OutputFailure;
+        };
+    }
+
+    fn fail(self: *WriteSession) void {
+        std.debug.assert(self.state == .open);
+        self.state = .failed;
+        self.backend.abort_fn(self.backend.context);
+    }
 };
 
 /// One LTX object store. Callbacks must be synchronous and non-reentrant.
@@ -37,8 +116,9 @@ pub const Error = error{
 pub const Client = struct {
     context: *anyopaque,
     /// Lists the level's objects ascending by `(min_txid, max_txid)`,
-    /// including only objects whose minimum TXID is at least `seek`.
-    /// Returns the filled prefix of `destination`.
+    /// including only objects whose minimum TXID is at least `seek`. Every
+    /// returned entry reports the exact stored object size. Returns the filled
+    /// prefix of `destination`.
     list_fn: *const fn (
         context: *anyopaque,
         level: u8,
@@ -63,6 +143,14 @@ pub const Client = struct {
         created_at_ms: i64,
         bytes: []const u8,
     ) Error!void,
+    /// Starts an optional transactional streaming write. The returned session
+    /// owns private staging until it finishes, aborts, or fails.
+    begin_write_fn: ?*const fn (
+        context: *anyopaque,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+    ) Error!WriteSession = null,
     /// Deletes objects; missing ones are ignored.
     delete_fn: *const fn (
         context: *anyopaque,
@@ -106,6 +194,25 @@ pub const Client = struct {
         return self.write_fn(self.context, level, identity, created_at_ms, bytes);
     }
 
+    pub fn begin_write(
+        self: Client,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+    ) Error!WriteSession {
+        if (level > ltx.max_level) return error.InvalidLevel;
+        if (identity.min_txid.value > identity.max_txid.value) {
+            return error.InvalidIdentity;
+        }
+        const begin = self.begin_write_fn orelse return error.WriteSessionUnsupported;
+        return begin(self.context, level, identity, created_at_ms);
+    }
+
+    /// Reports whether `begin_write` has an adapter implementation.
+    pub fn supports_write_sessions(self: Client) bool {
+        return self.begin_write_fn != null;
+    }
+
     pub fn delete(self: Client, files: []const ltx.FileInfo) Error!void {
         return self.delete_fn(self.context, files);
     }
@@ -121,6 +228,14 @@ pub const FileClient = struct {
     root_bytes: usize,
     path_a: [std.Io.Dir.max_path_bytes]u8 = undefined,
     path_b: [std.Io.Dir.max_path_bytes]u8 = undefined,
+    write_final_path: [std.Io.Dir.max_path_bytes]u8 = undefined,
+    write_final_path_bytes: usize = 0,
+    write_temporary_path: [std.Io.Dir.max_path_bytes]u8 = undefined,
+    write_temporary_path_bytes: usize = 0,
+    write_session_file: ?std.Io.File = null,
+    write_offset_bytes: u64 = 0,
+    write_session_active: bool = false,
+    level_directories_synced: [@as(usize, ltx.max_level) + 1]bool = @splat(false),
 
     /// `root` is the subpath under `dir` that holds the replica; empty means
     /// `dir` itself. It must be a clean relative path without a trailing
@@ -142,6 +257,7 @@ pub const FileClient = struct {
             .list_fn = list,
             .open_fn = open,
             .write_fn = write,
+            .begin_write_fn = begin_write,
             .delete_fn = delete,
         };
     }
@@ -188,10 +304,13 @@ pub const FileClient = struct {
             const identity = ltx.parse_file_name(current.name) catch continue;
             if (identity.min_txid.value < seek.value) continue;
             if (count == destination.len) return error.ListingCapacityExceeded;
+            const stat = dir.statFile(self.io, current.name, .{}) catch
+                return error.StorageFailure;
             destination[count] = .{
                 .level = level,
                 .min_txid = identity.min_txid,
                 .max_txid = identity.max_txid,
+                .size_bytes = stat.size,
             };
             count += 1;
         }
@@ -238,14 +357,100 @@ pub const FileClient = struct {
     ) Error!void {
         _ = created_at_ms;
         const self: *FileClient = @ptrCast(@alignCast(context));
+        if (self.write_session_active) return error.InvalidState;
         const final_path = try self.file_path(&self.path_a, level, identity);
         const level_dir = try level_directory_path(self, &self.path_b, level);
-        self.dir.createDirPath(self.io, level_dir) catch return error.StorageFailure;
-        const temporary = try temporary_path(self, final_path, &self.path_b);
-        write_temporary_then_rename(self, temporary, final_path, bytes) catch |err| {
-            self.dir.deleteFile(self.io, temporary) catch {};
-            return err;
+        try ensure_level_directory(self, level, level_dir);
+        const staged = try create_unique_temporary(self, final_path, &self.path_b);
+        try write_temporary_then_rename(self, staged, final_path, bytes);
+    }
+
+    fn begin_write(
+        context: *anyopaque,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+    ) Error!WriteSession {
+        _ = created_at_ms;
+        const self: *FileClient = @ptrCast(@alignCast(context));
+        if (self.write_session_active) return error.InvalidState;
+        const final_path = try self.file_path(&self.write_final_path, level, identity);
+        self.write_final_path_bytes = final_path.len;
+        const level_dir = try level_directory_path(self, &self.path_a, level);
+        try ensure_level_directory(self, level, level_dir);
+        const staged = try create_unique_temporary(
+            self,
+            final_path,
+            &self.write_temporary_path,
+        );
+        self.write_temporary_path_bytes = staged.path.len;
+        self.write_session_file = staged.file;
+        self.write_offset_bytes = 0;
+        self.write_session_active = true;
+        return WriteSession.init(.{
+            .context = self,
+            .write_fn = write_session_chunk,
+            .finish_fn = finish_write_session,
+            .abort_fn = abort_write_session,
+        });
+    }
+
+    fn write_session_chunk(context: *anyopaque, bytes: []const u8) Error!void {
+        const self: *FileClient = @ptrCast(@alignCast(context));
+        const file = self.write_session_file orelse return error.InvalidState;
+        if (!self.write_session_active) return error.InvalidState;
+        const count_bytes = std.math.cast(u64, bytes.len) orelse
+            return error.ObjectTooLarge;
+        const end_bytes = std.math.add(u64, self.write_offset_bytes, count_bytes) catch
+            return error.ObjectTooLarge;
+        file.writePositionalAll(self.io, bytes, self.write_offset_bytes) catch
+            return error.StorageFailure;
+        self.write_offset_bytes = end_bytes;
+    }
+
+    fn finish_write_session(context: *anyopaque) Error!void {
+        const self: *FileClient = @ptrCast(@alignCast(context));
+        const file = self.write_session_file orelse return error.InvalidState;
+        if (!self.write_session_active) return error.InvalidState;
+        file.sync(self.io) catch return error.StorageFailure;
+        file.close(self.io);
+        self.write_session_file = null;
+        self.dir.rename(
+            self.write_temporary_path[0..self.write_temporary_path_bytes],
+            self.dir,
+            self.write_final_path[0..self.write_final_path_bytes],
+            self.io,
+        ) catch return error.StorageFailure;
+        sync_parent_directory(
+            self,
+            self.write_final_path[0..self.write_final_path_bytes],
+        ) catch {
+            self.end_write_session();
+            return error.PublicationIndeterminate;
         };
+        self.end_write_session();
+    }
+
+    fn abort_write_session(context: *anyopaque) void {
+        const self: *FileClient = @ptrCast(@alignCast(context));
+        if (self.write_session_file) |file| {
+            file.close(self.io);
+            self.write_session_file = null;
+        }
+        if (self.write_session_active) {
+            self.dir.deleteFile(
+                self.io,
+                self.write_temporary_path[0..self.write_temporary_path_bytes],
+            ) catch {};
+        }
+        self.end_write_session();
+    }
+
+    fn end_write_session(self: *FileClient) void {
+        self.write_session_active = false;
+        self.write_offset_bytes = 0;
+        self.write_final_path_bytes = 0;
+        self.write_temporary_path_bytes = 0;
     }
 
     fn delete(
@@ -253,6 +458,7 @@ pub const FileClient = struct {
         files: []const ltx.FileInfo,
     ) Error!void {
         const self: *FileClient = @ptrCast(@alignCast(context));
+        if (self.write_session_active) return error.InvalidState;
         for (files) |info| {
             const path = try self.file_path(
                 &self.path_a,
@@ -294,38 +500,112 @@ fn append_separator(destination: []u8, offset: *usize) Error!void {
     try append_path(destination, offset, "/");
 }
 
-fn temporary_path(
+const TemporaryFile = struct {
+    file: std.Io.File,
+    path: []const u8,
+};
+
+fn create_unique_temporary(
     self: *FileClient,
     final_path: []const u8,
     workspace: *[std.Io.Dir.max_path_bytes]u8,
-) Error![]const u8 {
-    _ = self;
-    if (final_path.len + temporary_suffix.len > workspace.len) {
+) Error!TemporaryFile {
+    const required = std.math.add(usize, final_path.len, temporary_suffix_bytes) catch
+        return error.PathTooLong;
+    if (required > workspace.len) {
         return error.PathTooLong;
     }
     @memcpy(workspace[0..final_path.len], final_path);
-    @memcpy(workspace[final_path.len..][0..temporary_suffix.len], temporary_suffix);
-    return workspace[0 .. final_path.len + temporary_suffix.len];
+    var candidate: u16 = 0;
+    while (candidate < temporary_candidate_count) : (candidate += 1) {
+        const suffix = std.fmt.bufPrint(
+            workspace[final_path.len..required],
+            ".tmp-{x:0>4}",
+            .{candidate},
+        ) catch return error.PathTooLong;
+        const path = workspace[0 .. final_path.len + suffix.len];
+        const file = self.dir.createFile(self.io, path, .{
+            .truncate = false,
+            .exclusive = true,
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return error.StorageFailure,
+        };
+        return .{ .file = file, .path = path };
+    }
+    return error.StagingCapacityExceeded;
 }
 
-const temporary_suffix = ".tmp";
+const temporary_candidate_count: u16 = 256;
+const temporary_suffix_bytes = ".tmp-0000".len;
 
 fn write_temporary_then_rename(
     self: *FileClient,
-    temporary: []const u8,
+    staged: TemporaryFile,
     final_path: []const u8,
     bytes: []const u8,
 ) Error!void {
-    var file = self.dir.createFile(self.io, temporary, .{ .truncate = true }) catch
-        return error.StorageFailure;
-    var succeeded = false;
-    defer if (!succeeded) self.dir.deleteFile(self.io, temporary) catch {};
+    const temporary = staged.path;
+    const file = staged.file;
+    var file_open = true;
+    defer if (file_open) file.close(self.io);
+    var temporary_exists = true;
+    defer if (temporary_exists) self.dir.deleteFile(self.io, temporary) catch {};
     file.writePositionalAll(self.io, bytes, 0) catch return error.StorageFailure;
     file.sync(self.io) catch return error.StorageFailure;
     file.close(self.io);
+    file_open = false;
     self.dir.rename(temporary, self.dir, final_path, self.io) catch
         return error.StorageFailure;
-    succeeded = true;
+    temporary_exists = false;
+    sync_parent_directory(self, final_path) catch
+        return error.PublicationIndeterminate;
+}
+
+fn sync_parent_directory(self: *FileClient, final_path: []const u8) Error!void {
+    const parent_path = std.Io.Dir.path.dirname(final_path) orelse ".";
+    return sync_directory(self, parent_path);
+}
+
+fn ensure_level_directory(
+    self: *FileClient,
+    level: u8,
+    level_path: []const u8,
+) Error!void {
+    const status = self.dir.createDirPathStatus(
+        self.io,
+        level_path,
+        .default_dir,
+    ) catch return error.StorageFailure;
+    const level_index: usize = @intCast(level);
+    if (status == .existed and self.level_directories_synced[level_index]) return;
+    try sync_directory_chain(self, level_path);
+    self.level_directories_synced[level_index] = true;
+}
+
+fn sync_directory_chain(self: *FileClient, deepest_path: []const u8) Error!void {
+    var current: ?[]const u8 = deepest_path;
+    var step_count: usize = 0;
+    while (step_count <= deepest_path.len) : (step_count += 1) {
+        const path = current orelse {
+            try sync_directory(self, ".");
+            return;
+        };
+        try sync_directory(self, path);
+        current = std.Io.Dir.path.dirname(path);
+    }
+    return error.PathTooLong;
+}
+
+fn sync_directory(self: *FileClient, path: []const u8) Error!void {
+    var file = self.dir.openFile(self.io, path, .{
+        .mode = .read_only,
+        .allow_directory = true,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch return error.StorageFailure;
+    defer file.close(self.io);
+    file.sync(self.io) catch return error.StorageFailure;
 }
 
 fn append_path(destination: []u8, offset: *usize, bytes: []const u8) Error!void {
@@ -385,6 +665,9 @@ pub fn run_conformance(client: Client) Error!void {
     if (listed[0].min_txid.value != 1 or listed[2].max_txid.value != 3) {
         return error.ConformanceFailure;
     }
+    for (listed) |info| {
+        if (info.size_bytes != one.len) return error.ConformanceFailure;
+    }
     const sought = try client.list(0, ltx.TXID.init(2), &infos);
     if (sought.len != 2 or sought[0].min_txid.value != 2) {
         return error.ConformanceFailure;
@@ -416,8 +699,8 @@ pub fn run_conformance(client: Client) Error!void {
     );
 
     try client.delete(&.{
-        .{ .level = 0, .min_txid = first.min_txid, .max_txid = first.max_txid },
-        .{ .level = 0, .min_txid = third.min_txid, .max_txid = third.max_txid },
+        .{ .level = 0, .min_txid = first.min_txid, .max_txid = first.max_txid, .size_bytes = one.len },
+        .{ .level = 0, .min_txid = third.min_txid, .max_txid = third.max_txid, .size_bytes = three.len },
     });
     const remaining = try client.list(0, ltx.TXID.init(0), &infos);
     if (remaining.len != 1 or remaining[0].min_txid.value != 2) {
@@ -426,7 +709,7 @@ pub fn run_conformance(client: Client) Error!void {
     try expect_error(error.ObjectNotFound, client.open(0, first, &storage));
     // Deleting a missing object is idempotent.
     try client.delete(&.{
-        .{ .level = 0, .min_txid = first.min_txid, .max_txid = first.max_txid },
+        .{ .level = 0, .min_txid = first.min_txid, .max_txid = first.max_txid, .size_bytes = one.len },
     });
 
     try expect_error(error.InvalidLevel, client.list(10, ltx.TXID.init(0), &infos));
@@ -436,8 +719,8 @@ pub fn run_conformance(client: Client) Error!void {
     );
 
     try client.delete(&.{
-        .{ .level = 0, .min_txid = second.min_txid, .max_txid = second.max_txid },
-        .{ .level = 1, .min_txid = span.min_txid, .max_txid = span.max_txid },
+        .{ .level = 0, .min_txid = second.min_txid, .max_txid = second.max_txid, .size_bytes = two.len },
+        .{ .level = 1, .min_txid = span.min_txid, .max_txid = span.max_txid, .size_bytes = one.len },
     });
     if ((try client.list(0, ltx.TXID.init(0), &infos)).len != 0) {
         return error.ConformanceFailure;

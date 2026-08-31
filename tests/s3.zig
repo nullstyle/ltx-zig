@@ -39,6 +39,15 @@ const TestClock = struct {
     }
 };
 
+const MutableClock = struct {
+    value_ms: u64,
+
+    fn now_ms(context: *anyopaque) u64 {
+        const self: *MutableClock = @ptrCast(@alignCast(context));
+        return self.value_ms;
+    }
+};
+
 /// Encodes one checksummed transition and returns its post-apply checksum.
 fn encode_transition(
     min_txid: u64,
@@ -87,10 +96,94 @@ fn encode_transition(
     return checksum_value;
 }
 
+const multipart_part_bytes = 5 * 1024 * 1024;
+
 var plain_send_workspace: [2 * multipart_part_bytes]u8 = undefined;
 var plain_clock_context: u8 = 0;
 
 var s3_under_test: ?ltx_s3.S3Client = null;
+
+fn init_plain_s3(send_workspace: []u8) !ltx_s3.S3Client {
+    return ltx_s3.S3Client.init(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .host = minio_host,
+            .port = minio_port,
+            .bucket = "ltx-gate",
+            .access_key = minio_root_user,
+            .secret_key = minio_root_password,
+            .prefix = "replica",
+            // The conformance suite lists three objects, forcing pagination.
+            .max_keys_per_page = 2,
+            .clock = .{
+                .context = &plain_clock_context,
+                .now_ms_fn = TestClock.now_ms,
+            },
+        },
+        send_workspace,
+    );
+}
+
+fn delete_identity(client: ltx_object.Client, identity: ltx.FileIdentity) !void {
+    try client.delete(&.{.{
+        .level = 0,
+        .min_txid = identity.min_txid,
+        .max_txid = identity.max_txid,
+        .size_bytes = 0,
+    }});
+}
+
+test "listing stops at the configured remote page budget" {
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try ltx_s3.S3Client.init(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .host = minio_host,
+            .port = minio_port,
+            .bucket = "ltx-gate",
+            .access_key = minio_root_user,
+            .secret_key = minio_root_password,
+            .prefix = "listing-limit",
+            .max_keys_per_page = 1,
+            .max_listing_pages = 1,
+            .clock = .{
+                .context = &plain_clock_context,
+                .now_ms_fn = TestClock.now_ms,
+            },
+        },
+        &send_workspace,
+    );
+    defer s3.deinit();
+    try s3.ensure_bucket();
+    const client = s3.client();
+    const first = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(61),
+        .max_txid = ltx.TXID.init(61),
+    };
+    const second = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(62),
+        .max_txid = ltx.TXID.init(62),
+    };
+    try delete_identity(client, first);
+    defer delete_identity(client, first) catch {};
+    try delete_identity(client, second);
+    defer delete_identity(client, second) catch {};
+    try client.write(0, first, 1, "first");
+    try client.write(0, second, 2, "second");
+
+    var infos: [2]ltx.FileInfo = undefined;
+    try std.testing.expectError(
+        error.ListingPageLimitExceeded,
+        client.list(0, ltx.TXID.init(0), &infos),
+    );
+    s3.config.max_listing_pages = 2;
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        (try client.list(0, ltx.TXID.init(0), &infos)).len,
+    );
+}
 
 test "s3 backend passes the conformance suite and a plan round trip" {
     const allocator = std.testing.allocator;
@@ -192,7 +285,10 @@ test "s3 backend passes the conformance suite over TLS" {
         return error.SkipZigTest;
     }
     const allocator = std.testing.allocator;
-    var clock_context: u8 = 0;
+    const current = std.Io.Timestamp.now(std.testing.io, .real);
+    var clock = MutableClock{
+        .value_ms = @intCast(@divTrunc(current.nanoseconds, std.time.ns_per_ms)),
+    };
     var send_workspace: [64 * 1024]u8 = undefined;
     var s3 = try ltx_s3.S3Client.init(
         allocator,
@@ -209,6 +305,40 @@ test "s3 backend passes the conformance suite over TLS" {
             .use_tls = true,
             .ca_file = s3_options.minio_ca,
             .clock = .{
+                .context = &clock,
+                .now_ms_fn = MutableClock.now_ms,
+            },
+        },
+        &send_workspace,
+    );
+    defer s3.deinit();
+    clock.value_ms += 1_000;
+    try s3.ensure_bucket();
+    try std.testing.expectEqual(
+        @as(i96, clock.value_ms) * std.time.ns_per_ms,
+        s3.http.now.?.nanoseconds,
+    );
+    try ltx_object.run_conformance(s3.client());
+}
+
+test "TLS delete completes without waiting for the peer idle timeout" {
+    if (s3_options.minio_ca.len == 0 or s3_options.minio_tls_port == 0) {
+        return error.SkipZigTest;
+    }
+    var clock_context: u8 = 0;
+    var send_workspace: [1024]u8 = undefined;
+    var s3 = try ltx_s3.S3Client.init(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .host = "localhost",
+            .port = s3_options.minio_tls_port,
+            .bucket = "ltx-gate-tls-delete",
+            .access_key = minio_root_user,
+            .secret_key = minio_root_password,
+            .use_tls = true,
+            .ca_file = s3_options.minio_ca,
+            .clock = .{
                 .context = &clock_context,
                 .now_ms_fn = TestClock.now_ms,
             },
@@ -217,15 +347,26 @@ test "s3 backend passes the conformance suite over TLS" {
     );
     defer s3.deinit();
     try s3.ensure_bucket();
-    try ltx_object.run_conformance(s3.client());
-}
 
-const multipart_part_bytes = 5 * 1024 * 1024;
+    const identity = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(1),
+        .max_txid = ltx.TXID.init(1),
+    };
+    const client = s3.client();
+    try client.write(0, identity, 1000, "delete-probe");
+    try client.delete(&.{.{
+        .level = 0,
+        .min_txid = identity.min_txid,
+        .max_txid = identity.max_txid,
+        .size_bytes = 0,
+    }});
+}
 
 var multipart_a: [multipart_part_bytes]u8 = undefined;
 var multipart_b: [multipart_part_bytes]u8 = undefined;
 var multipart_tail: [1024]u8 = undefined;
 var multipart_recv: [2 * multipart_part_bytes + 1024]u8 = undefined;
+var automatic_send_workspace: [multipart_part_bytes]u8 = undefined;
 
 test "multipart upload streams parts into one readable object" {
     // Parts other than the last must meet the store's 5 MiB minimum.
@@ -269,7 +410,272 @@ test "multipart upload streams parts into one readable object" {
     try std.testing.expectEqualSlices(u8, &multipart_a, stored[0..multipart_part_bytes]);
     try std.testing.expectEqualSlices(u8, &multipart_b, stored[multipart_part_bytes..][0..multipart_part_bytes]);
     try std.testing.expectEqualSlices(u8, &multipart_tail, stored[2 * multipart_part_bytes ..]);
-    try client.delete(&.{.{ .level = 0, .min_txid = identity.min_txid, .max_txid = identity.max_txid }});
+    try client.delete(&.{.{
+        .level = 0,
+        .min_txid = identity.min_txid,
+        .max_txid = identity.max_txid,
+        .size_bytes = 0,
+    }});
+}
+
+test "failed multipart abort preserves cleanup state and blocks writes" {
+    var send_workspace: [1024]u8 = undefined;
+    var s3 = try init_plain_s3(&send_workspace);
+    const working_port = s3.config.port;
+    defer {
+        s3.config.port = working_port;
+        s3.deinit();
+    }
+    try s3.ensure_bucket();
+    const identity = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(38),
+        .max_txid = ltx.TXID.init(38),
+    };
+    try s3.begin_multipart(0, identity, 1_233_000);
+
+    // Force the cleanup request onto an unused endpoint after initiation.
+    s3.config.port = minio_port + 1;
+    try std.testing.expectError(error.StorageFailure, s3.abort_multipart());
+    try std.testing.expect(s3.multipart != null);
+    try std.testing.expectError(
+        error.InvalidState,
+        s3.client().begin_write(0, identity, 1_233_001),
+    );
+
+    // The retained upload identity makes a later cleanup retry possible.
+    s3.config.port = working_port;
+    try s3.abort_multipart();
+    try std.testing.expect(s3.multipart == null);
+}
+
+test "write session publishes a small stream with one PUT at finish" {
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try init_plain_s3(&send_workspace);
+    defer s3.deinit();
+    try s3.ensure_bucket();
+
+    const client = s3.client();
+    try std.testing.expect(client.supports_write_sessions());
+    const identity = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(40),
+        .max_txid = ltx.TXID.init(40),
+    };
+    try delete_identity(client, identity);
+    defer delete_identity(client, identity) catch {};
+
+    var session = try client.begin_write(0, identity, 1_234_000);
+    try session.writer().write_all("transactional ");
+    try session.writer().write_all("small object");
+    try std.testing.expect(s3.multipart == null);
+    var received: [64]u8 = undefined;
+    try std.testing.expectError(
+        error.ObjectNotFound,
+        client.open(0, identity, &received),
+    );
+
+    try session.finish();
+    try std.testing.expectEqual(
+        ltx_object.WriteSessionState.final,
+        session.current_state(),
+    );
+    try std.testing.expect(s3.multipart == null);
+    try std.testing.expectEqualStrings(
+        "transactional small object",
+        try client.open(0, identity, &received),
+    );
+}
+
+test "write session automatically publishes more than two multipart parts" {
+    @memset(&multipart_a, 0xa5);
+    @memset(&multipart_b, 0x5a);
+    @memset(&multipart_tail, 0xe7);
+
+    var s3 = try init_plain_s3(&automatic_send_workspace);
+    defer s3.deinit();
+    try s3.ensure_bucket();
+    const client = s3.client();
+    const identity = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(41),
+        .max_txid = ltx.TXID.init(43),
+    };
+    try delete_identity(client, identity);
+    defer delete_identity(client, identity) catch {};
+
+    var session = try client.begin_write(0, identity, 1_234_123);
+    try session.writer().write_all(&multipart_a);
+    try std.testing.expect(s3.multipart == null);
+    try session.writer().write_all(&multipart_b);
+    try std.testing.expectEqual(@as(u32, 1), s3.multipart.?.part_count);
+    try session.writer().write_all(&multipart_tail);
+    try std.testing.expectEqual(@as(u32, 2), s3.multipart.?.part_count);
+    try std.testing.expectError(
+        error.ObjectNotFound,
+        client.open(0, identity, &multipart_recv),
+    );
+
+    try session.finish();
+    try std.testing.expect(s3.multipart == null);
+    const stored = try client.open(0, identity, &multipart_recv);
+    try std.testing.expectEqual(@as(usize, multipart_recv.len), stored.len);
+    try std.testing.expectEqualSlices(u8, &multipart_a, stored[0..multipart_part_bytes]);
+    try std.testing.expectEqualSlices(
+        u8,
+        &multipart_b,
+        stored[multipart_part_bytes..][0..multipart_part_bytes],
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &multipart_tail,
+        stored[2 * multipart_part_bytes ..],
+    );
+}
+
+test "write session abort removes automatic multipart private state" {
+    @memset(&multipart_a, 0x3c);
+    @memset(&multipart_tail, 0xc3);
+
+    var s3 = try init_plain_s3(&automatic_send_workspace);
+    defer s3.deinit();
+    try s3.ensure_bucket();
+    const client = s3.client();
+    const identity = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(44),
+        .max_txid = ltx.TXID.init(45),
+    };
+    try delete_identity(client, identity);
+
+    var session = try client.begin_write(0, identity, 1_234_456);
+    try session.writer().write_all(&multipart_a);
+    try session.writer().write_all(&multipart_tail);
+    try std.testing.expectEqual(@as(u32, 1), s3.multipart.?.part_count);
+    session.abort();
+
+    try std.testing.expectEqual(
+        ltx_object.WriteSessionState.final,
+        session.current_state(),
+    );
+    try std.testing.expect(s3.multipart == null);
+    try std.testing.expectError(
+        error.ObjectNotFound,
+        client.open(0, identity, &multipart_recv),
+    );
+}
+
+test "failed automatic multipart abort can be retried through the client" {
+    @memset(&multipart_a, 0x6d);
+    @memset(&multipart_tail, 0xd6);
+
+    var s3 = try init_plain_s3(&automatic_send_workspace);
+    const working_port = s3.config.port;
+    defer {
+        s3.config.port = working_port;
+        s3.deinit();
+    }
+    try s3.ensure_bucket();
+    const client = s3.client();
+    const identity = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(49),
+        .max_txid = ltx.TXID.init(50),
+    };
+    try delete_identity(client, identity);
+
+    var session = try client.begin_write(0, identity, 1_234_654);
+    try session.writer().write_all(&multipart_a);
+    try session.writer().write_all(&multipart_tail);
+    try std.testing.expectEqual(@as(u32, 1), s3.multipart.?.part_count);
+
+    s3.config.port = minio_port + 1;
+    session.abort();
+    try std.testing.expect(s3.write_session == null);
+    try std.testing.expect(s3.multipart != null);
+
+    s3.config.port = working_port;
+    try s3.abort_multipart();
+    try std.testing.expect(s3.multipart == null);
+}
+
+test "write sessions and manual multipart uploads are mutually exclusive" {
+    var send_workspace: [1024]u8 = undefined;
+    var s3 = try init_plain_s3(&send_workspace);
+    defer s3.deinit();
+    try s3.ensure_bucket();
+    const client = s3.client();
+    const identity = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(46),
+        .max_txid = ltx.TXID.init(46),
+    };
+    try delete_identity(client, identity);
+
+    try s3.begin_multipart(0, identity, 1_234_789);
+    try std.testing.expectError(
+        error.InvalidState,
+        client.begin_write(0, identity, 1_234_789),
+    );
+    try std.testing.expectError(
+        error.InvalidState,
+        client.write(0, identity, 1_234_789, "conflict"),
+    );
+    try s3.abort_multipart();
+
+    var session = try client.begin_write(0, identity, 1_234_789);
+    try std.testing.expectError(
+        error.InvalidState,
+        s3.begin_multipart(0, identity, 1_234_789),
+    );
+    try std.testing.expectError(error.InvalidState, s3.put_part(1, "conflict"));
+    try std.testing.expectError(error.InvalidState, s3.complete_multipart());
+    try std.testing.expectError(error.InvalidState, s3.abort_multipart());
+    try std.testing.expectError(
+        error.InvalidState,
+        s3.put_if_absent(0, identity, 1_234_789, "conflict"),
+    );
+    session.abort();
+
+    // Once another part follows, the preceding part is non-final and must
+    // meet S3's minimum part size.
+    try s3.begin_multipart(0, identity, 1_234_789);
+    try s3.put_part(1, "short");
+    try std.testing.expectError(error.InvalidState, s3.put_part(2, "tail"));
+    try s3.abort_multipart();
+}
+
+test "write session capacity failure poisons and cleans private state" {
+    var send_workspace: [1024]u8 = undefined;
+    var s3 = try init_plain_s3(&send_workspace);
+    defer s3.deinit();
+    try s3.ensure_bucket();
+    const client = s3.client();
+    const identity = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(47),
+        .max_txid = ltx.TXID.init(47),
+    };
+    try delete_identity(client, identity);
+
+    var session = try client.begin_write(0, identity, 1_235_000);
+    const full_buffer: [1024]u8 = @splat(0x5a);
+    try session.writer().write_all(&full_buffer);
+    try std.testing.expectError(
+        error.OutputFailure,
+        session.writer().write_all("x"),
+    );
+    try std.testing.expectEqual(
+        ltx_object.WriteSessionState.failed,
+        session.current_state(),
+    );
+    try std.testing.expect(s3.multipart == null);
+    try std.testing.expectError(error.InvalidState, session.finish());
+    try std.testing.expectError(
+        error.OutputFailure,
+        session.writer().write_all("late"),
+    );
+    var received: [1]u8 = undefined;
+    try std.testing.expectError(
+        error.ObjectNotFound,
+        client.open(0, identity, &received),
+    );
+
+    var replacement = try client.begin_write(0, identity, 1_235_001);
+    replacement.abort();
 }
 
 const RetryProbe = struct {
@@ -283,6 +689,8 @@ const RetryProbe = struct {
             .status => 25,
         };
     }
+
+    fn sleep(_: *anyopaque, _: u64) ltx_s3.Error!void {}
 };
 
 test "a configured retry policy is not consulted on success" {
@@ -304,6 +712,7 @@ test "a configured retry policy is not consulted on success" {
             .retry = .{
                 .context = &probe,
                 .next_delay_ms_fn = RetryProbe.next,
+                .sleep_ms_fn = RetryProbe.sleep,
                 .max_attempts = 3,
             },
         },
@@ -321,7 +730,12 @@ test "a configured retry policy is not consulted on success" {
         "retry-probe",
         try client.open(0, identity, &storage),
     );
-    try client.delete(&.{.{ .level = 0, .min_txid = identity.min_txid, .max_txid = identity.max_txid }});
+    try client.delete(&.{.{
+        .level = 0,
+        .min_txid = identity.min_txid,
+        .max_txid = identity.max_txid,
+        .size_bytes = 0,
+    }});
     try std.testing.expectEqual(@as(u32, 0), probe.calls);
 }
 
@@ -391,7 +805,12 @@ test "etag replace renews only against the observed generation" {
         "contender",
         try client.open(0, identity, &storage),
     );
-    try client.delete(&.{.{ .level = 0, .min_txid = identity.min_txid, .max_txid = identity.max_txid }});
+    try client.delete(&.{.{
+        .level = 0,
+        .min_txid = identity.min_txid,
+        .max_txid = identity.max_txid,
+        .size_bytes = 0,
+    }});
 }
 
 /// The ETag copy keeps its length in a sentinel-free fixed buffer by

@@ -446,6 +446,7 @@ fn run_archived_builds(
         "example-round-trip",
         "example-apply-snapshot",
         "example-sqlite-store",
+        "example-replicate-once",
     };
     for (example_steps) |step| {
         try run_zig_build(

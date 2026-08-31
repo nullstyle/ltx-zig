@@ -1,7 +1,8 @@
 # Replication guide
 
 This document is the deployment contract for the replication modules:
-`ltx_wal`, `ltx_object`, `ltx_s3`, `ltx_replica`, and `ltx_capture`. The
+`ltx_wal`, `ltx_object`, `ltx_s3`, `ltx_replica`, `ltx_capture`,
+`ltx_resources`, and `ltx_replication`. The
 roadmap that produced them is [`replication-roadmap.md`](replication-roadmap.md);
 the codec trust model they build on is [`design.md`](design.md).
 
@@ -9,11 +10,13 @@ the codec trust model they build on is [`design.md`](design.md).
 
 | Module | Role |
 | --- | --- |
-| `ltx_wal` | SQLite WAL bytes to committed page maps, salt censes, and mid-WAL resume. Standalone; no filesystem or SQLite linkage. |
-| `ltx_object` | The storage-neutral object contract, the filesystem backend in the Litestream layout, and the backend-agnostic conformance suite. |
-| `ltx_s3` | The S3 backend: path-style SigV4, paginated prefix-scoped listings, object read/write/delete, bucket creation. |
+| `ltx_wal` | SQLite WAL bytes to committed page maps, salt scans, and mid-WAL resume. Standalone; no filesystem or SQLite linkage. |
+| `ltx_object` | The storage-neutral object contract, transactional writer sessions, the filesystem backend in the Litestream layout, and the backend-agnostic conformance suite. |
+| `ltx_s3` | The S3 backend: path-style and virtual-host SigV4, TLS, bounded retry, paginated prefix-scoped listings, object read/write/delete, conditional writes, automatic single/multipart transactional upload, and bucket creation. |
 | `ltx_replica` | The level ladder, restore planning, compaction and retention planners, and the restore and compaction executors over `ltx` codecs. |
-| `ltx_capture` | The SQLite capture session: WAL-mode lifecycle, Litestream control tables, a checkpoint-blocking read lock, snapshot/incremental/fallback transitions, and passive checkpointing. Links SQLite through a hand-written extern surface provided by the host build. |
+| `ltx_capture` | The SQLite capture session: WAL-mode lifecycle, Litestream control tables, a checkpoint-blocking read lock, snapshot/incremental/fallback transitions, seeded continuation, mid-WAL resume, and three-tier passive checkpointing. Links SQLite through a hand-written extern surface provided by the host build. |
+| `ltx_resources` | Checked public resource formulas and fixed-arena binding for byte and typed workspaces. |
+| `ltx_replication` | The synchronous per-database controller: startup restore, capture position, restore, one adjacent-level maintenance quantum, and safe retention. |
 
 Every module is synchronous, allocation-free after initialization (the S3
 HTTP transport's pooled connections are the single exception), and driven by
@@ -35,6 +38,12 @@ explicit limits, workspaces, and timestamps. Consult
   Litestream's on-disk and object-store layouts so external tooling
   (including the Litestream v0.5.16 reader qualified in
   [`upstream.md`](upstream.md)) interoperates.
+- Filesystem and S3 producers stream encoded output into private transactional
+  staging. `finish` is the requested object publication boundary; encoding or
+  transport failure does not advance capture position or delete compacted
+  inputs. A post-commit confirmation failure reports or documents an
+  indeterminate publication; reconcile that identity before retrying or
+  discarding its source.
 
 ## What the host owns
 
@@ -48,11 +57,15 @@ explicit limits, workspaces, and timestamps. Consult
   provides create-only fencing and `object_etag` + `put_if_match` provide
   replace-if-generation renewal (a shifted generation fails with
   `ETagMismatch`); turning these into a lease protocol is the host's
-  decision. A `RetryPolicy` on the S3 config covers transient transport
-  failures and retryable statuses on idempotent requests.
-- Checkpoint cadence beyond the byte threshold: call
-  `Session.checkpoint_passive` (or set `checkpoint_threshold_bytes`) as your
-  retention loop requires.
+  decision. Conditional PUTs are attempted once and report
+  `PublicationIndeterminate` when delivery fails after sending begins. A
+  `RetryPolicy` covers transient transport failures and retryable statuses only
+  on unambiguous idempotent requests.
+- Checkpoint policy: configure any combination of
+  `checkpoint_threshold_bytes`, `checkpoint_interval_ms`, and
+  `checkpoint_max_frames`, or call `Session.checkpoint_passive` explicitly.
+  The host still decides when capture runs and should monitor
+  `Session.checkpoint_pending` for deferred automatic maintenance.
 
 ## Producer lifecycle
 
@@ -72,6 +85,39 @@ capture as an incremental. Any foreign discontinuity — another process
 checkpointing, a replaced WAL — falls back to a fresh snapshot, which is
 always safe because missing pages are read from the database file. A WAL
 larger than the workspace is rejected, never partially read.
+
+Automatic checkpoint failure never masks a capture that has already published
+and advanced its position. Instead, `checkpoint_pending` remains true and a
+later sync retries the PASSIVE checkpoint. Manual `checkpoint_passive` reports
+`CheckpointIncomplete` when SQLite could not checkpoint every logged frame.
+
+When the object adapter implements transactional sessions, `output_storage`
+may be empty because encoder bytes flow directly to private backend staging.
+Adapters that expose only whole-object `write` retain the fixed buffered
+fallback and must supply `Limits.max_output_bytes` of output capacity. Every
+simultaneously live workspace must be disjoint; opaque adapter storage such as
+an S3 send buffer is also caller-owned and cannot be checked through the
+storage-neutral client interface.
+
+## Controller lifecycle
+
+```zig
+var controller = try ltx_replication.Controller.init(options, &resources);
+defer controller.finish();
+
+_ = try controller.sync(now_ms);
+_ = try controller.maintain(1); // one caller-selected adjacent-level quantum
+const durable = try controller.position();
+```
+
+`Startup.require_empty` rejects any pre-existing object tree,
+`Startup.verified_local` seeds a host-verified image position, and
+`Startup.restore_latest` restores and verifies the latest chain before SQLite
+opens. Restore-latest requires the host to quiesce the target and rejects an
+existing `-wal`, `-shm`, or `-journal` sidecar. Runtime `restore` likewise
+requires a distinct host-quiesced backend target. The controller centralizes
+the common synchronous path, while `ltx_capture` and `ltx_replica` remain
+public for custom policy.
 
 ## Consumer lifecycle
 
@@ -94,8 +140,9 @@ names the lower-level files fully absorbed by a durable higher level.
 - `mise exec -- zig build capture-integration -Doptimize=ReleaseSafe` — live
   host SQLite: capture, checkpoint continuation, bounded-WAL, and restores
   verified by querying restored images read-only.
-- `mise run s3-integration` — the same conformance suite plus a plan round
-  trip against a local MinIO server with real SigV4.
+- `mise run s3-integration` — the same conformance suite plus plan, TLS,
+  conditional-write, retry, multipart, and supported virtual-host coverage
+  against isolated pinned local MinIO instances with real SigV4.
 - `mise exec -- zig build litestream-interop -Dlitestream=<path>` — the
   pinned Litestream v0.5.16 binary restores Zig-compacted fixtures and a
   live `ltx_capture` tree to byte-identical images.
@@ -122,7 +169,13 @@ per deployment and record the numbers where this section points.
   `ca_file` or the system bundle, and multipart uploads stream one part at
   a time through the send workspace (single in-flight upload per client,
   parts numbered from one without gaps, every part but the last at the
-  store's 5 MiB minimum).
+  store's 5 MiB minimum). Transactional writers buffer at most one part and
+  automatically use a single PUT for small objects or multipart for larger
+  ones. Listings request at most eight keys per page so the maximum S3 key and
+  its XML expansion remain inside the fixed 64 KiB response workspace, and
+  `Config.max_listing_pages` bounds total remote pagination even when foreign
+  keys are ignored. Failed multipart aborts retain their upload identity and
+  block new writes until an explicit cleanup retry or `deinit` succeeds.
 - `ltx_capture`: passive checkpointing only — no writer barrier, which the
   single-writer-per-database model makes unnecessary. Three tiers bound the
   WAL: `checkpoint_threshold_bytes`, `checkpoint_interval_ms`, and

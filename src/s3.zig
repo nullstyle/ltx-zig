@@ -5,15 +5,25 @@
 //! milestone covers: single-request `PutObject` with the
 //! `litestream-timestamp` metadata header, `GetObject`, per-object
 //! `DeleteObject`, paginated `ListObjectsV2` with `start-after` seek, and
-//! bucket creation. Keys follow the Litestream object-store layout
-//! `{prefix}/{level:04x}/{min}-{max}.ltx`. Multipart upload, conditional
-//! writes, TLS, and virtual-host addressing are not implemented yet.
+//! bucket creation. Transactional write sessions stay in one caller-owned
+//! buffer for small objects and switch automatically to multipart upload only
+//! when the stream exceeds that buffer. Keys follow the Litestream object-store
+//! layout `{prefix}/{level:04x}/{min}-{max}.ltx`. The concrete client also
+//! exposes bounded multipart upload, signed conditional writes, TLS, and
+//! virtual-host addressing without weakening the storage-neutral object
+//! contract.
 //!
 //! Object payloads, listings, and all signing scratch live in fixed
 //! caller-owned buffers. The standard-library HTTP transport is the one
 //! allocation point: it allocates pooled connections from the allocator
 //! provided at initialization and nothing else allocates. The clock is
 //! injected — no ambient time reads.
+//!
+//! S3 publication is remote: after request delivery begins, a transport error
+//! can hide either a committed or rejected write. Conditional methods surface
+//! `PublicationIndeterminate`; a transactional writer reports its contract's
+//! `StorageFailure`, so the host must reconcile the object identity before it
+//! advances a durable position or discards source objects.
 //!
 //! The gate for this backend is `mise run s3-integration`, which starts a
 //! local MinIO server and runs the backend-agnostic conformance suite
@@ -25,6 +35,17 @@ const object = @import("ltx_object");
 
 pub const Error = object.Error;
 
+/// Conditional publication can become indeterminate after request delivery
+/// starts: a transport failure may hide either a committed or rejected write.
+/// Callers must reconcile the object generation before another fenced write.
+pub const ConditionalWriteError = Error || error{PublicationIndeterminate};
+pub const InitError = Error || error{InvalidConfiguration};
+
+/// At most eight S3 keys are requested per page. With S3's 1,024-byte key
+/// limit and worst-case XML entity expansion, this leaves room in the fixed
+/// 64 KiB response workspace for every Contents field and page envelope.
+pub const max_list_keys_per_page: u32 = 8;
+
 /// Why a request is being considered for retry.
 pub const RetryCause = union(enum) {
     /// The transport failed before a complete response arrived.
@@ -34,16 +55,22 @@ pub const RetryCause = union(enum) {
 };
 
 /// Caller-injected retry policy. Retries apply to transport failures and
-/// to retryable statuses on idempotent methods only (GET, HEAD, DELETE,
-/// PUT); POST requests such as multipart initiation are never retried,
-/// because a retry could duplicate an upload. The library sleeps for the
-/// returned delay through its Io between attempts; hosts that want jitter
-/// or caps encode them in `next_delay_ms_fn`.
+/// to retryable statuses on idempotent methods only (GET, HEAD, DELETE, and
+/// unconditional PUT). Conditional PUT and POST requests are never retried:
+/// after a lost response their publication outcome can be indeterminate.
+/// Delay selection and sleeping are both injected so the module never reads
+/// an ambient clock; hosts encode jitter, caps, cancellation, and the actual
+/// wait in these callbacks.
 pub const RetryPolicy = struct {
     context: *anyopaque,
     next_delay_ms_fn: *const fn (context: *anyopaque, attempt: u32, cause: RetryCause) ?u64,
+    sleep_ms_fn: *const fn (context: *anyopaque, delay_ms: u64) Error!void,
     /// Total attempts including the first.
     max_attempts: u32 = 3,
+
+    fn sleep_ms(self: RetryPolicy, delay_ms: u64) Error!void {
+        return self.sleep_ms_fn(self.context, delay_ms);
+    }
 };
 
 /// The conditional header applied to a request. All conditional headers are
@@ -91,9 +118,13 @@ pub const Config = struct {
     /// Key prefix under the bucket; may be empty.
     prefix: []const u8 = "",
     clock: Clock,
-    /// Maximum keys requested per listing page. Pages also fit the internal
-    /// XML workspace, bounding the response body size.
-    max_keys_per_page: u32 = 512,
+    /// Maximum keys requested per listing page. Must be in
+    /// `1...max_list_keys_per_page` so every response stays within the fixed
+    /// XML workspace under the S3 key-size limit.
+    max_keys_per_page: u32 = max_list_keys_per_page,
+    /// Maximum remote pages consumed by one `list` call, including pages that
+    /// contain only unrelated or malformed keys. Must be nonzero.
+    max_listing_pages: u32 = 4096,
     /// Optional retry policy for transient transport failures and
     /// retryable statuses on idempotent requests.
     retry: ?RetryPolicy = null,
@@ -101,7 +132,8 @@ pub const Config = struct {
 
 /// One in-flight multipart upload. A client tracks a single upload at a
 /// time; part bytes stream through the send workspace one part at a time,
-/// so an arbitrarily large object never needs to exist whole.
+/// so an object bounded by `max_multipart_parts * send_workspace.len` never
+/// needs to exist whole.
 pub const MultipartState = struct {
     level: u8,
     identity: ltx.FileIdentity,
@@ -111,9 +143,24 @@ pub const MultipartState = struct {
     part_count: u32 = 0,
     etag_lengths: [max_multipart_parts]u8 = @splat(0),
     etags: [max_multipart_parts][64]u8 = @splat(@splat(0)),
+    part_sizes: [max_multipart_parts]u64 = @splat(0),
 };
 
 pub const max_multipart_parts = 512;
+pub const min_multipart_part_bytes = 5 * 1024 * 1024;
+
+const MultipartOwner = enum {
+    manual,
+    write_session,
+};
+
+const StreamingWriteState = struct {
+    level: u8,
+    identity: ltx.FileIdentity,
+    created_at_ms: i64,
+    buffered_bytes: usize = 0,
+    total_bytes: u64 = 0,
+};
 
 const amz_date_bytes = 16;
 const sha256_hex_bytes = 64;
@@ -122,7 +169,7 @@ const empty_payload_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4
 /// The S3 object client. Stateful and single-owner: keep it at a stable
 /// address while the derived `Client` is in use. `send_workspace` is the
 /// mutable staging region for outgoing object bytes, sized for the largest
-/// written object.
+/// single-request object or multipart part.
 pub const S3Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -137,17 +184,26 @@ pub const S3Client = struct {
     redirect_buffer: [1024]u8 = undefined,
     transfer_buffer: [16 * 1024]u8 = undefined,
     xml_workspace: [64 * 1024]u8 = undefined,
-    key_slices: [512][]const u8 = undefined,
+    key_slices: [max_list_keys_per_page][]const u8 = undefined,
+    size_values: [max_list_keys_per_page]u64 = undefined,
     token_workspace: [256]u8 = undefined,
     etag_workspace: [128]u8 = undefined,
     multipart: ?MultipartState = null,
+    multipart_owner: ?MultipartOwner = null,
+    write_session: ?StreamingWriteState = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
         config: Config,
         send_workspace: []u8,
-    ) Error!S3Client {
+    ) InitError!S3Client {
+        if (config.max_keys_per_page == 0 or
+            config.max_listing_pages == 0 or
+            config.max_keys_per_page > max_list_keys_per_page)
+        {
+            return error.InvalidConfiguration;
+        }
         var self = S3Client{
             .allocator = allocator,
             .io = io,
@@ -155,9 +211,10 @@ pub const S3Client = struct {
             .http = .{ .allocator = allocator, .io = io },
             .send_workspace = send_workspace,
         };
+        errdefer self.http.deinit();
         if (config.use_tls) {
+            const now = timestamp_from_unix_ms(config.clock.now_ms());
             if (config.ca_file) |path| {
-                const now = std.Io.Clock.real.now(io);
                 self.http.ca_bundle.addCertsFromFilePath(
                     allocator,
                     io,
@@ -165,15 +222,22 @@ pub const S3Client = struct {
                     .cwd(),
                     path,
                 ) catch return error.StorageFailure;
-                // Pre-setting `now` stops the first TLS request from
-                // replacing this bundle with a system rescan.
-                self.http.now = now;
+            } else {
+                self.http.ca_bundle.rescan(allocator, io, now) catch
+                    return error.StorageFailure;
             }
+            // Pre-setting `now` stops the first TLS request from reading the
+            // ambient clock and replacing the caller-selected bundle.
+            self.http.now = now;
         }
         return self;
     }
 
     pub fn deinit(self: *S3Client) void {
+        if (self.write_session != null) abort_write_session(self);
+        if (self.multipart_owner) |owner| {
+            self.abort_multipart_owned(owner) catch {};
+        }
         self.http.deinit();
     }
 
@@ -183,6 +247,7 @@ pub const S3Client = struct {
             .list_fn = list,
             .open_fn = open,
             .write_fn = write,
+            .begin_write_fn = begin_write,
             .delete_fn = delete,
         };
     }
@@ -232,9 +297,14 @@ pub const S3Client = struct {
         const self: *S3Client = @ptrCast(@alignCast(context));
         var count: usize = 0;
         var continuation: ?[]const u8 = null;
-        while (true) {
+        var page_count: u32 = 0;
+        while (page_count < self.config.max_listing_pages) : (page_count += 1) {
             const remaining = destination.len - count;
-            const page_keys = @min(self.config.max_keys_per_page, remaining + 1);
+            const configured_page_keys: usize = self.config.max_keys_per_page;
+            const page_keys: u32 = if (remaining >= configured_page_keys)
+                self.config.max_keys_per_page
+            else
+                @intCast(remaining + 1);
             const query = try build_list_query(
                 &self.query_workspace,
                 page_keys,
@@ -246,7 +316,7 @@ pub const S3Client = struct {
             const outcome = try self.perform(.GET, "/", query, null, null, &self.xml_workspace, .none);
             if (outcome.status != .ok) return error.StorageFailure;
             const page = try self.parse_list_page(outcome.bytes);
-            for (page.keys) |key| {
+            for (page.keys, page.sizes) |key, size_bytes| {
                 const name = basename(key) orelse continue;
                 const identity = ltx.parse_file_name(name) catch continue;
                 if (identity.min_txid.value < seek.value) continue;
@@ -255,11 +325,14 @@ pub const S3Client = struct {
                     .level = level,
                     .min_txid = identity.min_txid,
                     .max_txid = identity.max_txid,
+                    .size_bytes = size_bytes,
                 };
                 count += 1;
             }
             if (!page.truncated) break;
             continuation = page.next_token orelse return error.StorageFailure;
+        } else {
+            return error.ListingPageLimitExceeded;
         }
         const listed = destination[0..count];
         std.sort.pdq(ltx.FileInfo, listed, {}, file_info_before);
@@ -288,6 +361,7 @@ pub const S3Client = struct {
         bytes: []const u8,
     ) Error!void {
         const self: *S3Client = @ptrCast(@alignCast(context));
+        if (self.has_active_write()) return error.InvalidState;
         if (bytes.len > self.send_workspace.len) return error.ObjectTooLarge;
         const key = try self.key_path(level, identity);
         @memcpy(self.send_workspace[0..bytes.len], bytes);
@@ -303,6 +377,143 @@ pub const S3Client = struct {
         if (outcome.status != .ok) return error.StorageFailure;
     }
 
+    fn begin_write(
+        context: *anyopaque,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+    ) Error!object.WriteSession {
+        const self: *S3Client = @ptrCast(@alignCast(context));
+        if (self.has_active_write()) return error.InvalidState;
+        self.write_session = .{
+            .level = level,
+            .identity = identity,
+            .created_at_ms = created_at_ms,
+        };
+        return object.WriteSession.init(.{
+            .context = self,
+            .write_fn = write_session_chunk,
+            .finish_fn = finish_write_session,
+            .abort_fn = abort_write_session,
+        });
+    }
+
+    fn write_session_chunk(context: *anyopaque, bytes: []const u8) Error!void {
+        const self: *S3Client = @ptrCast(@alignCast(context));
+        var state = &(self.write_session orelse return error.InvalidState);
+        const count_bytes = std.math.cast(u64, bytes.len) orelse
+            return error.ObjectTooLarge;
+        const total_bytes = std.math.add(u64, state.total_bytes, count_bytes) catch
+            return error.ObjectTooLarge;
+        try self.validate_stream_capacity(total_bytes);
+
+        var remaining = bytes;
+        var iteration_count: u32 = 0;
+        while (remaining.len > 0) : (iteration_count += 1) {
+            if (iteration_count >= max_multipart_parts) return error.ObjectTooLarge;
+            if (state.buffered_bytes == self.send_workspace.len) {
+                try self.flush_write_session_part();
+            }
+            const available = self.send_workspace.len - state.buffered_bytes;
+            const copy_bytes = @min(available, remaining.len);
+            @memcpy(
+                self.send_workspace[state.buffered_bytes..][0..copy_bytes],
+                remaining[0..copy_bytes],
+            );
+            state.buffered_bytes += copy_bytes;
+            remaining = remaining[copy_bytes..];
+            if (state.buffered_bytes == self.send_workspace.len and remaining.len > 0) {
+                try self.flush_write_session_part();
+            }
+        }
+        state.total_bytes = total_bytes;
+    }
+
+    fn validate_stream_capacity(self: *const S3Client, total_bytes: u64) Error!void {
+        const buffer_bytes = std.math.cast(u64, self.send_workspace.len) orelse
+            return error.ObjectTooLarge;
+        if (total_bytes <= buffer_bytes) return;
+        if (buffer_bytes < min_multipart_part_bytes) return error.ObjectTooLarge;
+        const maximum_bytes = std.math.mul(
+            u64,
+            buffer_bytes,
+            max_multipart_parts,
+        ) catch return error.ObjectTooLarge;
+        if (total_bytes > maximum_bytes) return error.ObjectTooLarge;
+    }
+
+    fn flush_write_session_part(self: *S3Client) Error!void {
+        const state = &(self.write_session orelse return error.InvalidState);
+        if (state.buffered_bytes < min_multipart_part_bytes) {
+            return error.ObjectTooLarge;
+        }
+        if (self.multipart == null) {
+            try self.begin_multipart_owned(
+                .write_session,
+                state.level,
+                state.identity,
+                state.created_at_ms,
+            );
+        }
+        const part_number = try self.next_part_number(.write_session);
+        try self.upload_buffered_part(
+            .write_session,
+            part_number,
+            state.buffered_bytes,
+        );
+        state.buffered_bytes = 0;
+    }
+
+    fn finish_write_session(context: *anyopaque) Error!void {
+        const self: *S3Client = @ptrCast(@alignCast(context));
+        const state = &(self.write_session orelse return error.InvalidState);
+        if (self.multipart == null) {
+            try self.finish_single_put(state);
+        } else {
+            if (self.multipart_owner != .write_session) return error.InvalidState;
+            if (state.buffered_bytes == 0) return error.InvalidState;
+            const part_number = try self.next_part_number(.write_session);
+            try self.upload_buffered_part(
+                .write_session,
+                part_number,
+                state.buffered_bytes,
+            );
+            state.buffered_bytes = 0;
+            try self.complete_multipart_owned(.write_session);
+        }
+        self.write_session = null;
+    }
+
+    fn finish_single_put(
+        self: *S3Client,
+        state: *const StreamingWriteState,
+    ) Error!void {
+        const key = try self.key_path(state.level, state.identity);
+        const outcome = try self.perform(
+            .PUT,
+            key,
+            "",
+            self.send_workspace[0..state.buffered_bytes],
+            state.created_at_ms,
+            null,
+            .none,
+        );
+        if (outcome.status != .ok) return error.StorageFailure;
+    }
+
+    fn abort_write_session(context: *anyopaque) void {
+        const self: *S3Client = @ptrCast(@alignCast(context));
+        if (self.write_session == null) return;
+        if (self.multipart_owner == .write_session) {
+            self.abort_multipart_owned(.write_session) catch {};
+        }
+        self.write_session = null;
+    }
+
+    fn has_active_write(self: *const S3Client) bool {
+        return self.write_session != null or self.multipart != null;
+    }
+
     /// Begins one multipart upload. The client tracks a single in-flight
     /// upload; part bodies stream through the send workspace one part at a
     /// time, so the object may be far larger than any workspace. Parts must
@@ -314,7 +525,25 @@ pub const S3Client = struct {
         identity: ltx.FileIdentity,
         created_at_ms: i64,
     ) Error!void {
-        if (self.multipart != null) return error.InvalidState;
+        if (self.write_session != null) return error.InvalidState;
+        return self.begin_multipart_owned(
+            .manual,
+            level,
+            identity,
+            created_at_ms,
+        );
+    }
+
+    fn begin_multipart_owned(
+        self: *S3Client,
+        owner: MultipartOwner,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+    ) Error!void {
+        if (self.multipart != null or self.multipart_owner != null) {
+            return error.InvalidState;
+        }
         const key = try self.key_path(level, identity);
         const query = try build_upload_query(&self.query_workspace, "uploads");
         const outcome = try self.perform(
@@ -337,6 +566,7 @@ pub const S3Client = struct {
         @memcpy(state.upload_id[0 .. value_end - value_start], outcome.bytes[value_start..value_end]);
         state.upload_id_bytes = value_end - value_start;
         self.multipart = state;
+        self.multipart_owner = owner;
     }
 
     /// Uploads one part and records its ETag for completion. Part numbers
@@ -346,24 +576,51 @@ pub const S3Client = struct {
         part_number: u32,
         bytes: []const u8,
     ) Error!void {
+        if (self.write_session != null) return error.InvalidState;
+        if (bytes.len > self.send_workspace.len) return error.ObjectTooLarge;
+        @memcpy(self.send_workspace[0..bytes.len], bytes);
+        return self.upload_buffered_part(.manual, part_number, bytes.len);
+    }
+
+    fn next_part_number(
+        self: *const S3Client,
+        owner: MultipartOwner,
+    ) Error!u32 {
+        const state = &(self.multipart orelse return error.InvalidState);
+        if (self.multipart_owner != owner) return error.InvalidState;
+        if (state.part_count >= max_multipart_parts) return error.ObjectTooLarge;
+        return state.part_count + 1;
+    }
+
+    fn upload_buffered_part(
+        self: *S3Client,
+        owner: MultipartOwner,
+        part_number: u32,
+        length_bytes: usize,
+    ) Error!void {
         var state = &(self.multipart orelse return error.InvalidState);
+        if (self.multipart_owner != owner) return error.InvalidState;
         if (part_number == 0 or part_number > max_multipart_parts) {
-            return error.InvalidLevel;
+            return error.ObjectTooLarge;
         }
         if (part_number != state.part_count + 1) return error.InvalidState;
-        if (bytes.len > self.send_workspace.len) return error.ObjectTooLarge;
+        if (length_bytes > self.send_workspace.len) return error.ObjectTooLarge;
+        if (state.part_count > 0 and
+            state.part_sizes[state.part_count - 1] < min_multipart_part_bytes)
+        {
+            return error.InvalidState;
+        }
         const key = try self.key_path(state.level, state.identity);
         const query = try build_part_query(
             &self.query_workspace,
             part_number,
             state.upload_id[0..state.upload_id_bytes],
         );
-        @memcpy(self.send_workspace[0..bytes.len], bytes);
         const outcome = try self.perform(
             .PUT,
             key,
             query,
-            self.send_workspace[0..bytes.len],
+            self.send_workspace[0..length_bytes],
             null,
             null,
             .none,
@@ -373,13 +630,32 @@ pub const S3Client = struct {
         if (etag.len > 64) return error.StorageFailure;
         @memcpy(state.etags[state.part_count][0..etag.len], etag);
         state.etag_lengths[state.part_count] = @intCast(etag.len);
+        state.part_sizes[state.part_count] = @intCast(length_bytes);
         state.part_count += 1;
     }
 
-    /// Completes the in-flight multipart upload, publishing the object.
+    /// Completes the in-flight multipart upload, publishing the object. A
+    /// `StorageFailure` after request delivery begins is indeterminate: the
+    /// caller must reconcile the object identity before retrying or deleting
+    /// source state.
     pub fn complete_multipart(self: *S3Client) Error!void {
+        if (self.write_session != null) return error.InvalidState;
+        return self.complete_multipart_owned(.manual);
+    }
+
+    fn complete_multipart_owned(
+        self: *S3Client,
+        owner: MultipartOwner,
+    ) Error!void {
         const state = &(self.multipart orelse return error.InvalidState);
+        if (self.multipart_owner != owner) return error.InvalidState;
         if (state.part_count == 0) return error.InvalidState;
+        var checked_part: u32 = 0;
+        while (checked_part + 1 < state.part_count) : (checked_part += 1) {
+            if (state.part_sizes[checked_part] < min_multipart_part_bytes) {
+                return error.InvalidState;
+            }
+        }
         const key = try self.key_path(state.level, state.identity);
         const query = try build_upload_query_with_id(
             &self.query_workspace,
@@ -411,13 +687,27 @@ pub const S3Client = struct {
             &self.xml_workspace,
             .none,
         );
-        self.multipart = null;
         if (outcome.status != .ok) return error.StorageFailure;
+        try validate_complete_multipart_response(outcome.bytes);
+        self.multipart = null;
+        self.multipart_owner = null;
     }
 
-    /// Aborts the in-flight multipart upload, discarding its parts.
+    /// Aborts the in-flight multipart upload, discarding its parts. A failed
+    /// cleanup retains the upload identity so the caller or `deinit` can retry;
+    /// all new writes remain blocked until cleanup succeeds.
     pub fn abort_multipart(self: *S3Client) Error!void {
+        if (self.write_session != null) return error.InvalidState;
+        const owner = self.multipart_owner orelse return error.InvalidState;
+        return self.abort_multipart_owned(owner);
+    }
+
+    fn abort_multipart_owned(
+        self: *S3Client,
+        owner: MultipartOwner,
+    ) Error!void {
         const state = &(self.multipart orelse return error.InvalidState);
+        if (self.multipart_owner != owner) return error.InvalidState;
         const key = try self.key_path(state.level, state.identity);
         const query = try build_upload_query_with_id(
             &self.query_workspace,
@@ -432,23 +722,24 @@ pub const S3Client = struct {
             null,
             .none,
         );
+        if (!abort_status_is_clean(outcome.status)) return error.StorageFailure;
         self.multipart = null;
-        switch (outcome.status) {
-            .ok, .no_content => {},
-            else => return error.StorageFailure,
-        }
+        self.multipart_owner = null;
     }
 
     /// Writes one object only when its key is absent, for host-side lease
     /// fencing: the first writer wins and later contenders receive
     /// `ObjectExists`. Uses `If-None-Match: *`, which the store must support.
+    /// A failure after delivery begins returns `PublicationIndeterminate` and
+    /// is never retried automatically; reconcile the stored generation.
     pub fn put_if_absent(
         self: *S3Client,
         level: u8,
         identity: ltx.FileIdentity,
         created_at_ms: i64,
         bytes: []const u8,
-    ) Error!void {
+    ) ConditionalWriteError!void {
+        if (self.has_active_write()) return error.InvalidState;
         if (level > ltx.max_level) return error.InvalidLevel;
         if (identity.min_txid.value > identity.max_txid.value) {
             return error.InvalidIdentity;
@@ -456,7 +747,7 @@ pub const S3Client = struct {
         if (bytes.len > self.send_workspace.len) return error.ObjectTooLarge;
         const key = try self.key_path(level, identity);
         @memcpy(self.send_workspace[0..bytes.len], bytes);
-        const outcome = try self.perform(
+        const outcome = try self.perform_conditional(
             .PUT,
             key,
             "",
@@ -468,7 +759,7 @@ pub const S3Client = struct {
         switch (outcome.status) {
             .ok, .created => {},
             .precondition_failed => return error.ObjectExists,
-            else => return error.StorageFailure,
+            else => return conditional_status_failure(outcome.status),
         }
     }
 
@@ -495,7 +786,9 @@ pub const S3Client = struct {
     /// (as returned by `object_etag`, quotes included). This is the
     /// replace-if-generation primitive for lease renewal: a contender that
     /// renewed between the caller's read and write shifts the ETag and this
-    /// call fails with `ETagMismatch`.
+    /// call fails with `ETagMismatch`. A failure after delivery begins returns
+    /// `PublicationIndeterminate` and is never retried automatically; reconcile
+    /// the stored generation before renewal continues.
     pub fn put_if_match(
         self: *S3Client,
         level: u8,
@@ -503,7 +796,8 @@ pub const S3Client = struct {
         created_at_ms: i64,
         bytes: []const u8,
         expected_etag: []const u8,
-    ) Error!void {
+    ) ConditionalWriteError!void {
+        if (self.has_active_write()) return error.InvalidState;
         if (level > ltx.max_level) return error.InvalidLevel;
         if (identity.min_txid.value > identity.max_txid.value) {
             return error.InvalidIdentity;
@@ -511,7 +805,7 @@ pub const S3Client = struct {
         if (bytes.len > self.send_workspace.len) return error.ObjectTooLarge;
         const key = try self.key_path(level, identity);
         @memcpy(self.send_workspace[0..bytes.len], bytes);
-        const outcome = try self.perform(
+        const outcome = try self.perform_conditional(
             .PUT,
             key,
             "",
@@ -523,7 +817,7 @@ pub const S3Client = struct {
         switch (outcome.status) {
             .ok => {},
             .precondition_failed => return error.ETagMismatch,
-            else => return error.StorageFailure,
+            else => return conditional_status_failure(outcome.status),
         }
     }
 
@@ -532,6 +826,7 @@ pub const S3Client = struct {
         files: []const ltx.FileInfo,
     ) Error!void {
         const self: *S3Client = @ptrCast(@alignCast(context));
+        if (self.has_active_write()) return error.InvalidState;
         for (files) |info| {
             const key = try self.key_path(
                 info.level,
@@ -570,8 +865,23 @@ pub const S3Client = struct {
         body_destination: ?[]u8,
         conditional: Conditional,
     ) Error!Outcome {
+        switch (conditional) {
+            .none => {},
+            .create_only, .match_etag => unreachable,
+        }
         const policy = self.config.retry orelse
-            return self.perform_once(method, key, query, payload, metadata_ms, body_destination, conditional);
+            return self.perform_once(
+                method,
+                key,
+                query,
+                payload,
+                metadata_ms,
+                body_destination,
+                conditional,
+            ) catch |err| switch (err) {
+                error.PublicationIndeterminate => unreachable,
+                else => |other| return other,
+            };
         var attempt: u32 = 1;
         while (true) : (attempt += 1) {
             const outcome = self.perform_once(
@@ -583,20 +893,24 @@ pub const S3Client = struct {
                 body_destination,
                 conditional,
             ) catch |err| {
-                if (err != error.StorageFailure) return err;
-                if (retry_delay(policy, attempt, .transport, method)) |delay| {
-                    try self.sleep_retry(delay);
+                const definite_error: Error = switch (err) {
+                    error.PublicationIndeterminate => unreachable,
+                    else => |other| other,
+                };
+                if (definite_error != error.StorageFailure) return definite_error;
+                if (retry_delay(policy, attempt, .transport, method, conditional)) |delay| {
+                    try policy.sleep_ms(delay);
                     continue;
                 }
-                return err;
+                return definite_error;
             };
             const retryable = @intFromEnum(outcome.status) >= 500 or
                 outcome.status == .too_many_requests;
             if (retryable) {
                 if (retry_delay(policy, attempt, .{
                     .status = @intFromEnum(outcome.status),
-                }, method)) |delay| {
-                    try self.sleep_retry(delay);
+                }, method, conditional)) |delay| {
+                    try policy.sleep_ms(delay);
                     continue;
                 }
             }
@@ -604,12 +918,33 @@ pub const S3Client = struct {
         }
     }
 
-    fn sleep_retry(self: *S3Client, delay_ms: u64) Error!void {
-        const timeout = std.Io.Timeout{ .duration = .{
-            .raw = std.Io.Duration.fromMilliseconds(@intCast(delay_ms)),
-            .clock = std.Io.Clock.real,
-        } };
-        timeout.sleep(self.io) catch return error.StorageFailure;
+    /// Executes a fenced PUT exactly once. Once sending starts, any transport
+    /// failure is conservatively indeterminate because the store may have
+    /// committed the conditional write before the response was lost.
+    fn perform_conditional(
+        self: *S3Client,
+        method: std.http.Method,
+        key: []const u8,
+        query: []const u8,
+        payload: ?[]u8,
+        metadata_ms: ?i64,
+        body_destination: ?[]u8,
+        conditional: Conditional,
+    ) ConditionalWriteError!Outcome {
+        std.debug.assert(method == .PUT);
+        switch (conditional) {
+            .none => unreachable,
+            .create_only, .match_etag => {},
+        }
+        return self.perform_once(
+            method,
+            key,
+            query,
+            payload,
+            metadata_ms,
+            body_destination,
+            conditional,
+        );
     }
 
     /// Signs and performs exactly one request attempt.
@@ -622,21 +957,20 @@ pub const S3Client = struct {
         metadata_ms: ?i64,
         body_destination: ?[]u8,
         conditional: Conditional,
-    ) Error!Outcome {
+    ) ConditionalWriteError!Outcome {
         const now_ms = self.config.clock.now_ms();
         var amz_date: [amz_date_bytes]u8 = undefined;
-        format_amz_date(now_ms, &amz_date);
+        try format_amz_date(now_ms, &amz_date);
+        // Keep certificate validation and request signing on the same injected
+        // wall clock for every new or reused HTTP request.
+        self.http.now = timestamp_from_unix_ms(now_ms);
         var payload_hash: [sha256_hex_bytes]u8 = undefined;
         sha256_hex(payload orelse "", &payload_hash);
 
         var timestamp_buffer: [24]u8 = undefined;
         var timestamp_text: []const u8 = "";
         if (metadata_ms) |value| {
-            timestamp_text = std.fmt.bufPrint(
-                &timestamp_buffer,
-                "{d}",
-                .{value},
-            ) catch return error.StorageFailure;
+            timestamp_text = try format_litestream_timestamp(value, &timestamp_buffer);
         }
 
         var path_buffer: [1024]u8 = undefined;
@@ -724,17 +1058,20 @@ pub const S3Client = struct {
         defer request.deinit();
 
         if (payload) |body| {
-            request.sendBodyComplete(body) catch return error.StorageFailure;
+            request.sendBodyComplete(body) catch
+                return post_send_failure(conditional);
         } else if (method.requestHasBody()) {
             // PUT without a payload still carries a zero-length body.
             const empty = self.send_workspace[0..0];
-            request.sendBodyComplete(empty) catch return error.StorageFailure;
+            request.sendBodyComplete(empty) catch
+                return post_send_failure(conditional);
         } else {
-            request.sendBodiless() catch return error.StorageFailure;
+            request.sendBodiless() catch return post_send_failure(conditional);
         }
         var response = request.receiveHead(&self.redirect_buffer) catch
-            return error.StorageFailure;
+            return post_send_failure(conditional);
         const status = response.head.status;
+        mark_bodyless_response_complete(&request, method, status);
         var etag: ?[]const u8 = null;
         var header_iterator = response.head.iterateHeaders();
         while (header_iterator.next()) |header| {
@@ -748,17 +1085,11 @@ pub const S3Client = struct {
         if (status != .ok) return .{ .status = status };
         const destination = body_destination orelse
             return .{ .status = status, .etag = etag };
-        const length_value = response.head.content_length orelse
-            return error.StorageFailure;
-        const length = std.math.cast(usize, length_value) orelse
-            return error.ObjectTooLarge;
-        if (length > destination.len) return error.ObjectTooLarge;
         const reader = response.reader(&self.transfer_buffer);
-        reader.readSliceAll(destination[0..length]) catch
-            return error.StorageFailure;
+        const bytes = try read_bounded_response_body(reader, destination);
         return .{
             .status = status,
-            .bytes = destination[0..length],
+            .bytes = bytes,
             .etag = etag,
         };
     }
@@ -874,6 +1205,7 @@ pub const S3Client = struct {
 
     const ListPage = struct {
         keys: []const []const u8,
+        sizes: []const u64,
         truncated: bool,
         next_token: ?[]const u8,
     };
@@ -884,34 +1216,59 @@ pub const S3Client = struct {
     fn parse_list_page(self: *S3Client, xml: []const u8) Error!ListPage {
         var count: usize = 0;
         var cursor: usize = 0;
-        while (std.mem.indexOfPos(u8, xml, cursor, "<Key>")) |start| {
-            const value_start = start + "<Key>".len;
+        while (std.mem.indexOfPos(u8, xml, cursor, "<Contents>")) |contents_start| {
+            const contents_end = std.mem.indexOfPos(
+                u8,
+                xml,
+                contents_start + "<Contents>".len,
+                "</Contents>",
+            ) orelse return error.StorageFailure;
+            const key_start = std.mem.indexOfPos(u8, xml, contents_start, "<Key>") orelse
+                return error.StorageFailure;
+            const value_start = key_start + "<Key>".len;
             const value_end = std.mem.indexOfPos(u8, xml, value_start, "</Key>") orelse
                 return error.StorageFailure;
-            if (count == self.key_slices.len) return error.StorageFailure;
-            self.key_slices[count] = xml[value_start..value_end];
-            count += 1;
-            cursor = value_end + "</Key>".len;
-        }
-        const truncated = std.mem.indexOf(u8, xml, "<IsTruncated>true<") != null;
-        var next_token: ?[]const u8 = null;
-        if (truncated) {
-            const token_start = std.mem.indexOf(u8, xml, "<NextContinuationToken>") orelse
+            const size_start = std.mem.indexOfPos(u8, xml, value_end, "<Size>") orelse
                 return error.StorageFailure;
-            const value_start = token_start + "<NextContinuationToken>".len;
-            const value_end = std.mem.indexOfPos(u8, xml, value_start, "</NextContinuationToken>") orelse
+            const size_value_start = size_start + "<Size>".len;
+            const size_value_end = std.mem.indexOfPos(u8, xml, size_value_start, "</Size>") orelse
                 return error.StorageFailure;
-            if (value_end - value_start > self.token_workspace.len) {
+            if (value_end > contents_end or size_value_end > contents_end) {
                 return error.StorageFailure;
             }
-            @memcpy(
-                self.token_workspace[0 .. value_end - value_start],
-                xml[value_start..value_end],
-            );
-            next_token = self.token_workspace[0 .. value_end - value_start];
+            if (count == self.key_slices.len) return error.StorageFailure;
+            self.key_slices[count] = xml[value_start..value_end];
+            self.size_values[count] = std.fmt.parseInt(
+                u64,
+                xml[size_value_start..size_value_end],
+                10,
+            ) catch return error.StorageFailure;
+            count += 1;
+            cursor = contents_end + "</Contents>".len;
+        }
+        const truncated_text = xml_text(
+            xml,
+            "<IsTruncated>",
+            "</IsTruncated>",
+        ) orelse return error.StorageFailure;
+        const truncated = if (std.mem.eql(u8, truncated_text, "true"))
+            true
+        else if (std.mem.eql(u8, truncated_text, "false"))
+            false
+        else
+            return error.StorageFailure;
+        var next_token: ?[]const u8 = null;
+        if (truncated) {
+            const encoded = xml_text(
+                xml,
+                "<NextContinuationToken>",
+                "</NextContinuationToken>",
+            ) orelse return error.StorageFailure;
+            next_token = try decode_xml_text(encoded, &self.token_workspace);
         }
         return .{
             .keys = self.key_slices[0..count],
+            .sizes = self.size_values[0..count],
             .truncated = truncated,
             .next_token = next_token,
         };
@@ -933,19 +1290,62 @@ fn sha256_hmac_hex(key: *const [32]u8, message: []const u8, out: *[sha256_hex_by
     _ = std.fmt.bufPrint(out, "{x}", .{&digest}) catch unreachable;
 }
 
-fn format_amz_date(now_ms: u64, out: *[amz_date_bytes]u8) void {
+fn timestamp_from_unix_ms(unix_ms: u64) std.Io.Timestamp {
+    const nanoseconds = @as(i96, @intCast(unix_ms)) *
+        @as(i96, std.time.ns_per_ms);
+    return std.Io.Timestamp.fromNanoseconds(nanoseconds);
+}
+
+fn format_amz_date(now_ms: u64, out: *[amz_date_bytes]u8) Error!void {
     const total_seconds = now_ms / 1000;
     const days: i64 = @intCast(total_seconds / 86_400);
     const day_seconds = total_seconds % 86_400;
     const civil = civil_from_days(days);
+    if (civil.year < 0 or civil.year > 9999) return error.InvalidTimestamp;
     _ = std.fmt.bufPrint(out, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
-        @as(u32, @intCast(civil.year)),
+        @as(u16, @intCast(civil.year)),
         civil.month,
         civil.day,
         day_seconds / 3600,
         (day_seconds % 3600) / 60,
         day_seconds % 60,
-    }) catch unreachable;
+    }) catch return error.InvalidTimestamp;
+}
+
+/// Litestream stores the LTX header timestamp as UTC RFC3339Nano metadata.
+/// LTX timestamps have millisecond precision, so the fractional part is at
+/// most three digits and trailing zeroes are omitted like Go's formatter.
+fn format_litestream_timestamp(
+    timestamp_ms: i64,
+    out: *[24]u8,
+) Error![]const u8 {
+    const total_seconds = @divFloor(timestamp_ms, 1000);
+    const days = @divFloor(total_seconds, 86_400);
+    const day_seconds = @mod(total_seconds, 86_400);
+    const millisecond: u16 = @intCast(@mod(timestamp_ms, 1000));
+    const civil = civil_from_days(days);
+    if (civil.year < 0 or civil.year > 9999) return error.InvalidTimestamp;
+
+    const prefix = std.fmt.bufPrint(out, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{
+        @as(u16, @intCast(civil.year)),
+        civil.month,
+        civil.day,
+        @as(u32, @intCast(@divFloor(day_seconds, 3600))),
+        @as(u32, @intCast(@divFloor(@mod(day_seconds, 3600), 60))),
+        @as(u32, @intCast(@mod(day_seconds, 60))),
+    }) catch return error.StorageFailure;
+    const tail = if (millisecond == 0)
+        std.fmt.bufPrint(out[prefix.len..], "Z", .{}) catch return error.StorageFailure
+    else if (@mod(millisecond, 100) == 0)
+        std.fmt.bufPrint(out[prefix.len..], ".{d}Z", .{@divExact(millisecond, 100)}) catch
+            return error.StorageFailure
+    else if (@mod(millisecond, 10) == 0)
+        std.fmt.bufPrint(out[prefix.len..], ".{d:0>2}Z", .{@divExact(millisecond, 10)}) catch
+            return error.StorageFailure
+    else
+        std.fmt.bufPrint(out[prefix.len..], ".{d:0>3}Z", .{millisecond}) catch
+            return error.StorageFailure;
+    return out[0 .. prefix.len + tail.len];
 }
 
 const CivilDate = struct { year: i64, month: u32, day: u32 };
@@ -1072,6 +1472,95 @@ fn append_multipart_xml(destination: []u8, offset: *usize, bytes: []const u8) Er
     offset.* = end;
 }
 
+fn xml_text(xml: []const u8, opening: []const u8, closing: []const u8) ?[]const u8 {
+    const opening_start = std.mem.indexOf(u8, xml, opening) orelse return null;
+    const value_start = opening_start + opening.len;
+    const value_end = std.mem.indexOfPos(u8, xml, value_start, closing) orelse
+        return null;
+    return xml[value_start..value_end];
+}
+
+fn decode_xml_text(encoded: []const u8, destination: []u8) Error![]const u8 {
+    var source_index: usize = 0;
+    var destination_index: usize = 0;
+    while (source_index < encoded.len) {
+        if (destination_index == destination.len) return error.StorageFailure;
+        if (encoded[source_index] != '&') {
+            destination[destination_index] = encoded[source_index];
+            source_index += 1;
+            destination_index += 1;
+            continue;
+        }
+        const end = std.mem.indexOfScalarPos(u8, encoded, source_index + 1, ';') orelse
+            return error.StorageFailure;
+        const entity = encoded[source_index .. end + 1];
+        destination[destination_index] = if (std.mem.eql(u8, entity, "&amp;"))
+            '&'
+        else if (std.mem.eql(u8, entity, "&lt;"))
+            '<'
+        else if (std.mem.eql(u8, entity, "&gt;"))
+            '>'
+        else if (std.mem.eql(u8, entity, "&quot;"))
+            '"'
+        else if (std.mem.eql(u8, entity, "&apos;"))
+            '\''
+        else
+            return error.StorageFailure;
+        destination_index += 1;
+        source_index = end + 1;
+    }
+    return destination[0..destination_index];
+}
+
+/// AWS may return an XML error inside an HTTP 200 response while completing a
+/// multipart upload. Publication is successful only when the bounded response
+/// is a complete `CompleteMultipartUploadResult` document.
+fn validate_complete_multipart_response(bytes: []const u8) Error!void {
+    var document = std.mem.trim(u8, bytes, " \t\r\n");
+    if (std.mem.startsWith(u8, document, "<?xml")) {
+        const declaration_end = std.mem.indexOf(u8, document, "?>") orelse
+            return error.StorageFailure;
+        document = std.mem.trim(u8, document[declaration_end + 2 ..], " \t\r\n");
+    }
+    if (std.mem.indexOf(u8, document, "<Error") != null) {
+        return error.StorageFailure;
+    }
+    const opening = "<CompleteMultipartUploadResult";
+    if (!std.mem.startsWith(u8, document, opening)) return error.StorageFailure;
+    if (document.len == opening.len) return error.StorageFailure;
+    const opening_suffix = document[opening.len];
+    if (opening_suffix != '>' and !std.ascii.isWhitespace(opening_suffix)) {
+        return error.StorageFailure;
+    }
+    _ = std.mem.indexOfScalarPos(u8, document, opening.len, '>') orelse
+        return error.StorageFailure;
+    if (!std.mem.endsWith(
+        u8,
+        document,
+        "</CompleteMultipartUploadResult>",
+    )) return error.StorageFailure;
+    const etag = xml_text(document, "<ETag>", "</ETag>") orelse
+        return error.StorageFailure;
+    if (etag.len == 0) return error.StorageFailure;
+}
+
+/// Reads a response to EOF into fixed caller-owned storage and probes one
+/// extra byte when the storage fills exactly. This works for content-length,
+/// chunked, and close-delimited HTTP bodies without allocating.
+fn read_bounded_response_body(
+    reader: *std.Io.Reader,
+    destination: []u8,
+) Error![]const u8 {
+    const length = reader.readSliceShort(destination) catch
+        return error.StorageFailure;
+    if (length < destination.len) return destination[0..length];
+    var extra: [1]u8 = undefined;
+    const extra_length = reader.readSliceShort(&extra) catch
+        return error.StorageFailure;
+    if (extra_length != 0) return error.ObjectTooLarge;
+    return destination;
+}
+
 fn append_key_part(destination: []u8, offset: *usize, bytes: []const u8) Error!void {
     const end = std.math.add(usize, offset.*, bytes.len) catch
         return error.PathTooLong;
@@ -1134,6 +1623,22 @@ fn signed_headers_text(
         "host;x-amz-content-sha256;x-amz-date";
 }
 
+fn mark_bodyless_response_complete(
+    request: *std.http.Client.Request,
+    method: std.http.Method,
+    status: std.http.Status,
+) void {
+    if (method != .HEAD and status.class() != .informational and
+        status != .no_content and status != .not_modified)
+    {
+        return;
+    }
+    // Zig 0.16 otherwise treats an absent length as a close-delimited body
+    // during Request.deinit(), which waits for an S3 keep-alive timeout.
+    std.debug.assert(request.reader.state == .received_head);
+    request.reader.state = .ready;
+}
+
 /// The retry decision: within budget, allowed for the method, and the
 /// policy still returning a delay.
 fn retry_delay(
@@ -1141,10 +1646,36 @@ fn retry_delay(
     attempt: u32,
     cause: RetryCause,
     method: std.http.Method,
+    conditional: Conditional,
 ) ?u64 {
     if (attempt >= policy.max_attempts) return null;
+    switch (conditional) {
+        .none => {},
+        .create_only, .match_etag => return null,
+    }
     if (!method_retryable(method)) return null;
     return policy.next_delay_ms_fn(policy.context, attempt, cause);
+}
+
+fn post_send_failure(conditional: Conditional) ConditionalWriteError {
+    return switch (conditional) {
+        .none => error.StorageFailure,
+        .create_only, .match_etag => error.PublicationIndeterminate,
+    };
+}
+
+fn conditional_status_failure(status: std.http.Status) ConditionalWriteError {
+    if (@intFromEnum(status) >= 500 or status == .too_many_requests) {
+        return error.PublicationIndeterminate;
+    }
+    return error.StorageFailure;
+}
+
+fn abort_status_is_clean(status: std.http.Status) bool {
+    return switch (status) {
+        .ok, .no_content, .not_found => true,
+        else => false,
+    };
 }
 
 fn method_retryable(method: std.http.Method) bool {
@@ -1170,15 +1701,47 @@ fn basename(key: []const u8) ?[]const u8 {
 test "amz date formatting matches known calendar values" {
     // 1,785,101,704 Unix seconds is 2026-07-26T21:35:04Z.
     var out: [amz_date_bytes]u8 = undefined;
-    format_amz_date(1_785_101_704_000, &out);
+    try format_amz_date(1_785_101_704_000, &out);
     try std.testing.expectEqualStrings("20260726T213504Z", &out);
-    format_amz_date(0, &out);
+    try format_amz_date(0, &out);
     try std.testing.expectEqualStrings("19700101T000000Z", &out);
-    format_amz_date(86_400_000, &out);
+    try format_amz_date(86_400_000, &out);
     try std.testing.expectEqualStrings("19700102T000000Z", &out);
     // 1,739,888,000 seconds is 2025-02-18T14:13:20Z.
-    format_amz_date(1_739_888_000_000, &out);
+    try format_amz_date(1_739_888_000_000, &out);
     try std.testing.expectEqualStrings("20250218T141320Z", &out);
+    try std.testing.expectError(
+        error.InvalidTimestamp,
+        format_amz_date(std.math.maxInt(u64), &out),
+    );
+}
+
+test "Litestream timestamp formatting matches RFC3339Nano" {
+    var out: [24]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "1970-01-01T00:00:00Z",
+        try format_litestream_timestamp(0, &out),
+    );
+    try std.testing.expectEqualStrings(
+        "1970-01-01T00:00:00.123Z",
+        try format_litestream_timestamp(123, &out),
+    );
+    try std.testing.expectEqualStrings(
+        "1970-01-01T00:00:00.12Z",
+        try format_litestream_timestamp(120, &out),
+    );
+    try std.testing.expectEqualStrings(
+        "1970-01-01T00:00:00.1Z",
+        try format_litestream_timestamp(100, &out),
+    );
+    try std.testing.expectEqualStrings(
+        "1969-12-31T23:59:59.999Z",
+        try format_litestream_timestamp(-1, &out),
+    );
+    try std.testing.expectError(
+        error.InvalidTimestamp,
+        format_litestream_timestamp(std.math.maxInt(i64), &out),
+    );
 }
 
 test "civil date conversion crosses leap years" {
@@ -1194,6 +1757,140 @@ test "civil date conversion crosses leap years" {
     try std.testing.expectEqual(@as(u32, 2), january_second.day);
 }
 
+test "list parsing binds every key to its exact stored size" {
+    const FixedClock = struct {
+        fn now_ms(_: *anyopaque) u64 {
+            return 0;
+        }
+    };
+    var clock_context: u8 = 0;
+    var send_workspace: [1]u8 = undefined;
+    var client = try S3Client.init(std.testing.allocator, std.testing.io, .{
+        .host = "127.0.0.1",
+        .port = 9000,
+        .bucket = "test",
+        .access_key = "key",
+        .secret_key = "secret",
+        .clock = .{ .context = &clock_context, .now_ms_fn = FixedClock.now_ms },
+    }, &send_workspace);
+    defer client.deinit();
+
+    const page = try client.parse_list_page(
+        \\<ListBucketResult><IsTruncated>true</IsTruncated>
+        \\<Contents><Key>replica/0000/0000000000000001-0000000000000001.ltx</Key><Size>17</Size></Contents>
+        \\<Contents><Key>replica/0000/0000000000000002-0000000000000002.ltx</Key><Size>4096</Size></Contents>
+        \\<NextContinuationToken>next&amp;page</NextContinuationToken></ListBucketResult>
+    );
+    try std.testing.expectEqual(@as(usize, 2), page.keys.len);
+    try std.testing.expectEqualSlices(u64, &.{ 17, 4096 }, page.sizes);
+    try std.testing.expect(page.truncated);
+    try std.testing.expectEqualStrings("next&page", page.next_token.?);
+    try std.testing.expectError(
+        error.StorageFailure,
+        client.parse_list_page(
+            "<ListBucketResult><Contents><Key>key</Key><Size>bad</Size></Contents></ListBucketResult>",
+        ),
+    );
+    try std.testing.expectError(
+        error.StorageFailure,
+        client.parse_list_page("<ListBucketResult></ListBucketResult>"),
+    );
+}
+
+test "listing page configuration stays within the fixed response budget" {
+    const FixedClock = struct {
+        fn now_ms(_: *anyopaque) u64 {
+            return 0;
+        }
+    };
+    var clock_context: u8 = 0;
+    var send_workspace: [1]u8 = undefined;
+    const base = Config{
+        .host = "127.0.0.1",
+        .port = 9000,
+        .bucket = "test",
+        .access_key = "key",
+        .secret_key = "secret",
+        .clock = .{ .context = &clock_context, .now_ms_fn = FixedClock.now_ms },
+    };
+    var zero = base;
+    zero.max_keys_per_page = 0;
+    try std.testing.expectError(
+        error.InvalidConfiguration,
+        S3Client.init(std.testing.allocator, std.testing.io, zero, &send_workspace),
+    );
+    var zero_pages = base;
+    zero_pages.max_listing_pages = 0;
+    try std.testing.expectError(
+        error.InvalidConfiguration,
+        S3Client.init(
+            std.testing.allocator,
+            std.testing.io,
+            zero_pages,
+            &send_workspace,
+        ),
+    );
+    var excessive = base;
+    excessive.max_keys_per_page = max_list_keys_per_page + 1;
+    try std.testing.expectError(
+        error.InvalidConfiguration,
+        S3Client.init(std.testing.allocator, std.testing.io, excessive, &send_workspace),
+    );
+    var bounded = try S3Client.init(
+        std.testing.allocator,
+        std.testing.io,
+        base,
+        &send_workspace,
+    );
+    defer bounded.deinit();
+}
+
+test "multipart completion accepts only a success result" {
+    try validate_complete_multipart_response(
+        \\   <CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+        \\     <Location>http://example.test/bucket/key</Location>
+        \\     <Bucket>bucket</Bucket><Key>key</Key><ETag>"etag"</ETag>
+        \\   </CompleteMultipartUploadResult>
+    );
+    try std.testing.expectError(
+        error.StorageFailure,
+        validate_complete_multipart_response(
+            \\<Error><Code>InternalError</Code><Message>try again</Message></Error>
+        ),
+    );
+    try std.testing.expectError(
+        error.StorageFailure,
+        validate_complete_multipart_response("<NotACompletionResult/>"),
+    );
+    try std.testing.expectError(
+        error.StorageFailure,
+        validate_complete_multipart_response(
+            "<CompleteMultipartUploadResult></CompleteMultipartUploadResult>",
+        ),
+    );
+}
+
+test "response bodies are bounded without requiring a declared length" {
+    var destination: [4]u8 = undefined;
+    var short_reader = std.Io.Reader.fixed("abc");
+    try std.testing.expectEqualStrings(
+        "abc",
+        try read_bounded_response_body(&short_reader, &destination),
+    );
+
+    var exact_reader = std.Io.Reader.fixed("abcd");
+    try std.testing.expectEqualStrings(
+        "abcd",
+        try read_bounded_response_body(&exact_reader, &destination),
+    );
+
+    var long_reader = std.Io.Reader.fixed("abcde");
+    try std.testing.expectError(
+        error.ObjectTooLarge,
+        read_bounded_response_body(&long_reader, &destination),
+    );
+}
+
 test "empty payload hash is the standard constant" {
     var out: [sha256_hex_bytes]u8 = undefined;
     sha256_hex("", &out);
@@ -1203,6 +1900,8 @@ test "empty payload hash is the standard constant" {
 test "retry decisions respect budget, method, and policy callback" {
     const Probe = struct {
         calls: u32 = 0,
+        sleep_calls: u32 = 0,
+        last_delay_ms: u64 = 0,
         stop_after: u32 = std.math.maxInt(u32),
         fn next(context: *anyopaque, attempt: u32, cause: RetryCause) ?u64 {
             const self: *@This() = @ptrCast(@alignCast(context));
@@ -1213,24 +1912,76 @@ test "retry decisions respect budget, method, and policy callback" {
                 .status => |code| if (code == 429) 20 else null,
             };
         }
+
+        fn sleep(context: *anyopaque, delay_ms: u64) Error!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.sleep_calls += 1;
+            self.last_delay_ms = delay_ms;
+        }
     };
     var probe = Probe{};
     const policy = RetryPolicy{
         .context = &probe,
         .next_delay_ms_fn = Probe.next,
+        .sleep_ms_fn = Probe.sleep,
         .max_attempts = 3,
     };
 
     // First failure within budget yields the callback's delay.
-    try std.testing.expectEqual(@as(?u64, 10), retry_delay(policy, 1, .transport, .GET));
+    try std.testing.expectEqual(
+        @as(?u64, 10),
+        retry_delay(policy, 1, .transport, .GET, .none),
+    );
     // POST is never retried.
-    try std.testing.expectEqual(@as(?u64, null), retry_delay(policy, 1, .transport, .POST));
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        retry_delay(policy, 1, .transport, .POST, .none),
+    );
+    // A conditional PUT is not safely retryable after a lost response.
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        retry_delay(policy, 1, .transport, .PUT, .create_only),
+    );
     // The last allowed attempt produces no further delay.
-    try std.testing.expectEqual(@as(?u64, null), retry_delay(policy, 3, .transport, .GET));
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        retry_delay(policy, 3, .transport, .GET, .none),
+    );
     // A non-429 status stops through the callback.
-    try std.testing.expectEqual(@as(?u64, null), retry_delay(policy, 1, .{ .status = 503 }, .PUT));
-    try std.testing.expectEqual(@as(?u64, 20), retry_delay(policy, 1, .{ .status = 429 }, .PUT));
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        retry_delay(policy, 1, .{ .status = 503 }, .PUT, .none),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 20),
+        retry_delay(policy, 1, .{ .status = 429 }, .PUT, .none),
+    );
     try std.testing.expectEqual(@as(u32, 3), probe.calls);
+    try policy.sleep_ms(20);
+    try std.testing.expectEqual(@as(u32, 1), probe.sleep_calls);
+    try std.testing.expectEqual(@as(u64, 20), probe.last_delay_ms);
+}
+
+test "conditional publication classifies post-send failure as indeterminate" {
+    try std.testing.expectEqual(
+        error.StorageFailure,
+        post_send_failure(.none),
+    );
+    try std.testing.expectEqual(
+        error.PublicationIndeterminate,
+        post_send_failure(.create_only),
+    );
+    try std.testing.expectEqual(
+        error.PublicationIndeterminate,
+        post_send_failure(.{ .match_etag = "\"generation\"" }),
+    );
+}
+
+test "multipart abort treats a missing upload as already clean" {
+    try std.testing.expect(abort_status_is_clean(.ok));
+    try std.testing.expect(abort_status_is_clean(.no_content));
+    try std.testing.expect(abort_status_is_clean(.not_found));
+    try std.testing.expect(!abort_status_is_clean(.internal_server_error));
 }
 
 test "signed header lists stay alphabetical across conditional variants" {

@@ -11,7 +11,7 @@ position before + verified LTX transition = position after
 The project follows a safety-first interpretation of TigerStyle: all work and
 memory are explicitly bounded, wire integers are decoded field by field, and
 unverified pages never masquerade as an authoritative database state. The
-package is named `ltx-zig`; consumers import its public module as `ltx`.
+package is named `ltx-zig`; consumers import its core module as `ltx`.
 
 ## Status
 
@@ -98,7 +98,8 @@ For a tagged release, add the package to a consumer's `build.zig.zon` with:
 zig fetch --save=ltx_zig https://github.com/nullstyle/ltx-zig/archive/refs/tags/v0.3.0.tar.gz
 ```
 
-Then expose either or both public modules to the consumer root module:
+Then expose whichever of the nine public modules the consumer needs. This
+example wires all of them so their package import names are explicit:
 
 ```zig
 const ltx_zig = b.dependency("ltx_zig", .{
@@ -114,6 +115,13 @@ const app = b.addExecutable(.{
         .imports = &.{
             .{ .name = "ltx", .module = ltx_zig.module("ltx") },
             .{ .name = "ltx_sqlite", .module = ltx_zig.module("ltx_sqlite") },
+            .{ .name = "ltx_wal", .module = ltx_zig.module("ltx_wal") },
+            .{ .name = "ltx_object", .module = ltx_zig.module("ltx_object") },
+            .{ .name = "ltx_s3", .module = ltx_zig.module("ltx_s3") },
+            .{ .name = "ltx_replica", .module = ltx_zig.module("ltx_replica") },
+            .{ .name = "ltx_capture", .module = ltx_zig.module("ltx_capture") },
+            .{ .name = "ltx_resources", .module = ltx_zig.module("ltx_resources") },
+            .{ .name = "ltx_replication", .module = ltx_zig.module("ltx_replication") },
         },
     }),
 });
@@ -144,11 +152,14 @@ mise exec -- zig build
 mise exec -- zig build fmt-check
 mise exec -- zig build test
 mise exec -- zig build sqlite-integration # optional; links the host libsqlite3
+mise exec -- zig build capture-integration # optional; links the host libsqlite3
+mise run s3-integration # optional; starts pinned local MinIO instances
 mise exec -- zig build consumer-smoke
 mise exec -- zig build consumer-compile
 mise exec -- zig build example-round-trip
 mise exec -- zig build example-apply-snapshot
 mise exec -- zig build example-sqlite-store
+mise exec -- zig build example-replicate-once # links the host libsqlite3
 mise exec -- zig build source-archive-smoke
 mise exec -- zig build release-check
 mise exec -- zig build resource-check
@@ -199,7 +210,7 @@ for the executable only).
 [`examples/sqlite_store_lifecycle.zig`](examples/sqlite_store_lifecycle.zig)
 demonstrates store initialization and recovery, verified snapshot publication,
 a held generation access and SQLite open specification, and the lock/lifecycle
-boundary without linking SQLite. Run them with the three `example-*` commands
+boundary without linking SQLite. Run them with the four `example-*` commands
 above. The project history is recorded in [`CHANGELOG.md`](CHANGELOG.md).
 
 Generate a deterministic v3 file on standard output with:
@@ -386,22 +397,31 @@ The exact feature matrix is in
 
 ## Replication modules
 
-Four additional modules extend the package toward a full SQLite-to-S3
-replication library; see [docs/replication-roadmap.md](docs/replication-roadmap.md)
-for the plan and current status. Import `ltx_wal` for bounded SQLite WAL
-parsing with committed page maps and salt censes, `ltx_object` for the
-storage-neutral object contract with its filesystem backend and conformance
-suite, `ltx_s3` for S3-compatible stores (path-style SigV4, paginated
-listings, object read/write/delete, and bucket creation over the
-standard-library HTTP client), `ltx_replica` for the Litestream level ladder, restore planning, and
-restore/compaction/retention executors over caller-owned workspaces, and
+Seven additional modules provide the SQLite-to-object-store replication
+stack; see
+[docs/replication-roadmap.md](docs/replication-roadmap.md) for the delivered
+milestones and remaining candidates. Import `ltx_wal` for bounded SQLite
+WAL parsing with committed page maps and salt scans, `ltx_object` for the
+storage-neutral object contract, transactional write sessions, its filesystem
+backend, and conformance suite, `ltx_s3` for S3-compatible stores (path-style
+or virtual-host SigV4, TLS, paginated listings, object read/write/delete,
+conditional writes, bounded retry, automatic single-or-multipart transactional
+publication, and bucket creation over the standard-library HTTP client),
+`ltx_replica` for the Litestream level ladder, restore planning, and
+restore/compaction/retention executors over caller-owned workspaces,
 `ltx_capture` for the SQLite capture session that publishes no-checksum L0
-transitions through an object client. The first three import only `std` and
-`ltx`; `ltx_capture` declares its own minimal SQLite C surface and expects
-the host build to link SQLite. Its live gate is
+transitions through an object client, resumes scans mid-WAL, seeds a restored
+position, and bounds checkpointing by bytes, age, or frame count,
+`ltx_resources` for checked capacity formulas and fixed-arena binding, and
+`ltx_replication` for a synchronous per-database controller over capture,
+restore, adjacent-level compaction, safe retention, and trusted position. Only
+`ltx_capture` declares a minimal SQLite C surface and expects the host build to
+link SQLite; the S3 standard-library HTTP transport owns a caller-supplied
+allocator for pooled connections. The live capture gate is
 `mise exec -- zig build capture-integration -Doptimize=ReleaseSafe`, and the
 S3 backend's gate is `mise run s3-integration`, which starts a pinned local
-MinIO server and runs the backend-agnostic conformance suite against it.
+MinIO server for the plain HTTP, TLS, and supported virtual-host lanes and runs
+the backend-agnostic conformance suite against it.
 
 ## Quiescent SQLite store
 

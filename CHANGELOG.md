@@ -26,6 +26,21 @@ version is zero, the Zig source API is intentionally unstable.
   verification at hundreds of MiB; numbers recorded in
   `docs/replication.md`.
 - CI runs the S3 MinIO gate on the macOS lane as well as Linux.
+- `ltx_resources`, a shipped checked resource-planning module with the codec,
+  WAL, apply, and wire formulas previously private to the benchmark harness,
+  plus an alignment-aware fixed-arena binder for typed and byte workspaces.
+- `ltx_object` transactional `WriteSession` support with explicit
+  finish/abort publication semantics, implemented by the filesystem backend
+  with private sync-and-rename staging.
+- `ltx_replication`, a synchronous per-database controller for guarded startup,
+  capture and position, restore, caller-selected adjacent-level maintenance,
+  and publish-before-delete retention over caller-owned resources.
+- Automatic S3 transactional publication: small encoded objects use one PUT,
+  while larger outputs switch boundedly to multipart without retaining the
+  complete object.
+- `ltx_capture.Session.checkpoint_pending`, which exposes a deferred automatic
+  PASSIVE-checkpoint retry without turning an already published capture into a
+  failed sync.
 
 ### Changed
 
@@ -35,12 +50,50 @@ version is zero, the Zig source API is intentionally unstable.
   virtual-host lane runs on Linux only — some macOS CI runners do not
   resolve `*.localhost` to loopback — while plain and TLS lanes cover
   both platforms.
+- Object listings now report exact `size_bytes`; compaction planning consumes
+  that metadata directly instead of requiring parallel size arrays and
+  redundant object reads.
+- `ltx_replica.RestoreJob` accepts any `ltx.ApplyBackend`, verifies that each
+  object key matches its decoded TXID range before staging, and safely replaces
+  an existing target with the first snapshot before applying contiguous tails.
+- S3 retry waiting is caller-injected alongside delay selection, and TLS
+  certificate validation derives its time from the injected SigV4 clock; the
+  module no longer reads an ambient clock.
+- Capture and compaction stream encoder output directly through transactional
+  object adapters; whole-object buffering remains as the compatibility path
+  for adapters without write sessions.
+- The portability compile gate now includes the external consumer so all nine
+  public modules are checked on every hosted cross-target.
+- The replication controller copies its compaction ladder, preflights encoder
+  capacity and live workspace ranges, preserves readiness after caller-input
+  errors, and requires sidecar-free quiescence for startup restore.
+
+### Fixed
+
+- S3 delete and multipart-abort teardown no longer wait for a keep-alive peer
+  timeout after a bodyless `204 No Content` response.
+- S3 `litestream-timestamp` metadata now uses Litestream-compatible UTC
+  RFC3339Nano text instead of decimal Unix milliseconds.
+- Filesystem object staging uses collision-safe exclusive names, synchronizes
+  the complete directory chain, and reports post-rename sync failures as
+  `PublicationIndeterminate` without removing the visible object.
+- Capture handles empty and zero-commit WALs with a safe database snapshot,
+  rejects truncated headers and aliased live workspaces, enforces frame-count
+  checkpoints, and verifies PASSIVE completion before recording a restart.
+- S3 multipart completion rejects HTTP-200 error XML, response reads remain
+  bounded without `Content-Length`, conditional writes are never retried,
+  failed aborts retain retryable cleanup state, listing pages are explicitly
+  bounded, and every request refreshes TLS time from the injected clock.
+- Controller retention deletes only the selected sources proven to be covered
+  by the newly verified output; corrupt upper metadata cannot delete an
+  unselected lower object.
+
 ## [0.3.0] - 2026-08-27
 
 ### Added
 
 - `ltx_wal`: bounded SQLite WAL parsing with committed page maps, salt
-  censes, torn-tail tolerance, and mid-WAL resume, ported from the pinned
+  scans, torn-tail tolerance, and mid-WAL resume, ported from the pinned
   Celld crate with Go-ported known answers, a differential page-map
   reference, pinned Litestream WAL fixtures, a mutation suite, and a
   native fuzz corpus.

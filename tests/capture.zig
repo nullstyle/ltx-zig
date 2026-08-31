@@ -87,6 +87,137 @@ const TestWorkspaces = struct {
     }
 };
 
+const FaultMode = enum { none, write_once, finish_once };
+
+const FaultingClient = struct {
+    backing: ltx_object.Client,
+    mode: FaultMode = .none,
+    inner: ?ltx_object.WriteSession = null,
+    abort_count: u32 = 0,
+
+    fn client(self: *FaultingClient) ltx_object.Client {
+        return .{
+            .context = self,
+            .list_fn = list,
+            .open_fn = open,
+            .write_fn = write_object,
+            .begin_write_fn = begin_write,
+            .delete_fn = delete,
+        };
+    }
+
+    fn list(
+        context: *anyopaque,
+        level: u8,
+        seek: ltx.TXID,
+        destination: []ltx.FileInfo,
+    ) ltx_object.Error![]const ltx.FileInfo {
+        const self: *FaultingClient = @ptrCast(@alignCast(context));
+        return self.backing.list(level, seek, destination);
+    }
+
+    fn open(
+        context: *anyopaque,
+        level: u8,
+        identity: ltx.FileIdentity,
+        destination: []u8,
+    ) ltx_object.Error![]const u8 {
+        const self: *FaultingClient = @ptrCast(@alignCast(context));
+        return self.backing.open(level, identity, destination);
+    }
+
+    fn write_object(
+        context: *anyopaque,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+        bytes: []const u8,
+    ) ltx_object.Error!void {
+        const self: *FaultingClient = @ptrCast(@alignCast(context));
+        return self.backing.write(level, identity, created_at_ms, bytes);
+    }
+
+    fn begin_write(
+        context: *anyopaque,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+    ) ltx_object.Error!ltx_object.WriteSession {
+        const self: *FaultingClient = @ptrCast(@alignCast(context));
+        if (self.inner != null) return error.InvalidState;
+        self.inner = try self.backing.begin_write(level, identity, created_at_ms);
+        return ltx_object.WriteSession.init(.{
+            .context = self,
+            .write_fn = write_chunk,
+            .finish_fn = finish_write,
+            .abort_fn = abort_write,
+        });
+    }
+
+    fn delete(context: *anyopaque, files: []const ltx.FileInfo) ltx_object.Error!void {
+        const self: *FaultingClient = @ptrCast(@alignCast(context));
+        return self.backing.delete(files);
+    }
+
+    fn write_chunk(context: *anyopaque, bytes: []const u8) ltx_object.Error!void {
+        const self: *FaultingClient = @ptrCast(@alignCast(context));
+        if (self.mode == .write_once) {
+            self.mode = .none;
+            return error.StorageFailure;
+        }
+        const inner = if (self.inner) |*active| active else return error.InvalidState;
+        inner.writer().write_all(bytes) catch return error.StorageFailure;
+    }
+
+    fn finish_write(context: *anyopaque) ltx_object.Error!void {
+        const self: *FaultingClient = @ptrCast(@alignCast(context));
+        if (self.mode == .finish_once) {
+            self.mode = .none;
+            return error.StorageFailure;
+        }
+        const inner = if (self.inner) |*active| active else return error.InvalidState;
+        try inner.finish();
+        self.inner = null;
+    }
+
+    fn abort_write(context: *anyopaque) void {
+        const self: *FaultingClient = @ptrCast(@alignCast(context));
+        if (self.inner) |*active| active.abort();
+        self.inner = null;
+        self.abort_count += 1;
+    }
+};
+
+const CaptureResumeState = struct {
+    position: ltx.Position,
+    segment_salt: ltx_wal.SaltPair,
+    segment_end_offset_bytes: u64,
+    segment_commit_pages: u32,
+    segment_restarted: bool,
+    last_wal_bytes: u64,
+    last_wal_frame_count: u64,
+    last_sync_ms: ?i64,
+};
+
+fn capture_resume_state(session: *const ltx_capture.Session) CaptureResumeState {
+    return .{
+        .position = session.position,
+        .segment_salt = session.segment_salt,
+        .segment_end_offset_bytes = session.segment_end_offset_bytes,
+        .segment_commit_pages = session.segment_commit_pages,
+        .segment_restarted = session.segment_restarted,
+        .last_wal_bytes = session.last_wal_bytes,
+        .last_wal_frame_count = session.last_wal_frame_count,
+        .last_sync_ms = session.last_sync_ms,
+    };
+}
+
+fn expect_level_zero_count(client: ltx_object.Client, expected: usize) !void {
+    var listed_storage: [4]ltx.FileInfo = undefined;
+    const listed = try client.list(0, ltx.TXID.init(0), &listed_storage);
+    try std.testing.expectEqual(expected, listed.len);
+}
+
 fn expect_restored_rows(
     dir: std.Io.Dir,
     io: std.Io,
@@ -137,11 +268,257 @@ fn list_all_levels(
     }
 }
 
-test "capture publishes snapshot and incremental transitions that restore" {
+test "capture streams to FileClient without output storage" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
     const client = store.client();
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+    var empty_output: [0]u8 = .{};
+    capture_workspaces.output_storage = &empty_output;
+
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one'), (2, 'two')");
+    try std.testing.expect((try session.sync(&capture_workspaces, 1000)) > 0);
+    try std.testing.expectEqual(@as(u64, 1), session.position.txid.value);
+    var listed_storage: [2]ltx.FileInfo = undefined;
+    const listed = try client.list(0, ltx.TXID.init(0), &listed_storage);
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expect(listed[0].size_bytes > 0);
+    try restore_and_expect(&temporary, client, 2);
+}
+
+test "capture validates the direct page workspace before publication" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+    var short_page: [4095]u8 = undefined;
+    capture_workspaces.page_workspace = &short_page;
+
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    try std.testing.expectError(
+        error.WorkspaceTooSmall,
+        session.sync(&capture_workspaces, 1000),
+    );
+    try std.testing.expectEqual(@as(u64, 0), session.position.txid.value);
+    var listed_storage: [1]ltx.FileInfo = undefined;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try client.list(0, ltx.TXID.init(0), &listed_storage)).len,
+    );
+
+    capture_workspaces.page_workspace = &workspaces.page_workspace;
+    try std.testing.expect((try session.sync(&capture_workspaces, 1000)) > 0);
+}
+
+test "capture rejects aliases across workspace families before publication" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    var client = store.client();
+    client.begin_write_fn = null;
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+    capture_workspaces.output_storage = capture_workspaces.wal_storage;
+
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    try std.testing.expectError(
+        error.WorkspaceAliasing,
+        session.sync(&capture_workspaces, 1000),
+    );
+    try std.testing.expectEqual(@as(u64, 0), session.position.txid.value);
+    try expect_level_zero_count(client, 0);
+}
+
+test "streaming capture permits an inactive output-storage alias" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+    capture_workspaces.output_storage = capture_workspaces.wal_storage;
+
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    try std.testing.expect((try session.sync(&capture_workspaces, 1000)) > 0);
+    try std.testing.expectEqual(@as(u64, 1), session.position.txid.value);
+    try expect_level_zero_count(client, 1);
+}
+
+test "capture write failure aborts without advancing and retries" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    var faulting = FaultingClient{
+        .backing = store.client(),
+        .mode = .write_once,
+    };
+    const client = faulting.client();
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    const before = capture_resume_state(&session);
+
+    try std.testing.expectError(
+        error.OutputFailure,
+        session.sync(&capture_workspaces, 1000),
+    );
+    try std.testing.expectEqualDeep(before, capture_resume_state(&session));
+    try std.testing.expectEqual(@as(u32, 1), faulting.abort_count);
+    try std.testing.expect(faulting.inner == null);
+    try expect_level_zero_count(client, 0);
+
+    try std.testing.expect((try session.sync(&capture_workspaces, 1000)) > 0);
+    try std.testing.expectEqual(@as(u64, 1), session.position.txid.value);
+    try expect_level_zero_count(client, 1);
+    try restore_and_expect(&temporary, client, 1);
+}
+
+test "capture finish failure aborts without advancing and retries" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    var faulting = FaultingClient{ .backing = store.client() };
+    const client = faulting.client();
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    _ = try session.sync(&capture_workspaces, 1000);
+
+    try session.exec("INSERT INTO kv VALUES (2, 'two')");
+    const before = capture_resume_state(&session);
+    faulting.mode = .finish_once;
+    try std.testing.expectError(
+        error.StorageFailure,
+        session.sync(&capture_workspaces, 2000),
+    );
+    try std.testing.expectEqualDeep(before, capture_resume_state(&session));
+    try std.testing.expectEqual(@as(u32, 1), faulting.abort_count);
+    try std.testing.expect(faulting.inner == null);
+    try expect_level_zero_count(client, 1);
+
+    try std.testing.expect((try session.sync(&capture_workspaces, 2000)) > 0);
+    try std.testing.expectEqual(@as(u64, 2), session.position.txid.value);
+    try expect_level_zero_count(client, 2);
+    try restore_and_expect(&temporary, client, 2);
+}
+
+test "unchanged capture advances the monotonic timestamp baseline" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    session.checkpoint_interval_ms = 1;
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    _ = try session.sync(&capture_workspaces, std.math.minInt(i64));
+    try std.testing.expectError(
+        error.CaptureUnchanged,
+        session.sync(&capture_workspaces, std.math.maxInt(i64)),
+    );
+    try std.testing.expectError(
+        error.TimestampRegression,
+        session.checkpoint_passive(std.math.minInt(i64)),
+    );
+    try session.exec("INSERT INTO kv VALUES (2, 'two')");
+    try std.testing.expectError(
+        error.TimestampRegression,
+        session.sync(&capture_workspaces, std.math.minInt(i64)),
+    );
+    try std.testing.expectEqual(@as(u64, 1), session.position.txid.value);
+    var listed_storage: [4]ltx.FileInfo = undefined;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        (try client.list(0, ltx.TXID.init(0), &listed_storage)).len,
+    );
+
+    _ = try session.sync(&capture_workspaces, std.math.maxInt(i64));
+    try std.testing.expectEqual(@as(u64, 2), session.position.txid.value);
+    try restore_and_expect(&temporary, client, 2);
+}
+
+test "capture publishes snapshot and incremental transitions that restore" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    var client = store.client();
+    client.begin_write_fn = null;
+    try std.testing.expect(!client.supports_write_sessions());
 
     var session = try ltx_capture.Session.init(
         temporary.dir,
@@ -188,7 +565,7 @@ test "capture publishes snapshot and incremental transitions that restore" {
     );
     try std.testing.expectEqual(@as(usize, 2), plan.len);
 
-    const backend = try ltx_replica.RestoreBackend.init(
+    var backend = try ltx_replica.RestoreBackend.init(
         temporary.dir,
         std.testing.io,
         "restored.db",
@@ -201,7 +578,7 @@ test "capture publishes snapshot and incremental transitions that restore" {
         .client = client,
         .codec_limits = codec_limits,
         .apply_limits = .{ .max_database_pages = 64, .max_database_bytes = 1 << 20 },
-        .backend = backend,
+        .backend = backend.backend(),
         .storage = &object_storage,
         .page_workspace = &page_workspace,
         .compressed_workspace = &compressed_workspace,
@@ -256,7 +633,7 @@ test "checkpoint restart falls back to a full snapshot" {
     );
     try std.testing.expectEqual(@as(usize, 2), plan.len);
 
-    const backend = try ltx_replica.RestoreBackend.init(
+    var backend = try ltx_replica.RestoreBackend.init(
         temporary.dir,
         std.testing.io,
         "restored.db",
@@ -269,7 +646,7 @@ test "checkpoint restart falls back to a full snapshot" {
         .client = client,
         .codec_limits = codec_limits,
         .apply_limits = .{ .max_database_pages = 64, .max_database_bytes = 1 << 20 },
-        .backend = backend,
+        .backend = backend.backend(),
         .storage = &object_storage,
         .page_workspace = &page_workspace,
         .compressed_workspace = &compressed_workspace,
@@ -277,6 +654,192 @@ test "checkpoint restart falls back to a full snapshot" {
     };
     _ = try job.run(plan);
     try expect_restored_rows(temporary.dir, std.testing.io, "restored.db", 3);
+}
+
+test "externally truncated WAL captures a database snapshot" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    _ = try session.sync(&capture_workspaces, 1000);
+    try session.exec("INSERT INTO kv VALUES (2, 'two')");
+    try session.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+
+    const pages = try session.sync(&capture_workspaces, 2000);
+    try std.testing.expect(pages > 0);
+    try std.testing.expectEqual(@as(u64, 2), session.position.txid.value);
+    try restore_and_expect(&temporary, client, 2);
+}
+
+test "valid header-only WAL captures a database snapshot" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one'), (2, 'two')");
+
+    var valid_header: [ltx_wal.header_size_bytes]u8 = undefined;
+    {
+        var wal_file = try temporary.dir.openFile(std.testing.io, "app.db-wal", .{});
+        defer wal_file.close(std.testing.io);
+        try std.testing.expectEqual(
+            valid_header.len,
+            try wal_file.readPositionalAll(std.testing.io, &valid_header, 0),
+        );
+    }
+    try session.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    {
+        var wal_file = try temporary.dir.createFile(std.testing.io, "app.db-wal", .{});
+        defer wal_file.close(std.testing.io);
+        try wal_file.writePositionalAll(std.testing.io, &valid_header, 0);
+        try wal_file.sync(std.testing.io);
+    }
+
+    const pages = try session.sync(&capture_workspaces, 1000);
+    try std.testing.expect(pages > 0);
+    try std.testing.expectEqual(@as(u64, 1), session.position.txid.value);
+    try restore_and_expect(&temporary, client, 2);
+}
+
+test "valid uncommitted WAL tail captures a database snapshot" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    _ = try session.sync(&capture_workspaces, 1000);
+    try session.exec("INSERT INTO kv VALUES (2, 'two')");
+
+    const frame_offset = ltx_wal.header_size_bytes;
+    const max_frame_bytes = ltx_wal.frame_header_size_bytes + 4096;
+    var uncommitted: [ltx_wal.header_size_bytes + max_frame_bytes]u8 = undefined;
+    var wal_prefix_bytes: usize = 0;
+    {
+        var wal_file = try temporary.dir.openFile(std.testing.io, "app.db-wal", .{});
+        defer wal_file.close(std.testing.io);
+        wal_prefix_bytes = try wal_file.readPositionalAll(std.testing.io, &uncommitted, 0);
+    }
+    try std.testing.expect(wal_prefix_bytes >= ltx_wal.header_size_bytes);
+    const header = try ltx_wal.decode_header(
+        uncommitted[0..ltx_wal.header_size_bytes],
+    );
+    const frame_bytes = ltx_wal.frame_header_size_bytes +
+        std.math.cast(usize, header.page_size).?;
+    const uncommitted_bytes = uncommitted[0 .. ltx_wal.header_size_bytes + frame_bytes];
+    try std.testing.expect(wal_prefix_bytes >= uncommitted_bytes.len);
+    std.mem.writeInt(u32, uncommitted[frame_offset + 4 ..][0..4], 0, .big);
+    var sums = ltx_wal.checksum(
+        header.checksum_order,
+        .{ .sum_1 = header.checksum_1, .sum_2 = header.checksum_2 },
+        uncommitted[frame_offset..][0..8],
+    );
+    sums = ltx_wal.checksum(
+        header.checksum_order,
+        sums,
+        uncommitted_bytes[frame_offset + ltx_wal.frame_header_size_bytes ..],
+    );
+    std.mem.writeInt(
+        u32,
+        uncommitted[frame_offset + 16 ..][0..4],
+        sums.sum_1,
+        .big,
+    );
+    std.mem.writeInt(
+        u32,
+        uncommitted[frame_offset + 20 ..][0..4],
+        sums.sum_2,
+        .big,
+    );
+    try std.testing.expect(session.segment_end_offset_bytes > uncommitted_bytes.len);
+
+    try session.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    {
+        var wal_file = try temporary.dir.createFile(std.testing.io, "app.db-wal", .{});
+        defer wal_file.close(std.testing.io);
+        try wal_file.writePositionalAll(std.testing.io, uncommitted_bytes, 0);
+        try wal_file.sync(std.testing.io);
+    }
+
+    const pages = try session.sync(&capture_workspaces, 2000);
+    try std.testing.expect(pages > 0);
+    try std.testing.expectEqual(@as(u64, 2), session.position.txid.value);
+    try restore_and_expect(&temporary, client, 2);
+}
+
+test "short nonempty WAL is rejected without advancing capture" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    _ = try session.sync(&capture_workspaces, 1000);
+    try session.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+
+    var wal_file = try temporary.dir.createFile(std.testing.io, "app.db-wal", .{});
+    const short_header: [16]u8 = @splat(0xa5);
+    try wal_file.writePositionalAll(std.testing.io, &short_header, 0);
+    try wal_file.sync(std.testing.io);
+    wal_file.close(std.testing.io);
+    const before = capture_resume_state(&session);
+
+    try std.testing.expectError(
+        error.TruncatedHeader,
+        session.sync(&capture_workspaces, 2000),
+    );
+    try std.testing.expectEqualDeep(before, capture_resume_state(&session));
+    try expect_level_zero_count(client, 1);
 }
 
 fn restore_and_expect(
@@ -293,7 +856,7 @@ fn restore_and_expect(
     const plan = try ltx_replica.calc_restore_plan(&lists, ltx.TXID.init(0), &plan_storage);
     try std.testing.expect(plan.len > 0);
 
-    const backend = try ltx_replica.RestoreBackend.init(
+    var backend = try ltx_replica.RestoreBackend.init(
         temporary.dir,
         std.testing.io,
         "restored.db",
@@ -306,7 +869,7 @@ fn restore_and_expect(
         .client = client,
         .codec_limits = codec_limits,
         .apply_limits = .{ .max_database_pages = 64, .max_database_bytes = 1 << 20 },
-        .backend = backend,
+        .backend = backend.backend(),
         .storage = &object_storage,
         .page_workspace = &page_workspace,
         .compressed_workspace = &compressed_workspace,
@@ -349,6 +912,112 @@ test "session checkpoint continues with a small incremental" {
     try std.testing.expectEqual(@as(u64, 2), session.position.txid.value);
 
     try restore_and_expect(&temporary, client, 3);
+}
+
+test "passive checkpoint reports an incomplete held-reader pass" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    _ = try session.sync(&capture_workspaces, 1000);
+
+    var reader = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer reader.finish();
+    try reader.exec("BEGIN");
+    defer reader.exec("ROLLBACK") catch {};
+    try reader.exec("SELECT count(*) FROM kv");
+
+    try session.exec("INSERT INTO kv VALUES (2, 'two')");
+    _ = try session.sync(&capture_workspaces, 2000);
+    try std.testing.expectError(
+        error.CheckpointIncomplete,
+        session.checkpoint_passive(2500),
+    );
+    try std.testing.expect(session.checkpoint_pending);
+    try std.testing.expect(!session.segment_restarted);
+    try std.testing.expectEqual(@as(i64, 1000), session.last_checkpoint_ms);
+
+    try reader.exec("ROLLBACK");
+    try session.checkpoint_passive(3000);
+    try std.testing.expect(!session.checkpoint_pending);
+    try std.testing.expect(session.segment_restarted);
+    try std.testing.expectEqual(@as(i64, 3000), session.last_checkpoint_ms);
+}
+
+test "automatic checkpoint defers an incomplete pass after publication" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    _ = try session.sync(&capture_workspaces, 1000);
+
+    var reader = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer reader.finish();
+    try reader.exec("BEGIN");
+    defer reader.exec("ROLLBACK") catch {};
+    try reader.exec("SELECT count(*) FROM kv");
+
+    try session.exec("INSERT INTO kv VALUES (2, 'two')");
+    session.checkpoint_threshold_bytes = 1;
+    const captured = try session.sync(&capture_workspaces, 2000);
+    try std.testing.expect(captured > 0);
+    try std.testing.expectEqual(@as(u64, 2), session.position.txid.value);
+    try std.testing.expect(session.checkpoint_pending);
+    try std.testing.expect(!session.segment_restarted);
+    try std.testing.expectEqual(@as(i64, 1000), session.last_checkpoint_ms);
+    try expect_level_zero_count(client, 2);
+
+    try reader.exec("ROLLBACK");
+    try std.testing.expectError(
+        error.CaptureUnchanged,
+        session.sync(&capture_workspaces, 3000),
+    );
+    try std.testing.expect(!session.checkpoint_pending);
+    try std.testing.expect(session.segment_restarted);
+    try std.testing.expectEqual(@as(i64, 3000), session.last_checkpoint_ms);
+    try restore_and_expect(&temporary, client, 2);
 }
 
 test "checkpoint threshold bounds wal growth across syncs" {
@@ -516,20 +1185,26 @@ test "frame-count checkpoint tier bounds WAL length" {
         client,
     );
     defer session.finish();
-    session.checkpoint_max_frames = 3;
     var workspaces = TestWorkspaces{};
     var capture_workspaces = workspaces.workspaces();
 
     try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
     try session.exec("INSERT INTO kv VALUES (1, 'one')");
     _ = try session.sync(&capture_workspaces, 1000);
-    // One batch of two frames stays under the tier; no restart.
+    // Start the tier just above the observed committed region so the
+    // subsequent bound is independent of SQLite's schema-frame count.
     try std.testing.expect(!session.segment_restarted);
+    try std.testing.expect(session.last_wal_frame_count > 0);
+    session.checkpoint_max_frames = std.math.cast(
+        u32,
+        session.last_wal_frame_count + 2,
+    ) orelse return error.FrameLimitExceeded;
 
-    // Enough batches to cross three frames triggers the tier; the next
-    // committed frames continue as an incremental.
+    // Enough batches to cross the configured frame count must trigger the
+    // tier; a timestamp-baseline update alone cannot satisfy this assertion.
     var batch: u64 = 0;
-    while (batch < 4) : (batch += 1) {
+    var checkpointed = false;
+    while (batch < 4 and !checkpointed) : (batch += 1) {
         const statement = try std.fmt.bufPrintZ(
             &sql_buffer,
             "INSERT INTO kv VALUES ({d}, 'v{d}')",
@@ -537,7 +1212,9 @@ test "frame-count checkpoint tier bounds WAL length" {
         );
         try session.exec(statement);
         _ = try session.sync(&capture_workspaces, @intCast(2000 + batch));
+        checkpointed = session.segment_restarted;
     }
-    try std.testing.expect(session.segment_restarted or session.last_checkpoint_ms != std.math.minInt(i64));
-    try restore_and_expect(&temporary, client, 5);
+    try std.testing.expect(checkpointed);
+    try std.testing.expect(session.last_checkpoint_ms >= 2000);
+    try restore_and_expect(&temporary, client, @intCast(batch + 1));
 }

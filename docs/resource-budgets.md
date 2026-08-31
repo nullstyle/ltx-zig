@@ -2,9 +2,10 @@
 
 `ltx` keeps codec processing allocation-free after initialization. Callers
 provide fixed-capacity workspaces and must separately budget state values,
-input/output storage, and any staged-apply backend storage. The checked formulas
-used by the benchmark harness live in
-[`benchmarks/resource_model.zig`](../benchmarks/resource_model.zig).
+input/output storage, and any staged-apply backend storage. The public
+`ltx_resources` module is the single checked source of truth for these formulas;
+its implementation lives in [`src/resources.zig`](../src/resources.zig), and
+the benchmark harness consumes the same module as applications.
 
 Let:
 
@@ -38,10 +39,12 @@ database pages; and encoded output. Their `@sizeOf` and `@alignOf` values depend
 on the compilation target. No source-compatibility, ABI, or numeric-layout
 guarantee is made for them before 1.0.
 
-The formulas assume separate, correctly aligned typed buffers. When carving
-them from one byte arena, apply checked alignment padding before
-`PageIndexEntry`, `LZ4CompressionWorkspace`, and state/control values. A plain
-sum is not an arena-layout formula.
+The formulas assume separate, correctly aligned typed buffers. `ArenaCursor`
+carves byte and typed-slice workspaces from one caller-owned arena with checked
+alignment padding, multiplication, addition, and capacity. Successful bindings
+advance monotonically and therefore cannot overlap. A zero-count binding is
+valid and consumes no storage; nonempty bindings of zero-sized types and
+invalid alignments are rejected. A plain sum is not an arena-layout formula.
 
 Each compaction input owns a complete decoder workspace because every input is
 independently bounded by `Limits`. The output encoder owns its own workspace.
@@ -66,9 +69,8 @@ its dedupe bitmap, and the ascending result entries. The `Reader` value and
 the whole WAL input slice are separate resources: `ltx_wal` borrows frame
 pages directly from the caller's slice and performs no allocation.
 `max_frames` bounds every scan loop and must cover the whole input including
-any torn tail. `wal_page_map_workspace_bytes` in
-[`benchmarks/resource_model.zig`](../benchmarks/resource_model.zig) checks
-this formula.
+any torn tail. `ltx_resources.wal_page_map_workspace_bytes` checks this
+formula.
 
 ## Replication-layer workspaces
 
@@ -78,9 +80,13 @@ compaction input plus one encoder workspace for compaction output, exactly as
 the codec table prescribes, with the fetched-object storage bounded by
 `Limits.max_input_bytes` per input. `ltx_capture` uses the WAL page-map
 workspace above, the encoder workspace for the emitted L0, one
-`Limits.max_page_size` page buffer for database-file reads, and two
-plain storage regions bounded by the accepted WAL size and
-`Limits.max_output_bytes` respectively.
+`Limits.max_page_size` page buffer for database-file reads, and plain WAL
+storage bounded by the accepted WAL size. With a transactional object adapter,
+capture and compaction encode directly into private backend staging and their
+output-storage slices may be empty. An adapter that only implements
+whole-object `write` still requires a fallback region bounded by
+`Limits.max_output_bytes`. S3's caller-owned send workspace is transport
+staging (at most one multipart part), not codec output storage.
 
 ## Compression capacity
 

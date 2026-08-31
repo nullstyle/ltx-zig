@@ -23,7 +23,6 @@ VH_DATA_DIR=".zig-cache/s3-gate-vh"
 VH_PID_FILE=".zig-cache/s3-gate-vh.pid"
 VH_LOG_FILE=".zig-cache/s3-gate-vh.log"
 CERT_DIR="$(pwd)/.zig-cache/s3-gate-certs"
-CERT_ABS="$CERT_DIR"
 TLS_DATA_DIR=".zig-cache/s3-gate-tls"
 TLS_PID_FILE=".zig-cache/s3-gate-tls.pid"
 TLS_LOG_FILE=".zig-cache/s3-gate-tls.log"
@@ -42,8 +41,12 @@ cleanup() {
     if [ -f "$TLS_PID_FILE" ]; then
         kill -9 "$(cat "$TLS_PID_FILE")" 2>/dev/null || true
     fi
+    if [ -f "$VH_PID_FILE" ]; then
+        kill -9 "$(cat "$VH_PID_FILE")" 2>/dev/null || true
+    fi
     kill_port "$PORT"
     kill_port "$TLS_PORT"
+    kill_port "$VH_PORT"
     rm -rf "$DATA_DIR" "$PID_FILE" "$LOG_FILE" \
         "$TLS_DATA_DIR" "$TLS_PID_FILE" "$TLS_LOG_FILE" \
         "$VH_DATA_DIR" "$VH_PID_FILE" "$VH_LOG_FILE"
@@ -51,8 +54,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Clear any stale instance from an interrupted earlier run.
-kill_port "$PORT"
-rm -rf "$DATA_DIR"
+cleanup
 mkdir -p .zig-cache
 
 nohup minio server "$DATA_DIR" --address "$ENDPOINT" > "$LOG_FILE" 2>&1 &
@@ -145,4 +147,4 @@ fi
 
 zig build s3-integration -Doptimize=ReleaseSafe \
     -Dminio-ca="$CERT_DIR/ca.crt" -Dminio-tls-port="$TLS_PORT" \
-    -Dminio-vh-port="$VH_PORT_ARG"
+    -Dminio-vh-port="$VH_PORT_ARG" "$@"

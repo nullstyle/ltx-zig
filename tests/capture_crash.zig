@@ -138,12 +138,12 @@ fn restore_latest(dir: std.Io.Dir, database_name: []const u8) !ltx.Position {
     try list_levels(client, &lists, &buffers);
     var plan_storage: [64]ltx.FileInfo = undefined;
     const plan = try ltx_replica.calc_restore_plan(&lists, ltx.TXID.init(0), &plan_storage);
-    const backend = try ltx_replica.RestoreBackend.init(dir, std.testing.io, database_name);
+    var backend = try ltx_replica.RestoreBackend.init(dir, std.testing.io, database_name);
     var job = ltx_replica.RestoreJob{
         .client = client,
         .codec_limits = codec_limits,
         .apply_limits = .{ .max_database_pages = 64, .max_database_bytes = 1 << 20 },
-        .backend = backend,
+        .backend = backend.backend(),
         .storage = &output,
         .page_workspace = &page,
         .compressed_workspace = &compressed,

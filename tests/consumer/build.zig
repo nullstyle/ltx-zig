@@ -21,6 +21,8 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "ltx_s3", .module = ltx_zig.module("ltx_s3") },
                 .{ .name = "ltx_replica", .module = ltx_zig.module("ltx_replica") },
                 .{ .name = "ltx_capture", .module = ltx_zig.module("ltx_capture") },
+                .{ .name = "ltx_replication", .module = ltx_zig.module("ltx_replication") },
+                .{ .name = "ltx_resources", .module = ltx_zig.module("ltx_resources") },
             },
         }),
     });

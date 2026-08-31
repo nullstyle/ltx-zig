@@ -54,14 +54,18 @@
   network-free.
 - The replication modules extend the core without weakening it: `ltx_wal`
   parses SQLite WAL bytes over caller-owned slices and workspaces, `ltx_object`
-  defines the storage-neutral object contract plus the filesystem backend,
+  defines the storage-neutral object contract, transactional writes, and the
+  filesystem backend,
   `ltx_replica` holds the level ladder and pure planners plus the restore and
-  compaction executors, and `ltx_capture` holds the SQLite capture session.
-  All four stay allocation-free after initialization and reuse the core's
-  limits, poisoning, and explicit-width discipline. The first three import
-  only `std` and `ltx`; only `ltx_capture` touches SQLite, through a
-  hand-written extern surface that the host build links.
-- For `ltx_wal`, `ltx_object`, `ltx_replica`, or `ltx_capture` changes, also
+  compaction executors, `ltx_capture` holds the SQLite capture session, and
+  `ltx_replication` owns only the common synchronous controller over those
+  layers. All five stay allocation-free after initialization and reuse the
+  core's limits, poisoning, and explicit-width discipline. No library module
+  links libc or SQLite; only `ltx_capture` declares a hand-written SQLite
+  extern surface, which the host executable links directly or through
+  `ltx_replication`.
+- For `ltx_wal`, `ltx_object`, `ltx_replica`, `ltx_capture`, or
+  `ltx_replication` changes, also
   run `mise exec -- zig build capture-integration -Doptimize=ReleaseSafe`,
   which links the host system SQLite and libc for the test executable only;
   no library module may link either.
