@@ -28,6 +28,7 @@ const max_frames = 256;
 const max_files_per_level = 8;
 const max_restore_files = 8;
 const max_compaction_inputs = 1;
+const read_workspace_bytes: u32 = 64 * 1024;
 const level_count = @as(usize, ltx.snapshot_level) + 1;
 const max_wal_bytes = ltx_wal.header_size_bytes +
     max_frames * (ltx_wal.frame_header_size_bytes + max_page_bytes);
@@ -67,6 +68,7 @@ const controller_config = ltx_replication.Config{
     .max_files_per_level = max_files_per_level,
     .max_restore_files = max_restore_files,
     .max_compaction_input_bytes = max_object_bytes * max_compaction_inputs,
+    .read_workspace_bytes = read_workspace_bytes,
     // The controller performs checkpoints after capture; the next sync then
     // demonstrates a segment restart without exposing the capture session.
     .checkpoint_threshold_bytes = checkpoint_threshold_bytes,
@@ -294,14 +296,13 @@ const ControllerStorage = struct {
     level_listings: [level_count * max_files_per_level]ltx.FileInfo = undefined,
     restore_plan: [max_restore_files]ltx.FileInfo = undefined,
     retention_plan: [max_files_per_level]ltx.FileInfo = undefined,
-    restore_storage: [max_object_bytes]u8 = undefined,
+    restore_read_workspace: [read_workspace_bytes]u8 = undefined,
     restore_page: [max_page_bytes]u8 = undefined,
     restore_compressed: [max_compressed_bytes]u8 = undefined,
     restore_index: [max_pages]ltx.PageIndexEntry = undefined,
     compaction_job_inputs: [max_compaction_inputs]ltx_replica.CompactionJobInput = undefined,
     compaction_inputs: [max_compaction_inputs]ltx.CompactionInput = undefined,
-    compaction_readers: [max_compaction_inputs]ltx.SliceReader = undefined,
-    compaction_input_storage: [max_compaction_inputs][max_object_bytes]u8 = undefined,
+    compaction_input_read_workspaces: [max_compaction_inputs][read_workspace_bytes]u8 = undefined,
     compaction_input_pages: [max_compaction_inputs][max_page_bytes]u8 = undefined,
     compaction_input_compressed: [max_compaction_inputs][max_compressed_bytes]u8 = undefined,
     compaction_input_indexes: [max_compaction_inputs][max_pages]ltx.PageIndexEntry = undefined,
@@ -312,7 +313,7 @@ const ControllerStorage = struct {
     fn bind(self: *ControllerStorage) ltx_replication.Resources {
         for (&self.compaction_job_inputs, 0..) |*input, index| {
             input.* = .{
-                .storage = &self.compaction_input_storage[index],
+                .read_workspace = &self.compaction_input_read_workspaces[index],
                 .page_workspace = &self.compaction_input_pages[index],
                 .compressed_workspace = &self.compaction_input_compressed[index],
                 .index_workspace = &self.compaction_input_indexes[index],
@@ -336,13 +337,12 @@ const ControllerStorage = struct {
             .level_listings = &self.level_listings,
             .restore_plan = &self.restore_plan,
             .retention_plan = &self.retention_plan,
-            .restore_storage = &self.restore_storage,
+            .restore_read_workspace = &self.restore_read_workspace,
             .restore_page_workspace = &self.restore_page,
             .restore_compressed_workspace = &self.restore_compressed,
             .restore_index_workspace = &self.restore_index,
             .compaction_job_inputs = &self.compaction_job_inputs,
             .compaction_inputs = &self.compaction_inputs,
-            .compaction_readers = &self.compaction_readers,
             .compaction_output_storage = &self.empty_output,
             .compaction_output_compressed_workspace = &self.compaction_output_compressed,
             .compaction_output_compression_workspace = &self.compaction_output_compression,

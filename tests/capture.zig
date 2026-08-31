@@ -50,6 +50,7 @@ const codec_limits = ltx.Limits{
     .max_varint_bytes = 10,
     .max_transaction_span = 64,
 };
+const restore_read_workspace_bytes = 64 * 1024;
 
 const wal_limits = ltx_wal.Limits{
     .max_page_size = 4096,
@@ -99,7 +100,7 @@ const FaultingClient = struct {
         return .{
             .context = self,
             .list_fn = list,
-            .open_fn = open,
+            .read_range_fn = read_range,
             .write_fn = write_object,
             .begin_write_fn = begin_write,
             .delete_fn = delete,
@@ -116,14 +117,14 @@ const FaultingClient = struct {
         return self.backing.list(level, seek, destination);
     }
 
-    fn open(
+    fn read_range(
         context: *anyopaque,
-        level: u8,
-        identity: ltx.FileIdentity,
+        info: ltx.FileInfo,
+        offset_bytes: u64,
         destination: []u8,
-    ) ltx_object.Error![]const u8 {
+    ) ltx_object.Error!void {
         const self: *FaultingClient = @ptrCast(@alignCast(context));
-        return self.backing.open(level, identity, destination);
+        return self.backing.read_range(info, offset_bytes, destination);
     }
 
     fn write_object(
@@ -570,7 +571,7 @@ test "capture publishes snapshot and incremental transitions that restore" {
         std.testing.io,
         "restored.db",
     );
-    var object_storage: [1 << 20]u8 = undefined;
+    var read_workspace: [restore_read_workspace_bytes]u8 = undefined;
     var page_workspace: [4096]u8 = undefined;
     var compressed_workspace: [4200]u8 = undefined;
     var index_workspace: [64]ltx.PageIndexEntry = undefined;
@@ -579,7 +580,7 @@ test "capture publishes snapshot and incremental transitions that restore" {
         .codec_limits = codec_limits,
         .apply_limits = .{ .max_database_pages = 64, .max_database_bytes = 1 << 20 },
         .backend = backend.backend(),
-        .storage = &object_storage,
+        .read_workspace = &read_workspace,
         .page_workspace = &page_workspace,
         .compressed_workspace = &compressed_workspace,
         .index_workspace = &index_workspace,
@@ -638,7 +639,7 @@ test "checkpoint restart falls back to a full snapshot" {
         std.testing.io,
         "restored.db",
     );
-    var object_storage: [1 << 20]u8 = undefined;
+    var read_workspace: [restore_read_workspace_bytes]u8 = undefined;
     var page_workspace: [4096]u8 = undefined;
     var compressed_workspace: [4200]u8 = undefined;
     var index_workspace: [64]ltx.PageIndexEntry = undefined;
@@ -647,7 +648,7 @@ test "checkpoint restart falls back to a full snapshot" {
         .codec_limits = codec_limits,
         .apply_limits = .{ .max_database_pages = 64, .max_database_bytes = 1 << 20 },
         .backend = backend.backend(),
-        .storage = &object_storage,
+        .read_workspace = &read_workspace,
         .page_workspace = &page_workspace,
         .compressed_workspace = &compressed_workspace,
         .index_workspace = &index_workspace,
@@ -861,7 +862,7 @@ fn restore_and_expect(
         std.testing.io,
         "restored.db",
     );
-    var object_storage: [1 << 20]u8 = undefined;
+    var read_workspace: [restore_read_workspace_bytes]u8 = undefined;
     var page_workspace: [4096]u8 = undefined;
     var compressed_workspace: [4200]u8 = undefined;
     var index_workspace: [64]ltx.PageIndexEntry = undefined;
@@ -870,7 +871,7 @@ fn restore_and_expect(
         .codec_limits = codec_limits,
         .apply_limits = .{ .max_database_pages = 64, .max_database_bytes = 1 << 20 },
         .backend = backend.backend(),
-        .storage = &object_storage,
+        .read_workspace = &read_workspace,
         .page_workspace = &page_workspace,
         .compressed_workspace = &compressed_workspace,
         .index_workspace = &index_workspace,

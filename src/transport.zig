@@ -4,7 +4,11 @@ pub const Reader = struct {
     context: *anyopaque,
     read_fn: *const fn (context: *anyopaque, destination: []u8) error{InputFailure}!usize,
     at_end_fn: *const fn (context: *anyopaque) error{InputFailure}!bool,
+    /// Optional complete memory range the reader may access. Immutable
+    /// backings may be shared by readers; set `backing_is_mutable` when reads
+    /// can overwrite this range so multi-reader users can reject overlap.
     backing_bytes: ?[]const u8 = null,
+    backing_is_mutable: bool = false,
 
     pub fn read(self: Reader, destination: []u8) error{InputFailure}!usize {
         const count = try self.read_fn(self.context, destination);

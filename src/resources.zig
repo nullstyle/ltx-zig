@@ -153,6 +153,24 @@ pub fn staged_apply_workspace_bytes(limits: ltx.Limits) Error!usize {
     return decoder_workspace_bytes(limits);
 }
 
+/// Total sequential object-read storage for one restore window and one window
+/// per simultaneous compaction input. Encoded object-size admission remains a
+/// separate `Limits.max_input_bytes` concern.
+pub fn replication_read_workspace_bytes(
+    read_workspace_bytes: u32,
+    max_compaction_inputs: u32,
+) Error!usize {
+    if (read_workspace_bytes == 0 or max_compaction_inputs == 0) {
+        return error.InvalidLimits;
+    }
+    const read_bytes = try cast_usize(read_workspace_bytes);
+    const reader_count = try add_usize(
+        try cast_usize(max_compaction_inputs),
+        1,
+    );
+    return mul_usize(read_bytes, reader_count);
+}
+
 /// Caller-owned variable storage for one WAL committed-page-map scan: page
 /// slots, the pending-page list, its bitmap, and the result entries. The
 /// reader value and the whole WAL input slice are separate resources.
@@ -329,4 +347,19 @@ fn add_u64(left: u64, right: u64) Error!u64 {
 
 fn mul_u64(left: u64, right: u64) Error!u64 {
     return std.math.mul(u64, left, right) catch error.ResourceBudgetOverflow;
+}
+
+test "replication read workspace includes restore and compaction windows" {
+    try std.testing.expectEqual(
+        @as(usize, 5 * 64 * 1024),
+        try replication_read_workspace_bytes(64 * 1024, 4),
+    );
+    try std.testing.expectError(
+        error.InvalidLimits,
+        replication_read_workspace_bytes(0, 4),
+    );
+    try std.testing.expectError(
+        error.InvalidLimits,
+        replication_read_workspace_bytes(64 * 1024, 0),
+    );
 }

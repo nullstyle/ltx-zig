@@ -660,7 +660,7 @@ pub const RestoreJob = struct {
     codec_limits: ltx.Limits,
     apply_limits: ltx.ApplyLimits,
     backend: ltx.ApplyBackend,
-    storage: []u8,
+    read_workspace: []u8,
     page_workspace: []u8,
     compressed_workspace: []u8,
     index_workspace: []ltx.PageIndexEntry,
@@ -672,14 +672,15 @@ pub const RestoreJob = struct {
     /// before the backend begins staging.
     pub fn run(self: *RestoreJob, plan: []const ltx.FileInfo) Error!ltx.Position {
         if (plan.len == 0) return error.TxNotAvailable;
+        for (plan) |info| try validate_source_info(self.codec_limits, info);
+        try self.validate_resource_aliases(plan);
         var restored_position: ?ltx.Position = null;
         for (plan, 0..) |info, index| {
-            const bytes = try self.client.open(
-                info.level,
-                .{ .min_txid = info.min_txid, .max_txid = info.max_txid },
-                self.storage,
+            var source = try object.ObjectReader.init(
+                self.client,
+                info,
+                self.read_workspace,
             );
-            var source = ltx.SliceReader.init(bytes);
             var identity_guard = RestoreIdentityGuard{
                 .inner = self.backend,
                 .expected = .{
@@ -700,38 +701,61 @@ pub const RestoreJob = struct {
             );
             const verified = applier.apply() catch |err| {
                 if (identity_guard.mismatch) return error.ObjectIdentityMismatch;
+                if (source.failure()) |storage_error| return storage_error;
                 return err;
             };
             restored_position = verified.post_apply_position();
         }
         return restored_position.?;
     }
+
+    fn validate_resource_aliases(
+        self: *const RestoreJob,
+        plan: []const ltx.FileInfo,
+    ) Error!void {
+        const controls = [_][]const u8{
+            std.mem.asBytes(self),
+            std.mem.sliceAsBytes(plan),
+        };
+        const workspaces = [_][]const u8{
+            self.read_workspace,
+            self.page_workspace,
+            self.compressed_workspace,
+            std.mem.sliceAsBytes(self.index_workspace),
+            self.backend.backing_bytes orelse &.{},
+        };
+        if (ranges_overlap(&controls, &controls) or
+            ranges_overlap(&workspaces, &workspaces) or
+            ranges_overlap(&controls, &workspaces))
+        {
+            return error.WorkspaceAliasing;
+        }
+    }
 };
 
 // ── Compaction execution ──────────────────────────────────────────────────────
 
-/// Byte storage for one fetched compaction source, sized for the codec input
-/// limit.
+/// One bounded object-read window and decoder workspaces for a compaction
+/// source. `object_reader` is initialized by `CompactionJob.run`.
 pub const CompactionJobInput = struct {
-    storage: []u8,
+    read_workspace: []u8,
     page_workspace: []u8,
     compressed_workspace: []u8,
     index_workspace: []ltx.PageIndexEntry,
+    object_reader: object.ObjectReader = undefined,
 };
 
-/// Caller-owned storage and state for one level compaction. `inputs`,
-/// `compaction_inputs`, and `readers` are parallel capacity arrays and must
-/// remain address-stable while compaction runs.
+/// Caller-owned storage and state for one level compaction. `inputs` and
+/// `compaction_inputs` are parallel capacity arrays and must remain
+/// address-stable while compaction runs.
 pub const CompactionJob = struct {
     client: object.Client,
     codec_limits: ltx.Limits,
     compaction_limits: ltx.CompactionLimits,
-    /// Per possible input: fetch storage and decoder workspaces.
+    /// Per possible input: bounded object-read and decoder workspaces.
     inputs: []CompactionJobInput,
     /// Scratch compactor inputs, at least `inputs.len`.
     compaction_inputs: []ltx.CompactionInput,
-    /// Scratch slice readers over each input's storage.
-    readers: []ltx.SliceReader,
     /// Whole-object fallback storage. May be empty when `client` supports
     /// transactional streaming write sessions.
     output_storage: []u8,
@@ -749,14 +773,19 @@ pub const CompactionJob = struct {
         destination_level: u8,
     ) Error!ltx.VerifiedLTX {
         try self.validate_input_count(source.len);
-        try self.fetch_inputs(source);
+        for (source) |info| try validate_source_info(self.codec_limits, info);
+        const streams_output = self.client.supports_write_sessions();
+        try self.validate_resource_aliases(source, streams_output);
         const identity = ltx.FileIdentity{
             .min_txid = source[0].min_txid,
             .max_txid = source[source.len - 1].max_txid,
         };
-        if (self.client.supports_write_sessions()) {
-            const last_header = try self.read_last_header(source.len);
-            self.reset_inputs(source.len);
+        if (streams_output) {
+            const last_header = try self.read_last_header(
+                source.len - 1,
+                source[source.len - 1],
+            );
+            try self.initialize_inputs(source);
             return self.run_streaming(
                 source.len,
                 destination_level,
@@ -764,68 +793,102 @@ pub const CompactionJob = struct {
                 last_header.timestamp_ms,
             );
         }
-        self.reset_inputs(source.len);
+        try self.initialize_inputs(source);
         return self.run_buffered(source.len, destination_level, identity);
     }
 
     fn validate_input_count(self: *const CompactionJob, input_count: usize) Error!void {
         if (input_count == 0) return error.CompactionNotAvailable;
         if (input_count > self.inputs.len or
-            input_count > self.compaction_inputs.len or
-            input_count > self.readers.len)
+            input_count > self.compaction_inputs.len)
         {
             return error.PlanCapacityExceeded;
         }
     }
 
-    fn fetch_inputs(self: *CompactionJob, source: []const ltx.FileInfo) Error!void {
-        for (source, self.inputs[0..source.len], self.readers[0..source.len]) |
-            info,
-            *job_input,
-            *reader,
-        | {
-            const bytes = try self.client.open(
-                info.level,
-                .{ .min_txid = info.min_txid, .max_txid = info.max_txid },
-                job_input.storage,
-            );
-            reader.* = ltx.SliceReader.init(bytes);
+    fn validate_resource_aliases(
+        self: *const CompactionJob,
+        source: []const ltx.FileInfo,
+        streams_output: bool,
+    ) Error!void {
+        const controls = [_][]const u8{
+            std.mem.asBytes(self),
+            std.mem.sliceAsBytes(source),
+            std.mem.sliceAsBytes(self.inputs[0..source.len]),
+            std.mem.sliceAsBytes(self.compaction_inputs[0..source.len]),
+        };
+        const output = compaction_output_ranges(self, streams_output);
+        if (ranges_overlap(&controls, &controls) or
+            ranges_overlap(&output, &output) or
+            ranges_overlap(&controls, &output))
+        {
+            return error.WorkspaceAliasing;
+        }
+        for (self.inputs[0..source.len], 0..) |input, index| {
+            const ranges = compaction_job_input_ranges(input);
+            if (ranges_overlap(&ranges, &ranges) or
+                ranges_overlap(&controls, &ranges) or
+                ranges_overlap(&output, &ranges))
+            {
+                return error.WorkspaceAliasing;
+            }
+            for (self.inputs[index + 1 .. source.len]) |later| {
+                const later_ranges = compaction_job_input_ranges(later);
+                if (ranges_overlap(&ranges, &later_ranges)) {
+                    return error.WorkspaceAliasing;
+                }
+            }
         }
     }
 
-    fn read_last_header(self: *CompactionJob, input_count: usize) Error!ltx.Header {
-        const index = input_count - 1;
-        const job_input = &self.inputs[index];
-        var reader = ltx.SliceReader.init(self.readers[index].bytes);
-        var decoder = try ltx.Decoder.init(
-            .v3,
-            self.codec_limits,
-            reader.reader(),
-            job_input.page_workspace,
-            job_input.compressed_workspace,
-            job_input.index_workspace,
-        );
-        return switch (try decoder.next()) {
-            .header => |header| header,
-            else => error.InvalidState,
-        };
-    }
-
-    fn reset_inputs(self: *CompactionJob, input_count: usize) void {
-        for (
-            self.inputs[0..input_count],
-            self.readers[0..input_count],
-            self.compaction_inputs[0..input_count],
-        ) |*job_input, *reader, *compaction_input| {
-            reader.* = ltx.SliceReader.init(reader.bytes);
+    fn initialize_inputs(self: *CompactionJob, source: []const ltx.FileInfo) Error!void {
+        for (source, self.inputs[0..source.len], self.compaction_inputs[0..source.len]) |
+            info,
+            *job_input,
+            *compaction_input,
+        | {
+            job_input.object_reader = try object.ObjectReader.init(
+                self.client,
+                info,
+                job_input.read_workspace,
+            );
             compaction_input.* = ltx.CompactionInput.init(
                 .v3,
-                reader.reader(),
+                job_input.object_reader.reader(),
                 job_input.page_workspace,
                 job_input.compressed_workspace,
                 job_input.index_workspace,
             );
         }
+    }
+
+    fn read_last_header(
+        self: *CompactionJob,
+        input_index: usize,
+        info: ltx.FileInfo,
+    ) Error!ltx.Header {
+        const job_input = &self.inputs[input_index];
+        var source = try object.ObjectReader.init(
+            self.client,
+            info,
+            job_input.read_workspace,
+        );
+        var decoder = try ltx.Decoder.init(
+            .v3,
+            self.codec_limits,
+            source.reader(),
+            job_input.page_workspace,
+            job_input.compressed_workspace,
+            job_input.index_workspace,
+        );
+        const event = decoder.next() catch |err| {
+            if (source.failure()) |storage_error| return storage_error;
+            return err;
+        };
+        return switch (event) {
+            .header => |header| header,
+            else => error.InvalidState,
+        };
     }
 
     fn run_streaming(
@@ -880,9 +943,63 @@ pub const CompactionJob = struct {
             self.output_compression_workspace,
             self.output_index_workspace,
         );
-        return compactor.compact();
+        return compactor.compact() catch |err| {
+            for (self.inputs[0..input_count]) |*input| {
+                if (input.object_reader.failure()) |storage_error| {
+                    return storage_error;
+                }
+            }
+            return err;
+        };
     }
 };
+
+fn validate_source_info(limits: ltx.Limits, info: ltx.FileInfo) Error!void {
+    if (info.level > ltx.max_level) return error.InvalidLevel;
+    if (info.min_txid.value > info.max_txid.value) return error.InvalidIdentity;
+    if (info.size_bytes == 0) return error.InvalidReadRange;
+    if (info.size_bytes > limits.max_input_bytes) return error.InputLimitExceeded;
+}
+
+fn compaction_job_input_ranges(input: CompactionJobInput) [4][]const u8 {
+    return .{
+        input.read_workspace,
+        input.page_workspace,
+        input.compressed_workspace,
+        std.mem.sliceAsBytes(input.index_workspace),
+    };
+}
+
+fn compaction_output_ranges(
+    job: *const CompactionJob,
+    streams_output: bool,
+) [4][]const u8 {
+    return .{
+        if (streams_output) job.output_storage[0..0] else job.output_storage,
+        job.output_compressed_workspace,
+        std.mem.asBytes(job.output_compression_workspace),
+        std.mem.sliceAsBytes(job.output_index_workspace),
+    };
+}
+
+fn ranges_overlap(left: []const []const u8, right: []const []const u8) bool {
+    for (left, 0..) |left_range, left_index| {
+        for (right, 0..) |right_range, right_index| {
+            if (left.ptr == right.ptr and left_index == right_index) continue;
+            if (slices_overlap(left_range, right_range)) return true;
+        }
+    }
+    return false;
+}
+
+fn slices_overlap(left: []const u8, right: []const u8) bool {
+    if (left.len == 0 or right.len == 0) return false;
+    const left_start = @intFromPtr(left.ptr);
+    const right_start = @intFromPtr(right.ptr);
+    const left_end = std.math.add(usize, left_start, left.len) catch return true;
+    const right_end = std.math.add(usize, right_start, right.len) catch return true;
+    return left_start < right_end and right_start < left_end;
+}
 
 fn verify_identity(verified: ltx.VerifiedLTX, expected: ltx.FileIdentity) Error!void {
     if (verified.header.min_txid.value != expected.min_txid.value or

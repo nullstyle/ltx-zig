@@ -402,11 +402,13 @@ stack; see
 [docs/replication-roadmap.md](docs/replication-roadmap.md) for the delivered
 milestones and remaining candidates. Import `ltx_wal` for bounded SQLite
 WAL parsing with committed page maps and salt scans, `ltx_object` for the
-storage-neutral object contract, transactional write sessions, its filesystem
-backend, and conformance suite, `ltx_s3` for S3-compatible stores (path-style
-or virtual-host SigV4, TLS, paginated listings, object read/write/delete,
-conditional writes, bounded retry, automatic single-or-multipart transactional
-publication, and bucket creation over the standard-library HTTP client),
+storage-neutral object contract, exact ranged reads with a bounded sequential
+reader, transactional write sessions, its filesystem backend, and conformance
+suite, `ltx_s3` for S3-compatible stores (path-style
+or virtual-host SigV4, TLS, paginated listings, signed exact ranged reads,
+object write/delete, conditional writes, bounded retry, automatic
+single-or-multipart transactional publication, and bucket creation over the
+standard-library HTTP client),
 `ltx_replica` for the Litestream level ladder, restore planning, and
 restore/compaction/retention executors over caller-owned workspaces,
 `ltx_capture` for the SQLite capture session that publishes no-checksum L0

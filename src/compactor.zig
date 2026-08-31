@@ -322,6 +322,7 @@ const TerminalProbe = struct {
             .read_fn = read,
             .at_end_fn = at_end,
             .backing_bytes = self.upstream.backing_bytes,
+            .backing_is_mutable = self.upstream.backing_is_mutable,
         };
     }
 
@@ -476,7 +477,18 @@ fn validate_later_input_aliases(
         if (later.reader.backing_bytes) |backing| {
             if (overlaps_any(backing, ranges)) return error.WorkspaceAliasing;
         }
+        if (readers_share_mutable_backing(
+            inputs[@intCast(input_index)].reader,
+            later.reader,
+        )) return error.WorkspaceAliasing;
     }
+}
+
+fn readers_share_mutable_backing(left: Reader, right: Reader) bool {
+    if (!left.backing_is_mutable and !right.backing_is_mutable) return false;
+    const left_backing = left.backing_bytes orelse return false;
+    const right_backing = right.backing_bytes orelse return false;
+    return workspace.slices_overlap(left_backing, right_backing);
 }
 
 fn input_workspace_ranges(input: *const CompactionInput) WorkspaceRanges {

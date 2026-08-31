@@ -144,10 +144,12 @@ configuration.
 Compaction receives one complete decoder workspace set per input and one
 complete encoder workspace set for output. These sets, the mutable
 `CompactionInput` slice, and output backing must remain address-stable,
-exclusively owned, and mutually non-overlapping for the operation. Immutable
-reported reader backings may overlap each other, but not mutable input state,
-workspaces, or output. Opaque transport-context extents cannot be inspected and
-remain a caller-side lifetime, aliasing, and non-reentrancy obligation. Each
+exclusively owned, and mutually non-overlapping for the operation. Reported
+immutable reader backings may overlap each other, but a reported mutable reader
+backing may not overlap any other reader backing. Neither kind may overlap
+mutable input state, workspaces, or output. Opaque transport-context extents
+cannot be inspected and remain a caller-side lifetime, aliasing, and
+non-reentrancy obligation. Each
 input holds at most one decompressed page while the merge selects the newest
 page at the smallest current page number. No page map or materialized database
 image is allocated.
@@ -174,11 +176,13 @@ buffers. The core imports no filesystem API and does not require libc.
 
 Slice transports publish their backing range so the codec can reject overlap
 with workspaces, page input, or output. Custom transport implementers should do
-the same when a stable range exists. All codec workspaces must remain live,
-address-stable, and exclusively owned until the codec reaches a terminal
-state. Transport contexts and any unreported backing storage have the same
-lifetime requirement and must remain non-overlapping and non-reentrant; zero
-from `read_fn` means permanent EOF.
+the same when a stable range exists, and set `Reader.backing_is_mutable` when
+reads can overwrite it. The compactor rejects overlapping reader backings when
+either is mutable. All codec workspaces must remain live, address-stable, and
+exclusively owned until the codec reaches a terminal state. Transport contexts
+and any unreported backing storage have the same lifetime requirement and must
+remain non-overlapping and non-reentrant; zero from `read_fn` means permanent
+EOF.
 `at_end_fn` must be non-consuming and report the exact end of this one LTX
 object, which requires known-length framing or buffering for a shared stream.
 `Decoder`, `Encoder`, `Compactor`, and `StagedApplier` are stateful,

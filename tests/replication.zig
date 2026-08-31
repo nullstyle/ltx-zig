@@ -49,6 +49,7 @@ const max_frames = 128;
 const max_files_per_level = 8;
 const max_restore_files = 16;
 const max_compaction_inputs = 4;
+const read_workspace_bytes: u32 = 1024;
 const max_wal_bytes = wal.header_size_bytes +
     max_frames * (wal.frame_header_size_bytes + max_page_bytes);
 
@@ -81,6 +82,7 @@ const config = replication.Config{
     .max_files_per_level = max_files_per_level,
     .max_restore_files = max_restore_files,
     .max_compaction_input_bytes = max_object_bytes * max_compaction_inputs,
+    .read_workspace_bytes = read_workspace_bytes,
 };
 
 const TestResources = struct {
@@ -100,14 +102,13 @@ const TestResources = struct {
     ]ltx.FileInfo = undefined,
     restore_plan: [max_restore_files]ltx.FileInfo = undefined,
     retention_plan: [max_files_per_level]ltx.FileInfo = undefined,
-    restore_storage: [max_object_bytes]u8 = undefined,
+    restore_read_workspace: [read_workspace_bytes]u8 = undefined,
     restore_page: [max_page_bytes]u8 = undefined,
     restore_compressed: [max_compressed_bytes]u8 = undefined,
     restore_index: [max_pages]ltx.PageIndexEntry = undefined,
     job_inputs: [max_compaction_inputs]replica.CompactionJobInput = undefined,
     compaction_inputs: [max_compaction_inputs]ltx.CompactionInput = undefined,
-    compaction_readers: [max_compaction_inputs]ltx.SliceReader = undefined,
-    input_storage: [max_compaction_inputs][max_object_bytes]u8 = undefined,
+    input_read_workspaces: [max_compaction_inputs][read_workspace_bytes]u8 = undefined,
     input_pages: [max_compaction_inputs][max_page_bytes]u8 = undefined,
     input_compressed: [max_compaction_inputs][max_compressed_bytes]u8 = undefined,
     input_indexes: [max_compaction_inputs][max_pages]ltx.PageIndexEntry = undefined,
@@ -119,7 +120,7 @@ const TestResources = struct {
     fn bind(self: *TestResources) replication.Resources {
         for (&self.job_inputs, 0..) |*input, index| {
             input.* = .{
-                .storage = &self.input_storage[index],
+                .read_workspace = &self.input_read_workspaces[index],
                 .page_workspace = &self.input_pages[index],
                 .compressed_workspace = &self.input_compressed[index],
                 .index_workspace = &self.input_indexes[index],
@@ -130,13 +131,12 @@ const TestResources = struct {
             .level_listings = &self.level_listings,
             .restore_plan = &self.restore_plan,
             .retention_plan = &self.retention_plan,
-            .restore_storage = &self.restore_storage,
+            .restore_read_workspace = &self.restore_read_workspace,
             .restore_page_workspace = &self.restore_page,
             .restore_compressed_workspace = &self.restore_compressed,
             .restore_index_workspace = &self.restore_index,
             .compaction_job_inputs = &self.job_inputs,
             .compaction_inputs = &self.compaction_inputs,
-            .compaction_readers = &self.compaction_readers,
             .compaction_output_storage = &self.compaction_output,
             .compaction_output_compressed_workspace = &self.compaction_compressed,
             .compaction_output_compression_workspace = &self.compaction_compression,
@@ -376,7 +376,37 @@ test "init rejects aliases inside operation workspace families" {
     );
 
     resources = storage.bind();
-    resources.restore_page_workspace = resources.restore_storage[0..max_page_bytes];
+    resources.restore_read_workspace =
+        resources.restore_page_workspace[0..read_workspace_bytes];
+    try expect_init_error(
+        error.InvalidResources,
+        replication.Controller.init(
+            options(&temporary, store.client(), "never-opened.db", .require_empty),
+            &resources,
+        ),
+    );
+
+    resources = storage.bind();
+    var shared_control_options = options(
+        &temporary,
+        store.client(),
+        "never-opened.db",
+        .require_empty,
+    );
+    shared_control_options.config.read_workspace_bytes = 128;
+    resources.restore_read_workspace = std.mem.sliceAsBytes(
+        resources.compaction_job_inputs,
+    )[0..128];
+    try expect_init_error(
+        error.InvalidResources,
+        replication.Controller.init(shared_control_options, &resources),
+    );
+
+    resources = storage.bind();
+    const map_seen_bytes = resources.capture.map_seen.len;
+    resources.capture.map_seen = std.mem.sliceAsBytes(
+        resources.compaction_job_inputs,
+    )[0..map_seen_bytes];
     try expect_init_error(
         error.InvalidResources,
         replication.Controller.init(
@@ -388,6 +418,60 @@ test "init rejects aliases inside operation workspace families" {
     resources = storage.bind();
     resources.compaction_job_inputs[1].page_workspace =
         resources.compaction_job_inputs[0].page_workspace;
+    try expect_init_error(
+        error.InvalidResources,
+        replication.Controller.init(
+            options(&temporary, store.client(), "never-opened.db", .require_empty),
+            &resources,
+        ),
+    );
+
+    resources = storage.bind();
+    resources.compaction_job_inputs[0].read_workspace =
+        resources.compaction_job_inputs[0].page_workspace[0..read_workspace_bytes];
+    try expect_init_error(
+        error.InvalidResources,
+        replication.Controller.init(
+            options(&temporary, store.client(), "never-opened.db", .require_empty),
+            &resources,
+        ),
+    );
+}
+
+test "init validates configured object-read workspace capacity" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const storage = try std.testing.allocator.create(TestResources);
+    defer std.testing.allocator.destroy(storage);
+
+    var resources = storage.bind();
+    var invalid_options = options(
+        &temporary,
+        store.client(),
+        "never-opened.db",
+        .require_empty,
+    );
+    invalid_options.config.read_workspace_bytes = 0;
+    try expect_init_error(
+        error.InvalidConfiguration,
+        replication.Controller.init(invalid_options, &resources),
+    );
+
+    resources = storage.bind();
+    resources.restore_read_workspace =
+        resources.restore_read_workspace[0 .. read_workspace_bytes - 1];
+    try expect_init_error(
+        error.InvalidResources,
+        replication.Controller.init(
+            options(&temporary, store.client(), "never-opened.db", .require_empty),
+            &resources,
+        ),
+    );
+
+    resources = storage.bind();
+    resources.compaction_job_inputs[0].read_workspace =
+        resources.compaction_job_inputs[0].read_workspace[0 .. read_workspace_bytes - 1];
     try expect_init_error(
         error.InvalidResources,
         replication.Controller.init(

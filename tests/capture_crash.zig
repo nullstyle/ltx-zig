@@ -43,6 +43,7 @@ var seen: [8]u8 = @splat(0);
 var entries: [64]ltx_wal.PageMapEntry =
     @splat(.{ .page_number = 0, .frame_offset_bytes = 0 });
 var output: [1 << 20]u8 = undefined;
+var restore_read_workspace: [64 * 1024]u8 = undefined;
 var page: [page_size]u8 = undefined;
 var compressed: [page_size + 1024]u8 = undefined;
 var compression: ltx.LZ4CompressionWorkspace = undefined;
@@ -144,7 +145,7 @@ fn restore_latest(dir: std.Io.Dir, database_name: []const u8) !ltx.Position {
         .codec_limits = codec_limits,
         .apply_limits = .{ .max_database_pages = 64, .max_database_bytes = 1 << 20 },
         .backend = backend.backend(),
-        .storage = &output,
+        .read_workspace = &restore_read_workspace,
         .page_workspace = &page,
         .compressed_workspace = &compressed,
         .index_workspace = &index,

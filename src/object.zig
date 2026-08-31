@@ -1,11 +1,11 @@
 //! Storage-neutral LTX object access.
 //!
 //! The `Client` contract mirrors the storage half of the pinned Celld crate's
-//! `ReplicaClient` trait: listings ascending by TXID range, whole-object
-//! reads, idempotent writes, and idempotent deletes — all over caller-owned
-//! buffers, with no allocation inside this module. Objects are opaque byte
-//! blobs at this layer; only their level and TXID-range identity are
-//! interpreted here, while listings also report their exact stored length.
+//! `ReplicaClient` trait: listings ascending by TXID range, exact bounded
+//! range reads, idempotent writes, and idempotent deletes — all over
+//! caller-owned buffers, with no allocation inside this module. Objects are
+//! opaque byte blobs at this layer; only their level and TXID-range identity
+//! are interpreted here, while listings also report their exact stored length.
 //!
 //! `FileClient` implements the contract over a directory handle using the
 //! Litestream filesystem replica layout (`<root>/ltx/<level>/<min>-<max>.ltx`)
@@ -19,9 +19,12 @@ const ltx = @import("ltx");
 pub const Error = error{
     InvalidLevel,
     InvalidIdentity,
+    InvalidReadRange,
     InvalidTimestamp,
     ObjectNotFound,
     ObjectExists,
+    /// The stored object no longer has the exact size reported by its listing.
+    ObjectChanged,
     /// A conditional replace saw a different stored generation than the
     /// caller expected; the caller must re-read and decide.
     ETagMismatch,
@@ -37,6 +40,7 @@ pub const Error = error{
     ConformanceFailure,
     WriteSessionUnsupported,
     StagingCapacityExceeded,
+    ReadWorkspaceTooSmall,
 };
 
 pub const WriteSessionState = enum {
@@ -125,14 +129,15 @@ pub const Client = struct {
         seek: ltx.TXID,
         destination: []ltx.FileInfo,
     ) Error![]const ltx.FileInfo,
-    /// Reads one whole object into `destination`, returning the byte slice
-    /// occupied. `destination` must be at least the object's size.
-    open_fn: *const fn (
+    /// Fills one exact range from a listed object. The adapter must reject a
+    /// current stored length different from `info.size_bytes`; successful
+    /// short reads are forbidden.
+    read_range_fn: *const fn (
         context: *anyopaque,
-        level: u8,
-        identity: ltx.FileIdentity,
+        info: ltx.FileInfo,
+        offset_bytes: u64,
         destination: []u8,
-    ) Error![]const u8,
+    ) Error!void,
     /// Writes one object at the identity's key. Overwrites are idempotent.
     /// `created_at_ms` is the creation timestamp the backend should report
     /// in listings when it supports object metadata.
@@ -167,17 +172,35 @@ pub const Client = struct {
         return self.list_fn(self.context, level, seek, destination);
     }
 
-    pub fn open(
+    pub fn read_range(
         self: Client,
-        level: u8,
-        identity: ltx.FileIdentity,
+        info: ltx.FileInfo,
+        offset_bytes: u64,
+        destination: []u8,
+    ) Error!void {
+        try validate_file_info(info);
+        const count_bytes = std.math.cast(u64, destination.len) orelse
+            return error.InvalidReadRange;
+        const end_bytes = std.math.add(u64, offset_bytes, count_bytes) catch
+            return error.InvalidReadRange;
+        if (end_bytes > info.size_bytes) return error.InvalidReadRange;
+        if (destination.len == 0) return;
+        return self.read_range_fn(self.context, info, offset_bytes, destination);
+    }
+
+    /// Reads one complete listed object through the range seam. The returned
+    /// slice occupies exactly `info.size_bytes` bytes of `destination`.
+    pub fn read_all(
+        self: Client,
+        info: ltx.FileInfo,
         destination: []u8,
     ) Error![]const u8 {
-        if (level > ltx.max_level) return error.InvalidLevel;
-        if (identity.min_txid.value > identity.max_txid.value) {
-            return error.InvalidIdentity;
-        }
-        return self.open_fn(self.context, level, identity, destination);
+        try validate_file_info(info);
+        const size_bytes = std.math.cast(usize, info.size_bytes) orelse
+            return error.ObjectTooLarge;
+        if (size_bytes > destination.len) return error.ObjectTooLarge;
+        try self.read_range(info, 0, destination[0..size_bytes]);
+        return destination[0..size_bytes];
     }
 
     pub fn write(
@@ -218,6 +241,106 @@ pub const Client = struct {
     }
 };
 
+/// A bounded sequential view over one listed object. `self`, its workspace,
+/// and the client context must stay at stable, non-overlapping addresses while
+/// the derived `ltx.Reader` is in use. A range failure poisons the reader and
+/// remains available through `failure()` after the transport narrows it to
+/// `InputFailure`.
+pub const ObjectReader = struct {
+    client: Client,
+    info: ltx.FileInfo,
+    workspace: []u8,
+    object_offset_bytes: u64 = 0,
+    buffered_offset_bytes: usize = 0,
+    buffered_length_bytes: usize = 0,
+    failure_value: ?Error = null,
+
+    pub fn init(
+        client: Client,
+        info: ltx.FileInfo,
+        workspace: []u8,
+    ) Error!ObjectReader {
+        try validate_file_info(info);
+        if (workspace.len == 0) return error.ReadWorkspaceTooSmall;
+        return .{
+            .client = client,
+            .info = info,
+            .workspace = workspace,
+        };
+    }
+
+    pub fn reader(self: *ObjectReader) ltx.Reader {
+        return .{
+            .context = self,
+            .read_fn = read,
+            .at_end_fn = at_end,
+            .backing_bytes = self.workspace,
+            .backing_is_mutable = true,
+        };
+    }
+
+    pub fn failure(self: *const ObjectReader) ?Error {
+        return self.failure_value;
+    }
+
+    fn read(context: *anyopaque, destination: []u8) error{InputFailure}!usize {
+        const self: *ObjectReader = @ptrCast(@alignCast(context));
+        if (self.failure_value != null) return error.InputFailure;
+        if (destination.len == 0 or self.object_offset_bytes == self.info.size_bytes) {
+            return 0;
+        }
+        if (self.buffered_offset_bytes == self.buffered_length_bytes) {
+            self.refill() catch |err| {
+                self.failure_value = err;
+                return error.InputFailure;
+            };
+        }
+        const available_bytes = self.buffered_length_bytes - self.buffered_offset_bytes;
+        const count_bytes = @min(destination.len, available_bytes);
+        @memcpy(
+            destination[0..count_bytes],
+            self.workspace[self.buffered_offset_bytes..][0..count_bytes],
+        );
+        self.buffered_offset_bytes += count_bytes;
+        self.object_offset_bytes = std.math.add(
+            u64,
+            self.object_offset_bytes,
+            @intCast(count_bytes),
+        ) catch unreachable;
+        std.debug.assert(self.object_offset_bytes <= self.info.size_bytes);
+        return count_bytes;
+    }
+
+    fn at_end(context: *anyopaque) error{InputFailure}!bool {
+        const self: *ObjectReader = @ptrCast(@alignCast(context));
+        if (self.failure_value != null) return error.InputFailure;
+        return self.object_offset_bytes == self.info.size_bytes;
+    }
+
+    fn refill(self: *ObjectReader) Error!void {
+        std.debug.assert(self.failure_value == null);
+        std.debug.assert(self.buffered_offset_bytes == self.buffered_length_bytes);
+        std.debug.assert(self.object_offset_bytes < self.info.size_bytes);
+        const remaining_bytes = self.info.size_bytes - self.object_offset_bytes;
+        const workspace_bytes = std.math.cast(u64, self.workspace.len) orelse
+            return error.InvalidReadRange;
+        const request_bytes: usize = @intCast(@min(remaining_bytes, workspace_bytes));
+        try self.client.read_range(
+            self.info,
+            self.object_offset_bytes,
+            self.workspace[0..request_bytes],
+        );
+        self.buffered_offset_bytes = 0;
+        self.buffered_length_bytes = request_bytes;
+    }
+};
+
+fn validate_file_info(info: ltx.FileInfo) Error!void {
+    if (info.level > ltx.max_level) return error.InvalidLevel;
+    if (info.min_txid.value > info.max_txid.value) return error.InvalidIdentity;
+    if (info.size_bytes == 0) return error.InvalidReadRange;
+}
+
 /// Filesystem-backed `Client` using the Litestream replica layout under one
 /// directory handle. The value is stateful and single-owner: keep it at a
 /// stable address while the derived `Client` is in use.
@@ -255,7 +378,7 @@ pub const FileClient = struct {
         return .{
             .context = self,
             .list_fn = list,
-            .open_fn = open,
+            .read_range_fn = read_range,
             .write_fn = write,
             .begin_write_fn = begin_write,
             .delete_fn = delete,
@@ -319,22 +442,17 @@ pub const FileClient = struct {
         return listed;
     }
 
-    fn open(
+    fn read_range(
         context: *anyopaque,
-        level: u8,
-        identity: ltx.FileIdentity,
+        info: ltx.FileInfo,
+        offset_bytes: u64,
         destination: []u8,
-    ) Error![]const u8 {
+    ) Error!void {
         const self: *FileClient = @ptrCast(@alignCast(context));
-        const path = try self.file_path(&self.path_a, level, identity);
-        const stat = self.dir.statFile(self.io, path, .{}) catch |err| {
-            return switch (err) {
-                error.FileNotFound => error.ObjectNotFound,
-                else => error.StorageFailure,
-            };
-        };
-        const size = std.math.cast(usize, stat.size) orelse return error.ObjectTooLarge;
-        if (size > destination.len) return error.ObjectTooLarge;
+        const path = try self.file_path(&self.path_a, info.level, .{
+            .min_txid = info.min_txid,
+            .max_txid = info.max_txid,
+        });
         var file = self.dir.openFile(self.io, path, .{}) catch |err| {
             return switch (err) {
                 error.FileNotFound => error.ObjectNotFound,
@@ -342,10 +460,11 @@ pub const FileClient = struct {
             };
         };
         defer file.close(self.io);
-        const read = file.readPositionalAll(self.io, destination[0..size], 0) catch
+        const stat = file.stat(self.io) catch return error.StorageFailure;
+        if (stat.size != info.size_bytes) return error.ObjectChanged;
+        const read = file.readPositionalAll(self.io, destination, offset_bytes) catch
             return error.StorageFailure;
-        if (read != size) return error.StorageFailure;
-        return destination[0..size];
+        if (read != destination.len) return error.ObjectChanged;
     }
 
     fn write(
@@ -624,7 +743,7 @@ fn file_info_before(_: void, left: ltx.FileInfo, right: ltx.FileInfo) bool {
 }
 
 /// Backend-agnostic conformance suite. Run it against empty storage: it
-/// writes at levels 0 and 1, asserts the listing, seek, read, idempotent
+/// writes at levels 0 and 1, asserts the listing, seek, ranged read, idempotent
 /// overwrite, and delete contracts, and deletes what it wrote. Returns
 /// `ConformanceFailure` on the first violated contract.
 pub fn run_conformance(client: Client) Error!void {
@@ -677,9 +796,43 @@ pub fn run_conformance(client: Client) Error!void {
         return error.ConformanceFailure;
     }
 
+    const second_info = ltx.FileInfo{
+        .level = 0,
+        .min_txid = second.min_txid,
+        .max_txid = second.max_txid,
+        .size_bytes = two.len,
+    };
     var storage: [8]u8 = undefined;
-    const opened = try client.open(0, second, &storage);
-    if (!std.mem.eql(u8, opened, &two)) return error.ConformanceFailure;
+    if (!std.mem.eql(u8, try client.read_all(second_info, &storage), &two)) {
+        return error.ConformanceFailure;
+    }
+    var first_range: [2]u8 = undefined;
+    try client.read_range(second_info, 0, &first_range);
+    if (!std.mem.eql(u8, &first_range, two[0..2])) return error.ConformanceFailure;
+    var middle_range: [3]u8 = undefined;
+    try client.read_range(second_info, 2, &middle_range);
+    if (!std.mem.eql(u8, &middle_range, two[2..5])) return error.ConformanceFailure;
+    var final_range: [1]u8 = undefined;
+    try client.read_range(second_info, 7, &final_range);
+    if (!std.mem.eql(u8, &final_range, two[7..8])) return error.ConformanceFailure;
+    try client.read_range(second_info, second_info.size_bytes, storage[0..0]);
+
+    var undersized: [7]u8 = undefined;
+    try expect_error(error.ObjectTooLarge, client.read_all(second_info, &undersized));
+    try expect_error(
+        error.InvalidReadRange,
+        client.read_range(second_info, second_info.size_bytes, final_range[0..1]),
+    );
+    try expect_error(
+        error.InvalidReadRange,
+        client.read_range(second_info, std.math.maxInt(u64), storage[0..0]),
+    );
+    var stale_info = second_info;
+    stale_info.size_bytes -= 1;
+    try expect_error(
+        error.ObjectChanged,
+        client.read_range(stale_info, 0, storage[0..1]),
+    );
 
     // Overwrite is idempotent: same identity, new bytes, unchanged listing.
     @memset(&two, 0x22);
@@ -687,7 +840,7 @@ pub fn run_conformance(client: Client) Error!void {
     if ((try client.list(0, ltx.TXID.init(0), &infos)).len != 3) {
         return error.ConformanceFailure;
     }
-    if (!std.mem.eql(u8, try client.open(0, second, &storage), &two)) {
+    if (!std.mem.eql(u8, try client.read_all(second_info, &storage), &two)) {
         return error.ConformanceFailure;
     }
 
@@ -706,7 +859,15 @@ pub fn run_conformance(client: Client) Error!void {
     if (remaining.len != 1 or remaining[0].min_txid.value != 2) {
         return error.ConformanceFailure;
     }
-    try expect_error(error.ObjectNotFound, client.open(0, first, &storage));
+    try expect_error(
+        error.ObjectNotFound,
+        client.read_range(.{
+            .level = 0,
+            .min_txid = first.min_txid,
+            .max_txid = first.max_txid,
+            .size_bytes = one.len,
+        }, 0, storage[0..1]),
+    );
     // Deleting a missing object is idempotent.
     try client.delete(&.{
         .{ .level = 0, .min_txid = first.min_txid, .max_txid = first.max_txid, .size_bytes = one.len },

@@ -96,6 +96,27 @@ The v0.4.0 tree removed the earlier golden fixtures and most crate-local tests,
 so the immutable v0.3.0 fixture pin remains the interoperability reference while
 v0.4.0 informs resource and controller design.
 
+The M7 read-path re-audit confirmed that the pinned v0.4.0
+[`ReplicaClient`](https://github.com/denoland/celld/blob/a52f9905425bc41134d817694bdc2c50bcc5e856/crates/ltx/src/client/mod.rs#L46-L49)
+still exposes `open_ltx_file` as a complete `Vec<u8>` and its
+[`object-store adapter`](https://github.com/denoland/celld/blob/a52f9905425bc41134d817694bdc2c50bcc5e856/crates/ltx/src/client/object_store.rs#L692-L708)
+materializes the complete response. Its
+[`restore`](https://github.com/denoland/celld/blob/a52f9905425bc41134d817694bdc2c50bcc5e856/crates/ltx/src/replica.rs#L565-L595)
+then collects the planned objects as `Vec<Vec<u8>>` before rebuilding the image.
+That remains useful orchestration evidence but is intentionally not Zig's
+fixed-memory model. Zig instead places one exact positional-read port at the
+object seam and adapts it to the unchanged sequential codec reader with
+caller-owned windows. Amazon S3's official `GetObject` documentation limits a
+request to a
+[`single range`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html#AmazonS3-GetObject-request-header-Range),
+and its range example shows
+[`206 Partial Content` with `Content-Range`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html#API_GetObject_Example_13).
+The official
+[`SigV4` GET example](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/sig-v4-header-based-auth.html#example-signature-GET-object)
+includes `range` in the canonical and signed header sets; Zig adopts that
+integrity hardening. These are transport behavior and hardening references
+only; M7 does not infer or alter LTX wire semantics.
+
 For Litestream v0.5.16: the release archive manifest, `go.mod`,
 `cmd/litestream/restore.go`, `replica.go` restore planning and decode path, and
 the pinned `superfly/ltx v0.5.2` reader were checked. The shipped binary is the

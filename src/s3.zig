@@ -3,7 +3,7 @@
 //! Implements the object-client contract against S3-compatible stores using
 //! path-style requests and AWS Signature Version 4, at the granularity this
 //! milestone covers: single-request `PutObject` with the
-//! `litestream-timestamp` metadata header, `GetObject`, per-object
+//! `litestream-timestamp` metadata header, ranged `GetObject`, per-object
 //! `DeleteObject`, paginated `ListObjectsV2` with `start-after` seek, and
 //! bucket creation. Transactional write sessions stay in one caller-owned
 //! buffer for small objects and switch automatically to multipart upload only
@@ -245,7 +245,7 @@ pub const S3Client = struct {
         return .{
             .context = self,
             .list_fn = list,
-            .open_fn = open,
+            .read_range_fn = read_range,
             .write_fn = write,
             .begin_write_fn = begin_write,
             .delete_fn = delete,
@@ -254,7 +254,7 @@ pub const S3Client = struct {
 
     /// Creates the bucket when absent; an already-owned bucket is success.
     pub fn ensure_bucket(self: *S3Client) Error!void {
-        const outcome = try self.perform(.PUT, "/", "", null, null, null, .none);
+        const outcome = try self.perform(.PUT, "/", "", .{});
         switch (outcome.status) {
             .ok, .conflict => {},
             else => return error.StorageFailure,
@@ -313,7 +313,9 @@ pub const S3Client = struct {
                 self.config.prefix,
                 continuation,
             );
-            const outcome = try self.perform(.GET, "/", query, null, null, &self.xml_workspace, .none);
+            const outcome = try self.perform(.GET, "/", query, .{
+                .body_destination = &self.xml_workspace,
+            });
             if (outcome.status != .ok) return error.StorageFailure;
             const page = try self.parse_list_page(outcome.bytes);
             for (page.keys, page.sizes) |key, size_bytes| {
@@ -339,18 +341,47 @@ pub const S3Client = struct {
         return listed;
     }
 
-    fn open(
+    fn read_range(
         context: *anyopaque,
-        level: u8,
-        identity: ltx.FileIdentity,
+        info: ltx.FileInfo,
+        offset_bytes: u64,
         destination: []u8,
-    ) Error![]const u8 {
+    ) Error!void {
         const self: *S3Client = @ptrCast(@alignCast(context));
-        const key = try self.key_path(level, identity);
-        const outcome = try self.perform(.GET, key, "", null, null, destination, .none);
+        if (destination.len == 0) return;
+        const length_bytes = std.math.cast(u64, destination.len) orelse
+            return error.InvalidReadRange;
+        const end_exclusive_bytes = std.math.add(
+            u64,
+            offset_bytes,
+            length_bytes,
+        ) catch return error.InvalidReadRange;
+        if (end_exclusive_bytes > info.size_bytes) return error.InvalidReadRange;
+        const end_bytes = end_exclusive_bytes - 1;
+        const key = try self.key_path(info.level, .{
+            .min_txid = info.min_txid,
+            .max_txid = info.max_txid,
+        });
+        const outcome = try self.perform(.GET, key, "", .{
+            .body_destination = destination,
+            .byte_range = .{
+                .start_bytes = offset_bytes,
+                .end_bytes = end_bytes,
+            },
+        });
         if (outcome.status == .not_found) return error.ObjectNotFound;
-        if (outcome.status != .ok) return error.StorageFailure;
-        return outcome.bytes;
+        if (outcome.status == .range_not_satisfiable) return error.ObjectChanged;
+        if (outcome.status != .partial_content) return error.StorageFailure;
+        const content_range = outcome.content_range orelse
+            return error.StorageFailure;
+        if (content_range.total_bytes != info.size_bytes) {
+            return error.ObjectChanged;
+        }
+        if (content_range.start_bytes != offset_bytes or
+            content_range.end_bytes != end_bytes)
+        {
+            return error.StorageFailure;
+        }
     }
 
     fn write(
@@ -369,10 +400,10 @@ pub const S3Client = struct {
             .PUT,
             key,
             "",
-            self.send_workspace[0..bytes.len],
-            created_at_ms,
-            null,
-            .none,
+            .{
+                .payload = self.send_workspace[0..bytes.len],
+                .metadata_ms = created_at_ms,
+            },
         );
         if (outcome.status != .ok) return error.StorageFailure;
     }
@@ -493,10 +524,10 @@ pub const S3Client = struct {
             .PUT,
             key,
             "",
-            self.send_workspace[0..state.buffered_bytes],
-            state.created_at_ms,
-            null,
-            .none,
+            .{
+                .payload = self.send_workspace[0..state.buffered_bytes],
+                .metadata_ms = state.created_at_ms,
+            },
         );
         if (outcome.status != .ok) return error.StorageFailure;
     }
@@ -550,10 +581,10 @@ pub const S3Client = struct {
             .POST,
             key,
             query,
-            null,
-            created_at_ms,
-            &self.xml_workspace,
-            .none,
+            .{
+                .metadata_ms = created_at_ms,
+                .body_destination = &self.xml_workspace,
+            },
         );
         if (outcome.status != .ok) return error.StorageFailure;
         var state = MultipartState{ .level = level, .identity = identity };
@@ -620,10 +651,7 @@ pub const S3Client = struct {
             .PUT,
             key,
             query,
-            self.send_workspace[0..length_bytes],
-            null,
-            null,
-            .none,
+            .{ .payload = self.send_workspace[0..length_bytes] },
         );
         if (outcome.status != .ok) return error.StorageFailure;
         const etag = outcome.etag orelse return error.StorageFailure;
@@ -682,10 +710,10 @@ pub const S3Client = struct {
             .POST,
             key,
             query,
-            body_buffer[0..body_offset],
-            null,
-            &self.xml_workspace,
-            .none,
+            .{
+                .payload = body_buffer[0..body_offset],
+                .body_destination = &self.xml_workspace,
+            },
         );
         if (outcome.status != .ok) return error.StorageFailure;
         try validate_complete_multipart_response(outcome.bytes);
@@ -717,10 +745,7 @@ pub const S3Client = struct {
             .DELETE,
             key,
             query,
-            null,
-            null,
-            null,
-            .none,
+            .{},
         );
         if (!abort_status_is_clean(outcome.status)) return error.StorageFailure;
         self.multipart = null;
@@ -751,10 +776,11 @@ pub const S3Client = struct {
             .PUT,
             key,
             "",
-            self.send_workspace[0..bytes.len],
-            created_at_ms,
-            null,
-            .create_only,
+            .{
+                .payload = self.send_workspace[0..bytes.len],
+                .metadata_ms = created_at_ms,
+                .conditional = .create_only,
+            },
         );
         switch (outcome.status) {
             .ok, .created => {},
@@ -776,7 +802,7 @@ pub const S3Client = struct {
             return error.InvalidIdentity;
         }
         const key = try self.key_path(level, identity);
-        const outcome = try self.perform(.HEAD, key, "", null, null, null, .none);
+        const outcome = try self.perform(.HEAD, key, "", .{});
         if (outcome.status == .not_found) return error.ObjectNotFound;
         if (outcome.status != .ok) return error.StorageFailure;
         return outcome.etag orelse error.StorageFailure;
@@ -809,10 +835,11 @@ pub const S3Client = struct {
             .PUT,
             key,
             "",
-            self.send_workspace[0..bytes.len],
-            created_at_ms,
-            null,
-            .{ .match_etag = expected_etag },
+            .{
+                .payload = self.send_workspace[0..bytes.len],
+                .metadata_ms = created_at_ms,
+                .conditional = .{ .match_etag = expected_etag },
+            },
         );
         switch (outcome.status) {
             .ok => {},
@@ -832,7 +859,7 @@ pub const S3Client = struct {
                 info.level,
                 .{ .min_txid = info.min_txid, .max_txid = info.max_txid },
             );
-            const outcome = try self.perform(.DELETE, key, "", null, null, null, .none);
+            const outcome = try self.perform(.DELETE, key, "", .{});
             switch (outcome.status) {
                 // S3 answers a successful delete with 204 No Content.
                 .ok, .no_content, .not_found => {},
@@ -841,14 +868,34 @@ pub const S3Client = struct {
         }
     }
 
+    const ByteRange = struct {
+        start_bytes: u64,
+        end_bytes: u64,
+    };
+
+    const ContentRange = struct {
+        start_bytes: u64,
+        end_bytes: u64,
+        total_bytes: u64,
+    };
+
+    const RequestOptions = struct {
+        payload: ?[]u8 = null,
+        metadata_ms: ?i64 = null,
+        body_destination: ?[]u8 = null,
+        conditional: Conditional = .none,
+        byte_range: ?ByteRange = null,
+    };
+
     const Outcome = struct {
         status: std.http.Status,
-        /// Response bytes when a body destination was supplied and the
-        /// status was OK; otherwise empty.
+        /// Response bytes when a body destination was supplied and the status
+        /// was OK or an expected partial-content response; otherwise empty.
         bytes: []const u8 = &.{},
         /// The `ETag` response header when present, copied into client
         /// storage and valid until the next request.
         etag: ?[]const u8 = null,
+        content_range: ?ContentRange = null,
     };
 
     /// Signs and performs one request, retrying transient failures when a
@@ -860,12 +907,9 @@ pub const S3Client = struct {
         method: std.http.Method,
         key: []const u8,
         query: []const u8,
-        payload: ?[]u8,
-        metadata_ms: ?i64,
-        body_destination: ?[]u8,
-        conditional: Conditional,
+        options: RequestOptions,
     ) Error!Outcome {
-        switch (conditional) {
+        switch (options.conditional) {
             .none => {},
             .create_only, .match_etag => unreachable,
         }
@@ -874,10 +918,7 @@ pub const S3Client = struct {
                 method,
                 key,
                 query,
-                payload,
-                metadata_ms,
-                body_destination,
-                conditional,
+                options,
             ) catch |err| switch (err) {
                 error.PublicationIndeterminate => unreachable,
                 else => |other| return other,
@@ -888,17 +929,20 @@ pub const S3Client = struct {
                 method,
                 key,
                 query,
-                payload,
-                metadata_ms,
-                body_destination,
-                conditional,
+                options,
             ) catch |err| {
                 const definite_error: Error = switch (err) {
                     error.PublicationIndeterminate => unreachable,
                     else => |other| other,
                 };
                 if (definite_error != error.StorageFailure) return definite_error;
-                if (retry_delay(policy, attempt, .transport, method, conditional)) |delay| {
+                if (retry_delay(
+                    policy,
+                    attempt,
+                    .transport,
+                    method,
+                    options.conditional,
+                )) |delay| {
                     try policy.sleep_ms(delay);
                     continue;
                 }
@@ -909,7 +953,7 @@ pub const S3Client = struct {
             if (retryable) {
                 if (retry_delay(policy, attempt, .{
                     .status = @intFromEnum(outcome.status),
-                }, method, conditional)) |delay| {
+                }, method, options.conditional)) |delay| {
                     try policy.sleep_ms(delay);
                     continue;
                 }
@@ -926,25 +970,15 @@ pub const S3Client = struct {
         method: std.http.Method,
         key: []const u8,
         query: []const u8,
-        payload: ?[]u8,
-        metadata_ms: ?i64,
-        body_destination: ?[]u8,
-        conditional: Conditional,
+        options: RequestOptions,
     ) ConditionalWriteError!Outcome {
         std.debug.assert(method == .PUT);
-        switch (conditional) {
+        switch (options.conditional) {
             .none => unreachable,
             .create_only, .match_etag => {},
         }
-        return self.perform_once(
-            method,
-            key,
-            query,
-            payload,
-            metadata_ms,
-            body_destination,
-            conditional,
-        );
+        std.debug.assert(options.byte_range == null);
+        return self.perform_once(method, key, query, options);
     }
 
     /// Signs and performs exactly one request attempt.
@@ -953,10 +987,7 @@ pub const S3Client = struct {
         method: std.http.Method,
         key: []const u8,
         query: []const u8,
-        payload: ?[]u8,
-        metadata_ms: ?i64,
-        body_destination: ?[]u8,
-        conditional: Conditional,
+        options: RequestOptions,
     ) ConditionalWriteError!Outcome {
         const now_ms = self.config.clock.now_ms();
         var amz_date: [amz_date_bytes]u8 = undefined;
@@ -965,13 +996,22 @@ pub const S3Client = struct {
         // wall clock for every new or reused HTTP request.
         self.http.now = timestamp_from_unix_ms(now_ms);
         var payload_hash: [sha256_hex_bytes]u8 = undefined;
-        sha256_hex(payload orelse "", &payload_hash);
+        sha256_hex(options.payload orelse "", &payload_hash);
 
         var timestamp_buffer: [24]u8 = undefined;
         var timestamp_text: []const u8 = "";
-        if (metadata_ms) |value| {
+        if (options.metadata_ms) |value| {
             timestamp_text = try format_litestream_timestamp(value, &timestamp_buffer);
         }
+
+        var range_buffer: [48]u8 = undefined;
+        const range_text: ?[]const u8 = if (options.byte_range) |byte_range|
+            std.fmt.bufPrint(&range_buffer, "bytes={d}-{d}", .{
+                byte_range.start_bytes,
+                byte_range.end_bytes,
+            }) catch return error.StorageFailure
+        else
+            null;
 
         var path_buffer: [1024]u8 = undefined;
         var host_buffer: [256]u8 = undefined;
@@ -997,12 +1037,13 @@ pub const S3Client = struct {
             query,
             &amz_date,
             &payload_hash,
-            if (metadata_ms == null) null else timestamp_text,
-            conditional,
+            if (options.metadata_ms == null) null else timestamp_text,
+            options.conditional,
+            range_text,
             host_header,
         );
 
-        var extra_headers: [4]std.http.Header = undefined;
+        var extra_headers: [5]std.http.Header = undefined;
         var extra_count: usize = 0;
         extra_headers[extra_count] = .{
             .name = "x-amz-date",
@@ -1014,14 +1055,14 @@ pub const S3Client = struct {
             .value = &payload_hash,
         };
         extra_count += 1;
-        if (metadata_ms != null) {
+        if (options.metadata_ms != null) {
             extra_headers[extra_count] = .{
                 .name = "x-amz-meta-litestream-timestamp",
                 .value = timestamp_text,
             };
             extra_count += 1;
         }
-        switch (conditional) {
+        switch (options.conditional) {
             .none => {},
             .create_only => {
                 extra_headers[extra_count] = .{
@@ -1037,6 +1078,13 @@ pub const S3Client = struct {
                 };
                 extra_count += 1;
             },
+        }
+        if (range_text) |text| {
+            extra_headers[extra_count] = .{
+                .name = "range",
+                .value = text,
+            };
+            extra_count += 1;
         }
 
         const uri = std.Uri{
@@ -1057,40 +1105,64 @@ pub const S3Client = struct {
         }) catch return error.StorageFailure;
         defer request.deinit();
 
-        if (payload) |body| {
+        if (options.payload) |body| {
             request.sendBodyComplete(body) catch
-                return post_send_failure(conditional);
+                return post_send_failure(options.conditional);
         } else if (method.requestHasBody()) {
             // PUT without a payload still carries a zero-length body.
             const empty = self.send_workspace[0..0];
             request.sendBodyComplete(empty) catch
-                return post_send_failure(conditional);
+                return post_send_failure(options.conditional);
         } else {
-            request.sendBodiless() catch return post_send_failure(conditional);
+            request.sendBodiless() catch
+                return post_send_failure(options.conditional);
         }
         var response = request.receiveHead(&self.redirect_buffer) catch
-            return post_send_failure(conditional);
+            return post_send_failure(options.conditional);
         const status = response.head.status;
         mark_bodyless_response_complete(&request, method, status);
         var etag: ?[]const u8 = null;
+        var content_range: ?ContentRange = null;
         var header_iterator = response.head.iterateHeaders();
         while (header_iterator.next()) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "etag")) {
                 const length = @min(header.value.len, self.etag_workspace.len);
                 @memcpy(self.etag_workspace[0..length], header.value[0..length]);
                 etag = self.etag_workspace[0..length];
-                break;
+            } else if (status == .partial_content and
+                std.ascii.eqlIgnoreCase(header.name, "content-range"))
+            {
+                if (content_range != null) return error.StorageFailure;
+                content_range = try parse_content_range(header.value);
             }
         }
-        if (status != .ok) return .{ .status = status };
-        const destination = body_destination orelse
-            return .{ .status = status, .etag = etag };
+        const readable_status = status == .ok or
+            (options.byte_range != null and status == .partial_content);
+        if (!readable_status) return .{
+            .status = status,
+            .etag = etag,
+            .content_range = content_range,
+        };
+        const destination = options.body_destination orelse return .{
+            .status = status,
+            .etag = etag,
+            .content_range = content_range,
+        };
         const reader = response.reader(&self.transfer_buffer);
-        const bytes = try read_bounded_response_body(reader, destination);
+        const bytes = read_bounded_response_body(reader, destination) catch |err| {
+            if (options.byte_range != null and err == error.ObjectTooLarge) {
+                return error.StorageFailure;
+            }
+            return err;
+        };
+        if (options.byte_range != null and bytes.len != destination.len) {
+            return error.StorageFailure;
+        }
         return .{
             .status = status,
             .bytes = bytes,
             .etag = etag,
+            .content_range = content_range,
         };
     }
 
@@ -1105,6 +1177,7 @@ pub const S3Client = struct {
         payload_hash: *const [sha256_hex_bytes]u8,
         timestamp_text: ?[]const u8,
         conditional: Conditional,
+        range_text: ?[]const u8,
         host_header: []const u8,
     ) Error![]const u8 {
         var canonical_offset: usize = 0;
@@ -1138,6 +1211,10 @@ pub const S3Client = struct {
                 try append_canonical(canonical, &canonical_offset, etag);
             },
         }
+        if (range_text) |text| {
+            try append_canonical(canonical, &canonical_offset, "\nrange:");
+            try append_canonical(canonical, &canonical_offset, text);
+        }
         try append_canonical(
             canonical,
             &canonical_offset,
@@ -1160,7 +1237,11 @@ pub const S3Client = struct {
             .create_only => "if-none-match",
             .match_etag => "if-match",
         };
-        const signed_headers = signed_headers_text(timestamp_text != null, conditional_name);
+        const signed_headers = signed_headers_text(
+            timestamp_text != null,
+            conditional_name,
+            range_text != null,
+        );
         try append_canonical(canonical, &canonical_offset, "\n\n");
         try append_canonical(canonical, &canonical_offset, signed_headers);
         try append_canonical(canonical, &canonical_offset, "\n");
@@ -1201,6 +1282,44 @@ pub const S3Client = struct {
             .{ self.config.access_key, scope, signed_headers, &signature },
         ) catch return error.StorageFailure;
         return authorization;
+    }
+
+    fn parse_content_range(value: []const u8) Error!ContentRange {
+        if (!std.mem.startsWith(u8, value, "bytes ")) {
+            return error.StorageFailure;
+        }
+        const fields = value["bytes ".len..];
+        const slash = std.mem.indexOfScalar(u8, fields, '/') orelse
+            return error.StorageFailure;
+        if (std.mem.indexOfScalar(u8, fields[slash + 1 ..], '/') != null) {
+            return error.StorageFailure;
+        }
+        const interval = fields[0..slash];
+        const dash = std.mem.indexOfScalar(u8, interval, '-') orelse
+            return error.StorageFailure;
+        if (std.mem.indexOfScalar(u8, interval[dash + 1 ..], '-') != null) {
+            return error.StorageFailure;
+        }
+        const start_bytes = try parse_decimal_u64(interval[0..dash]);
+        const end_bytes = try parse_decimal_u64(interval[dash + 1 ..]);
+        const total_bytes = try parse_decimal_u64(fields[slash + 1 ..]);
+        if (start_bytes > end_bytes or end_bytes >= total_bytes) {
+            return error.StorageFailure;
+        }
+        return .{
+            .start_bytes = start_bytes,
+            .end_bytes = end_bytes,
+            .total_bytes = total_bytes,
+        };
+    }
+
+    fn parse_decimal_u64(value: []const u8) Error!u64 {
+        if (value.len == 0) return error.StorageFailure;
+        for (value) |byte| {
+            if (!std.ascii.isDigit(byte)) return error.StorageFailure;
+        }
+        return std.fmt.parseInt(u64, value, 10) catch
+            error.StorageFailure;
     }
 
     const ListPage = struct {
@@ -1604,18 +1723,37 @@ fn append_canonical(destination: []u8, offset: *usize, bytes: []const u8) Error!
 fn signed_headers_text(
     has_metadata: bool,
     conditional_name: ?[]const u8,
+    has_range: bool,
 ) []const u8 {
     if (conditional_name) |name| {
         if (std.mem.eql(u8, name, "if-match")) {
+            if (has_range) {
+                return if (has_metadata)
+                    "host;if-match;range;x-amz-content-sha256;x-amz-date;x-amz-meta-litestream-timestamp"
+                else
+                    "host;if-match;range;x-amz-content-sha256;x-amz-date";
+            }
             return if (has_metadata)
                 "host;if-match;x-amz-content-sha256;x-amz-date;x-amz-meta-litestream-timestamp"
             else
                 "host;if-match;x-amz-content-sha256;x-amz-date";
         }
+        if (has_range) {
+            return if (has_metadata)
+                "host;if-none-match;range;x-amz-content-sha256;x-amz-date;x-amz-meta-litestream-timestamp"
+            else
+                "host;if-none-match;range;x-amz-content-sha256;x-amz-date";
+        }
         return if (has_metadata)
             "host;if-none-match;x-amz-content-sha256;x-amz-date;x-amz-meta-litestream-timestamp"
         else
             "host;if-none-match;x-amz-content-sha256;x-amz-date";
+    }
+    if (has_range) {
+        return if (has_metadata)
+            "host;range;x-amz-content-sha256;x-amz-date;x-amz-meta-litestream-timestamp"
+        else
+            "host;range;x-amz-content-sha256;x-amz-date";
     }
     return if (has_metadata)
         "host;x-amz-content-sha256;x-amz-date;x-amz-meta-litestream-timestamp"
@@ -1987,19 +2125,54 @@ test "multipart abort treats a missing upload as already clean" {
 test "signed header lists stay alphabetical across conditional variants" {
     try std.testing.expectEqualStrings(
         "host;x-amz-content-sha256;x-amz-date",
-        signed_headers_text(false, null),
+        signed_headers_text(false, null, false),
     );
     try std.testing.expectEqualStrings(
         "host;if-match;x-amz-content-sha256;x-amz-date",
-        signed_headers_text(false, "if-match"),
+        signed_headers_text(false, "if-match", false),
     );
     try std.testing.expectEqualStrings(
         "host;if-none-match;x-amz-content-sha256;x-amz-date",
-        signed_headers_text(false, "if-none-match"),
+        signed_headers_text(false, "if-none-match", false),
     );
     try std.testing.expectEqualStrings(
         "host;if-none-match;x-amz-content-sha256;x-amz-date;x-amz-meta-litestream-timestamp",
-        signed_headers_text(true, "if-none-match"),
+        signed_headers_text(true, "if-none-match", false),
+    );
+    try std.testing.expectEqualStrings(
+        "host;range;x-amz-content-sha256;x-amz-date",
+        signed_headers_text(false, null, true),
+    );
+    try std.testing.expectEqualStrings(
+        "host;if-match;range;x-amz-content-sha256;x-amz-date",
+        signed_headers_text(false, "if-match", true),
+    );
+}
+
+test "content range parsing is strict and bounded" {
+    try std.testing.expectEqual(
+        S3Client.ContentRange{
+            .start_bytes = 7,
+            .end_bytes = 9,
+            .total_bytes = 20,
+        },
+        try S3Client.parse_content_range("bytes 7-9/20"),
+    );
+    try std.testing.expectError(
+        error.StorageFailure,
+        S3Client.parse_content_range("bytes */20"),
+    );
+    try std.testing.expectError(
+        error.StorageFailure,
+        S3Client.parse_content_range("bytes 9-7/20"),
+    );
+    try std.testing.expectError(
+        error.StorageFailure,
+        S3Client.parse_content_range("bytes 7-20/20"),
+    );
+    try std.testing.expectError(
+        error.StorageFailure,
+        S3Client.parse_content_range("octets 7-9/20"),
     );
 }
 

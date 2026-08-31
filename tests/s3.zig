@@ -134,6 +134,243 @@ fn delete_identity(client: ltx_object.Client, identity: ltx.FileIdentity) !void 
     }});
 }
 
+fn object_info(
+    identity: ltx.FileIdentity,
+    size_bytes: usize,
+) ltx.FileInfo {
+    return .{
+        .level = 0,
+        .min_txid = identity.min_txid,
+        .max_txid = identity.max_txid,
+        .size_bytes = @intCast(size_bytes),
+    };
+}
+
+const ScriptedRangeResponse = struct {
+    status: std.http.Status,
+    headers: []const std.http.Header = &.{},
+    body: []const u8,
+    expected_range: []const u8 = "bytes=0-2",
+};
+
+fn request_has_exact_range(
+    request: *const std.http.Server.Request,
+    expected: []const u8,
+) bool {
+    var found: ?[]const u8 = null;
+    var headers = request.iterateHeaders();
+    while (headers.next()) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "range")) continue;
+        if (found != null) return false;
+        found = header.value;
+    }
+    return if (found) |value| std.mem.eql(u8, value, expected) else false;
+}
+
+fn serve_scripted_range_responses(
+    server: *std.Io.net.Server,
+    responses: []const ScriptedRangeResponse,
+) !void {
+    for (responses) |response| {
+        var stream = try server.accept(std.testing.io);
+        defer stream.close(std.testing.io);
+        var read_buffer: [4096]u8 = undefined;
+        var write_buffer: [4096]u8 = undefined;
+        var stream_reader = stream.reader(std.testing.io, &read_buffer);
+        var stream_writer = stream.writer(std.testing.io, &write_buffer);
+        var http_server = std.http.Server.init(
+            &stream_reader.interface,
+            &stream_writer.interface,
+        );
+        var request = try http_server.receiveHead();
+        const valid_request = request.head.method == .GET and
+            request_has_exact_range(&request, response.expected_range);
+        try request.respond(response.body, .{
+            .status = response.status,
+            .keep_alive = false,
+            .extra_headers = response.headers,
+        });
+        if (!valid_request) return error.TestUnexpectedResult;
+    }
+}
+
+fn expect_scripted_range_error(
+    response: ScriptedRangeResponse,
+    expected_error: ltx_object.Error,
+) !void {
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const responses = [_]ScriptedRangeResponse{response};
+    var server_task = std.testing.io.async(
+        serve_scripted_range_responses,
+        .{ &server, &responses },
+    );
+    defer _ = server_task.cancel(std.testing.io) catch {};
+
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try ltx_s3.S3Client.init(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .host = "127.0.0.1",
+            .port = server.socket.address.getPort(),
+            .bucket = "scripted-range",
+            .access_key = "test-access",
+            .secret_key = "test-secret",
+            .clock = .{
+                .context = &plain_clock_context,
+                .now_ms_fn = TestClock.now_ms,
+            },
+        },
+        &send_workspace,
+    );
+    defer s3.deinit();
+    var destination: [3]u8 = undefined;
+    const result = s3.client().read_range(
+        object_info(.{ .min_txid = .init(1), .max_txid = .init(1) }, 6),
+        0,
+        &destination,
+    );
+    try server_task.cancel(std.testing.io);
+    try std.testing.expectError(expected_error, result);
+}
+
+const valid_range_header = [_]std.http.Header{.{
+    .name = "content-range",
+    .value = "bytes 0-2/6",
+}};
+
+const duplicate_range_headers = [_]std.http.Header{
+    .{ .name = "content-range", .value = "bytes 0-2/6" },
+    .{ .name = "Content-Range", .value = "bytes 0-2/6" },
+};
+
+const mismatched_interval_header = [_]std.http.Header{.{
+    .name = "content-range",
+    .value = "bytes 1-3/6",
+}};
+
+const mismatched_total_header = [_]std.http.Header{.{
+    .name = "content-range",
+    .value = "bytes 0-2/7",
+}};
+
+const second_mismatched_total_header = [_]std.http.Header{.{
+    .name = "content-range",
+    .value = "bytes 3-5/7",
+}};
+
+test "scripted S3 range read rejects a whole-object success response" {
+    try expect_scripted_range_error(.{
+        .status = .ok,
+        .body = "abc",
+    }, error.StorageFailure);
+}
+
+test "scripted S3 range read requires exactly one Content-Range header" {
+    try expect_scripted_range_error(.{
+        .status = .partial_content,
+        .body = "abc",
+    }, error.StorageFailure);
+    try expect_scripted_range_error(.{
+        .status = .partial_content,
+        .headers = &duplicate_range_headers,
+        .body = "abc",
+    }, error.StorageFailure);
+}
+
+test "scripted S3 range read validates the complete Content-Range value" {
+    try expect_scripted_range_error(.{
+        .status = .partial_content,
+        .headers = &mismatched_interval_header,
+        .body = "abc",
+    }, error.StorageFailure);
+    try expect_scripted_range_error(.{
+        .status = .partial_content,
+        .headers = &mismatched_total_header,
+        .body = "abc",
+    }, error.ObjectChanged);
+}
+
+test "scripted S3 range read rejects short and oversized response bodies" {
+    try expect_scripted_range_error(.{
+        .status = .partial_content,
+        .headers = &valid_range_header,
+        .body = "ab",
+    }, error.StorageFailure);
+    try expect_scripted_range_error(.{
+        .status = .partial_content,
+        .headers = &valid_range_header,
+        .body = "abcd",
+    }, error.StorageFailure);
+}
+
+test "scripted S3 object reader poisons without exposing failed range bytes" {
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    var server_open = true;
+    defer if (server_open) server.deinit(std.testing.io);
+    const responses = [_]ScriptedRangeResponse{
+        .{
+            .status = .partial_content,
+            .headers = &valid_range_header,
+            .body = "abc",
+        },
+        .{
+            .status = .partial_content,
+            .headers = &second_mismatched_total_header,
+            .body = "def",
+            .expected_range = "bytes=3-5",
+        },
+    };
+    var server_task = std.testing.io.async(
+        serve_scripted_range_responses,
+        .{ &server, &responses },
+    );
+    defer _ = server_task.cancel(std.testing.io) catch {};
+
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try ltx_s3.S3Client.init(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .host = "127.0.0.1",
+            .port = server.socket.address.getPort(),
+            .bucket = "scripted-reader",
+            .access_key = "test-access",
+            .secret_key = "test-secret",
+            .clock = .{
+                .context = &plain_clock_context,
+                .now_ms_fn = TestClock.now_ms,
+            },
+        },
+        &send_workspace,
+    );
+    defer s3.deinit();
+
+    const info = object_info(.{ .min_txid = .init(2), .max_txid = .init(2) }, 6);
+    var workspace: [3]u8 = undefined;
+    var source = try ltx_object.ObjectReader.init(s3.client(), info, &workspace);
+    const reader = source.reader();
+    var output: [6]u8 = @splat(0xcc);
+    try std.testing.expectEqual(@as(usize, 3), try reader.read(&output));
+    try std.testing.expectEqualStrings("abc", output[0..3]);
+    try std.testing.expectError(error.InputFailure, reader.read(output[3..]));
+    try server_task.cancel(std.testing.io);
+    server.deinit(std.testing.io);
+    server_open = false;
+    try std.testing.expectEqual(error.ObjectChanged, source.failure().?);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xcc} ** 3), output[3..]);
+    try std.testing.expectEqualStrings("def", &workspace);
+
+    var late: [3]u8 = @splat(0x5a);
+    try std.testing.expectError(error.InputFailure, reader.read(&late));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x5a} ** 3), &late);
+    try std.testing.expectEqual(error.ObjectChanged, source.failure().?);
+    try std.testing.expectError(error.InputFailure, reader.at_end());
+}
+
 test "listing stops at the configured remote page budget" {
     var send_workspace: [64]u8 = undefined;
     var s3 = try ltx_s3.S3Client.init(
@@ -182,6 +419,64 @@ test "listing stops at the configured remote page budget" {
     try std.testing.expectEqual(
         @as(usize, 2),
         (try client.list(0, ltx.TXID.init(0), &infos)).len,
+    );
+}
+
+test "range and whole reads honor the listed object size" {
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try ltx_s3.S3Client.init(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .host = minio_host,
+            .port = minio_port,
+            .bucket = "ltx-gate",
+            .access_key = minio_root_user,
+            .secret_key = minio_root_password,
+            .prefix = "range-read",
+            .clock = .{
+                .context = &plain_clock_context,
+                .now_ms_fn = TestClock.now_ms,
+            },
+        },
+        &send_workspace,
+    );
+    defer s3.deinit();
+    try s3.ensure_bucket();
+
+    const client = s3.client();
+    const identity = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(1),
+        .max_txid = ltx.TXID.init(1),
+    };
+    const payload = "range-0123456789-end";
+    try delete_identity(client, identity);
+    defer delete_identity(client, identity) catch {};
+    try client.write(0, identity, 1, payload);
+
+    var listed_storage: [1]ltx.FileInfo = undefined;
+    const listed = try client.list(0, ltx.TXID.init(0), &listed_storage);
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expectEqual(@as(u64, payload.len), listed[0].size_bytes);
+
+    var middle: [3]u8 = undefined;
+    try client.read_range(listed[0], 8, &middle);
+    try std.testing.expectEqualStrings("234", &middle);
+    var one: [1]u8 = undefined;
+    try client.read_range(listed[0], payload.len - 1, &one);
+    try std.testing.expectEqualStrings("d", &one);
+
+    var all_storage: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        payload,
+        try client.read_all(listed[0], &all_storage),
+    );
+
+    var stale = listed[0];
+    stale.size_bytes += 1;
+    try std.testing.expectError(
+        error.ObjectChanged,
+        client.read_range(stale, 0, &one),
     );
 }
 
@@ -256,10 +551,7 @@ test "s3 backend passes the conformance suite and a plan round trip" {
     try std.testing.expectEqual(@as(usize, 2), plan.len);
 
     var object_storage: [4096]u8 = undefined;
-    const first = try client.open(0, .{
-        .min_txid = ltx.TXID.init(1),
-        .max_txid = ltx.TXID.init(1),
-    }, &object_storage);
+    const first = try client.read_all(plan[0], &object_storage);
     try std.testing.expectEqualSlices(u8, snapshot_sink.written(), first);
 
     // Conditional writes: the first fence claim wins, the second contender
@@ -273,7 +565,7 @@ test "s3 backend passes the conformance suite and a plan round trip" {
         error.ObjectExists,
         s3.put_if_absent(0, fence, 5100, "contender"),
     );
-    const claimed = try client.open(0, fence, &object_storage);
+    const claimed = try client.read_all(object_info(fence, "claim".len), &object_storage);
     try std.testing.expectEqualStrings("claim", claimed);
     try client.write(0, fence, 5200, "overwrite");
 }
@@ -405,7 +697,10 @@ test "multipart upload streams parts into one readable object" {
     try std.testing.expect(s3.multipart == null);
 
     const client = s3.client();
-    const stored = try client.open(0, identity, &multipart_recv);
+    const stored = try client.read_all(
+        object_info(identity, multipart_recv.len),
+        &multipart_recv,
+    );
     try std.testing.expectEqual(@as(usize, multipart_recv.len), stored.len);
     try std.testing.expectEqualSlices(u8, &multipart_a, stored[0..multipart_part_bytes]);
     try std.testing.expectEqualSlices(u8, &multipart_b, stored[multipart_part_bytes..][0..multipart_part_bytes]);
@@ -470,7 +765,7 @@ test "write session publishes a small stream with one PUT at finish" {
     var received: [64]u8 = undefined;
     try std.testing.expectError(
         error.ObjectNotFound,
-        client.open(0, identity, &received),
+        client.read_all(object_info(identity, 1), &received),
     );
 
     try session.finish();
@@ -481,7 +776,10 @@ test "write session publishes a small stream with one PUT at finish" {
     try std.testing.expect(s3.multipart == null);
     try std.testing.expectEqualStrings(
         "transactional small object",
-        try client.open(0, identity, &received),
+        try client.read_all(
+            object_info(identity, "transactional small object".len),
+            &received,
+        ),
     );
 }
 
@@ -510,12 +808,15 @@ test "write session automatically publishes more than two multipart parts" {
     try std.testing.expectEqual(@as(u32, 2), s3.multipart.?.part_count);
     try std.testing.expectError(
         error.ObjectNotFound,
-        client.open(0, identity, &multipart_recv),
+        client.read_all(object_info(identity, multipart_recv.len), &multipart_recv),
     );
 
     try session.finish();
     try std.testing.expect(s3.multipart == null);
-    const stored = try client.open(0, identity, &multipart_recv);
+    const stored = try client.read_all(
+        object_info(identity, multipart_recv.len),
+        &multipart_recv,
+    );
     try std.testing.expectEqual(@as(usize, multipart_recv.len), stored.len);
     try std.testing.expectEqualSlices(u8, &multipart_a, stored[0..multipart_part_bytes]);
     try std.testing.expectEqualSlices(
@@ -557,7 +858,7 @@ test "write session abort removes automatic multipart private state" {
     try std.testing.expect(s3.multipart == null);
     try std.testing.expectError(
         error.ObjectNotFound,
-        client.open(0, identity, &multipart_recv),
+        client.read_all(object_info(identity, multipart_recv.len), &multipart_recv),
     );
 }
 
@@ -671,7 +972,7 @@ test "write session capacity failure poisons and cleans private state" {
     var received: [1]u8 = undefined;
     try std.testing.expectError(
         error.ObjectNotFound,
-        client.open(0, identity, &received),
+        client.read_all(object_info(identity, received.len), &received),
     );
 
     var replacement = try client.begin_write(0, identity, 1_235_001);
@@ -728,7 +1029,7 @@ test "a configured retry policy is not consulted on success" {
     var storage: [64]u8 = undefined;
     try std.testing.expectEqualStrings(
         "retry-probe",
-        try client.open(0, identity, &storage),
+        try client.read_all(object_info(identity, "retry-probe".len), &storage),
     );
     try client.delete(&.{.{
         .level = 0,
@@ -782,7 +1083,7 @@ test "etag replace renews only against the observed generation" {
     try s3.put_if_match(0, identity, 7100, "second", etag_one[0..etag_len(&etag_one)]);
     try std.testing.expectEqualStrings(
         "second",
-        try client.open(0, identity, &storage),
+        try client.read_all(object_info(identity, "second".len), &storage),
     );
 
     var etag_two: [128]u8 = @splat(0);
@@ -803,7 +1104,7 @@ test "etag replace renews only against the observed generation" {
     );
     try std.testing.expectEqualStrings(
         "contender",
-        try client.open(0, identity, &storage),
+        try client.read_all(object_info(identity, "contender".len), &storage),
     );
     try client.delete(&.{.{
         .level = 0,

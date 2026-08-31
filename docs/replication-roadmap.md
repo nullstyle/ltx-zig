@@ -3,9 +3,9 @@
 This roadmap records the completed extension of `ltx-zig` from an LTX codec
 toolkit into bounded SQLite-to-object-store replication building blocks,
 informed by the pinned `denoland/celld` LTX crate and exposed as an embeddable
-library rather than a daemon. The M1–M6 stack is shipped: the original
+library rather than a daemon. The M1–M7 stack is shipped: the original
 foundations, a public checked resource binder, transactional object writes,
-and a synchronous per-database controller.
+bounded object reads, and a synchronous per-database controller.
 
 The consumer built above this library — for example, a stateful actor system
 giving each actor its own SQLite database — owns which databases exist, when
@@ -41,7 +41,7 @@ Out of scope (consumer):
 | --- | --- | --- |
 | `ltx_wal` (M1) | `wal.rs` | WAL header/frame parsing, salts, cumulative checksum chains, committed page map (bitmap plus entries, newest-wins, caller-owned), salt census for checkpoint detection, torn-tail tolerance, and mid-WAL resume seeding. |
 | `ltx_capture` (M2) | `db.rs` | WAL-mode open, `_litestream_seq`/`_litestream_lock` control tables, a checkpoint-blocking read lock, snapshot and incremental collection with database-file fallback and grown pages, foreign-discontinuity snapshot fallback, seeded continuation after restore, mid-WAL resume, three-tier passive checkpoint policy, and atomic L0 publication. The Celld writer barrier is intentionally omitted for the single-writer-per-database model. |
-| `ltx_object`, `ltx_s3` (M3/M6) | `client/*` | The object-client contract and filesystem backend plus S3-compatible path-style and virtual-host SigV4, bounded paginated `ListObjectsV2`, whole-object reads, idempotent per-object deletes, conditional create/replace, TLS, bounded retry, `litestream-timestamp` metadata, and transactional writer sessions that publish through filesystem staging or automatic single/multipart upload. |
+| `ltx_object`, `ltx_s3` (M3/M6/M7) | `client/*` | The object-client contract and filesystem backend plus S3-compatible path-style and virtual-host SigV4, bounded paginated `ListObjectsV2`, exact ranged reads with bounded sequential reader windows, idempotent per-object deletes, conditional create/replace, TLS, bounded retry, `litestream-timestamp` metadata, and transactional writer sessions that publish through filesystem staging or automatic single/multipart upload. |
 | `ltx_replica` (M4) | `replica.rs`, `replica_compactor.rs`, `compaction_level.rs` | Restore planning and generic staged-apply execution, the level ladder (L0/L1/L2/L3 plus snapshot level 9), bounded level compaction over the existing `Compactor`, and retention planning. |
 | `ltx_resources` (M6) | — | Checked public codec, apply, WAL, and wire capacity formulas plus an alignment-aware fixed-arena binder. |
 | `ltx_replication` (M6) | `replica.rs`, `db.rs` | One synchronous controller for empty, verified-local, or restore-latest startup; capture and trusted position; all-level restore; caller-selected adjacent-level compaction; and publish-before-delete retention. Scheduling, fencing, and acknowledgement stay outside. |
@@ -93,6 +93,7 @@ and `resource-check` verifies them.
 | M4 — `ltx_replica` ✅ | Level ladder, `calc_restore_plan`, compaction and retention planners, restore-to-path through `StagedApplier`, level compaction through `Compactor`, core naming helpers (`FileInfo`, filename codec, level layouts, TXID text). | Planner truth tables ported from Celld; end-to-end encode → store → plan → restore → compact → retain tests with exact-image verification. |
 | M5 — consolidation ✅ | This roadmap, engineering rules, upstream evidence, resource budgets, the `replicate-once` consumer template, and [`replication.md`](replication.md) as the deployment contract. | `fmt-check`, `test`, `resource-check`, `fuzz`, `capture-integration`, `s3-integration`, `consumer-smoke`, Litestream interoperability, and canonical source-archive qualification. |
 | M6 — orchestration and bounded publication ✅ | Public resource formulas and fixed-arena binding; exact object sizes; generic identity-checked restore; transactional filesystem and S3 writer sessions; direct capture/compaction publication; and the `ltx_replication.Controller`. | Hermetic session and planner tests, live SQLite controller lifecycle, zero-output-buffer capture, automatic MinIO single/multipart publication, scale qualification, consumer wiring, and release gates. |
+| M7 — bounded object reads ✅ | Exact range reads in the object contract; an allocation-free sequential `ObjectReader` poisoned by range failures; filesystem positional reads; signed S3 single-range GETs with exact `Content-Range` validation; and restore/compaction input windows sized independently of the accepted object limit. | Backend conformance and malformed-range tests, MinIO range qualification, tiny-window restore and interleaved compaction, controller capacity and alias checks, scale qualification, and release gates. |
 
 Normal tests stay network-free. The dedicated S3/MinIO gate and
 Litestream-binary interoperability gate are implemented and run in hosted CI;
@@ -100,8 +101,7 @@ their external tools remain outside the hermetic unit-test step.
 
 ## Candidate next increments
 
-No post-M6 feature sprint is committed. The remaining high-value candidates
-are bounded range/streaming reads to remove whole-object restore and compaction
-input buffers, fault-injection qualification around interrupted controller
-maintenance and remote multipart publication, and controller-level resource
-view helpers that bind a complete `Resources` value from one fixed arena.
+No post-M7 feature sprint is committed. The remaining high-value candidates
+are fault-injection qualification around interrupted controller maintenance
+and remote multipart publication, and controller-level resource view helpers
+that bind a complete `Resources` value from one fixed arena.

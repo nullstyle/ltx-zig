@@ -17,6 +17,29 @@ const encoder_limits = ltx.Limits{
     .max_transaction_span = 8,
 };
 
+fn file_info(
+    level: u8,
+    identity: ltx.FileIdentity,
+    size_bytes: u64,
+) ltx.FileInfo {
+    return .{
+        .level = level,
+        .min_txid = identity.min_txid,
+        .max_txid = identity.max_txid,
+        .size_bytes = size_bytes,
+    };
+}
+
+fn read_object(
+    client: object.Client,
+    level: u8,
+    identity: ltx.FileIdentity,
+    size_bytes: u64,
+    destination: []u8,
+) object.Error![]const u8 {
+    return client.read_all(file_info(level, identity, size_bytes), destination);
+}
+
 const FailingWriteBackend = struct {
     fail_write: bool = false,
     fail_finish: bool = false,
@@ -49,6 +72,60 @@ const FailingWriteBackend = struct {
     fn abort(context: *anyopaque) void {
         const self: *FailingWriteBackend = @ptrCast(@alignCast(context));
         self.abort_count += 1;
+    }
+};
+
+const FailingReadBackend = struct {
+    bytes: []const u8,
+    fail_at_call: ?u32 = null,
+    call_count: u32 = 0,
+
+    fn client(self: *FailingReadBackend) object.Client {
+        return .{
+            .context = self,
+            .list_fn = list,
+            .read_range_fn = read_range,
+            .write_fn = write,
+            .delete_fn = delete,
+        };
+    }
+
+    fn list(
+        _: *anyopaque,
+        _: u8,
+        _: ltx.TXID,
+        destination: []ltx.FileInfo,
+    ) object.Error![]const ltx.FileInfo {
+        return destination[0..0];
+    }
+
+    fn read_range(
+        context: *anyopaque,
+        info: ltx.FileInfo,
+        offset_bytes: u64,
+        destination: []u8,
+    ) object.Error!void {
+        const self: *FailingReadBackend = @ptrCast(@alignCast(context));
+        self.call_count += 1;
+        if (self.fail_at_call == self.call_count) return error.StorageFailure;
+        if (info.size_bytes != self.bytes.len) return error.ObjectChanged;
+        const offset = std.math.cast(usize, offset_bytes) orelse
+            return error.InvalidReadRange;
+        @memcpy(destination, self.bytes[offset..][0..destination.len]);
+    }
+
+    fn write(
+        _: *anyopaque,
+        _: u8,
+        _: ltx.FileIdentity,
+        _: i64,
+        _: []const u8,
+    ) object.Error!void {
+        return error.StorageFailure;
+    }
+
+    fn delete(_: *anyopaque, _: []const ltx.FileInfo) object.Error!void {
+        return error.StorageFailure;
     }
 };
 
@@ -95,6 +172,77 @@ fn snapshot_header() ltx.Header {
     };
 }
 
+test "object reader uses a one-byte window across the complete object" {
+    var backend = FailingReadBackend{ .bytes = "bounded" };
+    const identity = ltx.FileIdentity{
+        .min_txid = .init(1),
+        .max_txid = .init(1),
+    };
+    const info = file_info(0, identity, backend.bytes.len);
+    var zero_info = info;
+    zero_info.size_bytes = 0;
+    var zero_destination: [0]u8 = .{};
+    try std.testing.expectError(
+        error.InvalidReadRange,
+        backend.client().read_all(zero_info, &zero_destination),
+    );
+    var empty_workspace: [0]u8 = .{};
+    try std.testing.expectError(
+        error.ReadWorkspaceTooSmall,
+        object.ObjectReader.init(backend.client(), info, &empty_workspace),
+    );
+
+    var workspace: [1]u8 = undefined;
+    var source = try object.ObjectReader.init(backend.client(), info, &workspace);
+    const reader = source.reader();
+    try std.testing.expect(reader.backing_is_mutable);
+    const backing = reader.backing_bytes orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(workspace.len, backing.len);
+    try std.testing.expectEqual(@intFromPtr(workspace[0..].ptr), @intFromPtr(backing.ptr));
+
+    var output: ["bounded".len]u8 = undefined;
+    var output_bytes: usize = 0;
+    var iteration_count: usize = 0;
+    while (!try reader.at_end()) : (iteration_count += 1) {
+        try std.testing.expect(iteration_count < output.len);
+        const count_bytes = try reader.read(output[output_bytes..]);
+        try std.testing.expectEqual(@as(usize, 1), count_bytes);
+        output_bytes += count_bytes;
+    }
+    try std.testing.expectEqual(output.len, output_bytes);
+    try std.testing.expectEqualStrings("bounded", &output);
+    try std.testing.expectEqual(@as(u32, output.len), backend.call_count);
+    try std.testing.expectEqual(@as(usize, 0), try reader.read(output[0..1]));
+    try std.testing.expectEqual(@as(?object.Error, null), source.failure());
+}
+
+test "object reader retains a range failure and remains poisoned" {
+    var backend = FailingReadBackend{
+        .bytes = "abcdef",
+        .fail_at_call = 2,
+    };
+    const identity = ltx.FileIdentity{
+        .min_txid = .init(2),
+        .max_txid = .init(2),
+    };
+    var workspace: [2]u8 = undefined;
+    var source = try object.ObjectReader.init(
+        backend.client(),
+        file_info(0, identity, backend.bytes.len),
+        &workspace,
+    );
+    const reader = source.reader();
+    var output: [6]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try reader.read(&output));
+    try std.testing.expectError(error.InputFailure, reader.read(output[2..]));
+    try std.testing.expectEqual(error.StorageFailure, source.failure().?);
+    try std.testing.expectEqual(@as(u32, 2), backend.call_count);
+
+    try std.testing.expectError(error.InputFailure, reader.read(output[2..]));
+    try std.testing.expectError(error.InputFailure, reader.at_end());
+    try std.testing.expectEqual(@as(u32, 2), backend.call_count);
+}
+
 test "file write session keeps chunked bytes private until finish" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -111,12 +259,18 @@ test "file write session keeps chunked bytes private until finish" {
     try session.writer().write_all("object");
 
     var storage: [32]u8 = undefined;
-    try std.testing.expectError(error.ObjectNotFound, client.open(0, identity, &storage));
+    try std.testing.expectError(
+        error.ObjectNotFound,
+        read_object(client, 0, identity, "chunked object".len, &storage),
+    );
     try session.finish();
     try std.testing.expectEqual(object.WriteSessionState.final, session.current_state());
     try std.testing.expectError(error.InvalidState, session.finish());
     session.abort();
-    try std.testing.expectEqualStrings("chunked object", try client.open(0, identity, &storage));
+    try std.testing.expectEqualStrings(
+        "chunked object",
+        try read_object(client, 0, identity, "chunked object".len, &storage),
+    );
 }
 
 test "two file clients isolate whole and session staging" {
@@ -139,17 +293,17 @@ test "two file clients isolate whole and session staging" {
     var storage: [32]u8 = undefined;
     try std.testing.expectEqualStrings(
         "whole object",
-        try second.open(0, identity, &storage),
+        try read_object(second, 0, identity, "whole object".len, &storage),
     );
     try session.writer().write_all("object");
     try std.testing.expectEqualStrings(
         "whole object",
-        try second.open(0, identity, &storage),
+        try read_object(second, 0, identity, "whole object".len, &storage),
     );
     try session.finish();
     try std.testing.expectEqualStrings(
         "session object",
-        try second.open(0, identity, &storage),
+        try read_object(second, 0, identity, "session object".len, &storage),
     );
 }
 
@@ -171,7 +325,10 @@ test "file client retries synchronization of the complete created directory chai
     );
     try std.testing.expectEqual(@as(u32, 5), SyncFault.call_count);
     var storage: [16]u8 = undefined;
-    try std.testing.expectError(error.ObjectNotFound, client.open(0, identity, &storage));
+    try std.testing.expectError(
+        error.ObjectNotFound,
+        read_object(client, 0, identity, "object".len, &storage),
+    );
 
     SyncFault.reset(5);
     try std.testing.expectError(
@@ -182,7 +339,10 @@ test "file client retries synchronization of the complete created directory chai
 
     SyncFault.reset(null);
     try client.write(0, identity, 0, "object");
-    try std.testing.expectEqualStrings("object", try client.open(0, identity, &storage));
+    try std.testing.expectEqualStrings(
+        "object",
+        try read_object(client, 0, identity, "object".len, &storage),
+    );
 }
 
 test "file client retains objects after post-rename synchronization failure" {
@@ -205,7 +365,7 @@ test "file client retains objects after post-rename synchronization failure" {
     var storage: [16]u8 = undefined;
     try std.testing.expectEqualStrings(
         "whole",
-        try client.open(0, whole_identity, &storage),
+        try read_object(client, 0, whole_identity, "whole".len, &storage),
     );
 
     const session_identity = ltx.FileIdentity{
@@ -219,7 +379,7 @@ test "file client retains objects after post-rename synchronization failure" {
     try std.testing.expectEqual(object.WriteSessionState.failed, session.current_state());
     try std.testing.expectEqualStrings(
         "streamed",
-        try client.open(0, session_identity, &storage),
+        try read_object(client, 0, session_identity, "streamed".len, &storage),
     );
 
     var replacement = try client.begin_write(0, session_identity, 1);
@@ -281,7 +441,10 @@ test "file write session aborts privately and enforces one active writer" {
     try std.testing.expectError(error.OutputFailure, session.writer().write_all("late"));
 
     var storage: [16]u8 = undefined;
-    try std.testing.expectError(error.ObjectNotFound, client.open(0, identity, &storage));
+    try std.testing.expectError(
+        error.ObjectNotFound,
+        read_object(client, 0, identity, 1, &storage),
+    );
     try std.testing.expectError(
         error.FileNotFound,
         temporary.dir.statFile(
@@ -309,7 +472,10 @@ test "file write session rejects offset overflow and cleans staging" {
     try std.testing.expectError(error.OutputFailure, session.writer().write_all("x"));
     try std.testing.expectEqual(object.WriteSessionState.failed, session.current_state());
     var storage: [1]u8 = undefined;
-    try std.testing.expectError(error.ObjectNotFound, client.open(0, identity, &storage));
+    try std.testing.expectError(
+        error.ObjectNotFound,
+        read_object(client, 0, identity, 1, &storage),
+    );
     try std.testing.expectError(
         error.FileNotFound,
         temporary.dir.statFile(
@@ -378,7 +544,13 @@ test "encoder streams a Go-compatible object through a file write session" {
     try std.testing.expectEqualSlices(
         u8,
         @embedFile("fixtures/go_v3_snapshot_zero_page.ltx"),
-        try client.open(0, identity, &storage),
+        try read_object(
+            client,
+            0,
+            identity,
+            @embedFile("fixtures/go_v3_snapshot_zero_page.ltx").len,
+            &storage,
+        ),
     );
 }
 
@@ -410,7 +582,10 @@ test "failed encoder output is aborted without publication" {
     session.abort();
 
     var storage: [4096]u8 = undefined;
-    try std.testing.expectError(error.ObjectNotFound, client.open(0, identity, &storage));
+    try std.testing.expectError(
+        error.ObjectNotFound,
+        read_object(client, 0, identity, 1, &storage),
+    );
 }
 
 test "write session poisons and aborts after an encoder output failure" {
@@ -498,17 +673,43 @@ test "file client writes the litestream filesystem layout" {
     var storage: [32]u8 = undefined;
     try std.testing.expectEqualStrings(
         "snapshot bytes",
-        try client.open(0, identity, &storage),
+        try read_object(client, 0, identity, "snapshot bytes".len, &storage),
     );
     var infos: [1]ltx.FileInfo = undefined;
     const listed = try client.list(0, ltx.TXID.init(0), &infos);
     try std.testing.expectEqual(@as(usize, 1), listed.len);
     try std.testing.expectEqual(@as(u64, "snapshot bytes".len), listed[0].size_bytes);
+    var prefix: [4]u8 = undefined;
+    try client.read_range(listed[0], 0, &prefix);
+    try std.testing.expectEqualStrings("snap", &prefix);
+    var middle: [4]u8 = undefined;
+    try client.read_range(listed[0], 5, &middle);
+    try std.testing.expectEqualStrings("hot ", &middle);
+    var suffix: [2]u8 = undefined;
+    try client.read_range(listed[0], listed[0].size_bytes - suffix.len, &suffix);
+    try std.testing.expectEqualStrings("es", &suffix);
+
     var small: [4]u8 = undefined;
-    try std.testing.expectError(error.ObjectTooLarge, client.open(0, identity, &small));
+    try std.testing.expectError(
+        error.ObjectTooLarge,
+        read_object(client, 0, identity, "snapshot bytes".len, &small),
+    );
+    var stale = listed[0];
+    stale.size_bytes -= 1;
+    try std.testing.expectError(error.ObjectChanged, client.read_range(stale, 0, small[0..1]));
+    try std.testing.expectError(
+        error.InvalidReadRange,
+        client.read_range(listed[0], listed[0].size_bytes, small[0..1]),
+    );
     try std.testing.expectError(
         error.ObjectNotFound,
-        client.open(0, .{ .min_txid = ltx.TXID.init(9), .max_txid = ltx.TXID.init(9) }, &storage),
+        read_object(
+            client,
+            0,
+            .{ .min_txid = ltx.TXID.init(9), .max_txid = ltx.TXID.init(9) },
+            1,
+            &storage,
+        ),
     );
 }
 

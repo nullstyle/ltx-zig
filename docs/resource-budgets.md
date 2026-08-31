@@ -15,6 +15,7 @@ Let:
 - `E = @sizeOf(ltx.PageIndexEntry)` for the selected target
 - `W = @sizeOf(ltx.LZ4CompressionWorkspace)` for the selected target
 - `K` be the compaction input count
+- `R = ltx_replication.Config.read_workspace_bytes`
 - `N` be the number of encoded pages
 - `V = Limits.max_varint_bytes`
 
@@ -74,11 +75,29 @@ formula.
 
 ## Replication-layer workspaces
 
-The replication modules add no formulas beyond the two above; they compose
-them. `ltx_replica` executors use one decoder workspace per restore or
-compaction input plus one encoder workspace for compaction output, exactly as
-the codec table prescribes, with the fetched-object storage bounded by
-`Limits.max_input_bytes` per input. `ltx_capture` uses the WAL page-map
+`ltx_replica` executors use one decoder workspace per restore or compaction
+input plus one encoder workspace for compaction output, exactly as the codec
+table prescribes. Encoded inputs are consumed through bounded sequential
+object-read windows instead of whole-object buffers:
+
+```text
+restore read bytes = R
+K-input compaction read bytes = K * R
+pooled restore + compaction read bytes = (K + 1) * R
+```
+
+`ltx_resources.replication_read_workspace_bytes` checks the pooled formula.
+
+`R` must be nonzero and no larger than `Limits.max_input_bytes`. The object
+size remains independently bounded by `Limits.max_input_bytes`; the replica
+executors reject an oversized listed object before opening any source. A
+complete sequential read performs at most
+`ceil(object bytes / R)` backend range operations.
+The controller validates every restore and compaction read slice against the
+configured `R` and validates all read, codec, control, and output ranges for
+aliasing.
+
+`ltx_capture` uses the WAL page-map
 workspace above, the encoder workspace for the emitted L0, one
 `Limits.max_page_size` page buffer for database-file reads, and plain WAL
 storage bounded by the accepted WAL size. With a transactional object adapter,

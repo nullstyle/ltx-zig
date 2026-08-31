@@ -99,12 +99,23 @@ The mutable input slice, all decoder and encoder workspaces, and output backing
 storage must remain live, address-stable, exclusively owned, and mutually
 non-overlapping until the compactor is terminal. Reported immutable reader
 backings may overlap one another, which supports multiple views into shared
-input storage, but may not intersect mutable input state, any workspace, or the
-output. `init` checks those reported ranges before consuming or emitting bytes.
+input storage. A reported mutable backing may not overlap any reader backing;
+neither kind may intersect mutable input state, any workspace, or the output.
+`init` checks those reported ranges before consuming or emitting bytes.
 Opaque transport contexts expose no extent for the core to inspect, so their
 owners must enforce the same lifetime, non-aliasing-with-mutable-storage, and
 non-reentrancy requirements. A compactor is stateful and single-owner; do not
 copy it or its `CompactionInput` slice after initialization.
+
+`ltx_replica.CompactionJobInput.read_workspace` is a mutable refill window,
+not an immutable input backing. The executor therefore checks all active read
+windows against one another, source metadata, both control arrays, every
+decoder workspace, and active output storage before its first source read.
+Whole-object output fallback storage is inactive and excluded when the client
+supports transactional writes. Aliased live ranges fail with
+`WorkspaceAliasing`. `ObjectReader` also marks the refill window as mutable at
+the generic `Reader` seam, so direct core-compactor callers cannot pass an
+overlap through the allowance for immutable readers over shared bytes.
 
 ## Verification and partial output
 

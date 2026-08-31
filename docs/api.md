@@ -31,11 +31,13 @@ relax those byte-level compatibility or safety requirements.
   supports seeded mid-WAL resume without linking SQLite.
 - `ltx_object` defines the synchronous storage-neutral object contract and its
   filesystem adapter in the Litestream layout, including the reusable backend
-  conformance suite. Optional transactional write sessions expose a bounded
-  `ltx.Writer`; `finish` is their only publication attempt and `abort`
-  discards private staging. `PublicationIndeterminate` means the adapter
-  crossed its commit point but could not confirm durable publication, so the
-  caller must reconcile the object identity.
+  conformance suite. Exact positional reads fill caller-owned slices, and the
+  allocation-free `ObjectReader` adapts them to a bounded sequential codec
+  reader. Optional transactional write sessions expose a bounded `ltx.Writer`;
+  `finish` is their only publication attempt and `abort` discards private
+  staging. `PublicationIndeterminate` means the adapter crossed its commit
+  point but could not confirm durable publication, so the caller must reconcile
+  the object identity.
 - `ltx_s3` implements that object contract over the standard-library HTTP
   client with path-style or virtual-host SigV4, TLS, bounded retry, paginated
   listings, conditional writes, and automatic single-or-multipart

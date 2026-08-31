@@ -11,8 +11,8 @@ the codec trust model they build on is [`design.md`](design.md).
 | Module | Role |
 | --- | --- |
 | `ltx_wal` | SQLite WAL bytes to committed page maps, salt scans, and mid-WAL resume. Standalone; no filesystem or SQLite linkage. |
-| `ltx_object` | The storage-neutral object contract, transactional writer sessions, the filesystem backend in the Litestream layout, and the backend-agnostic conformance suite. |
-| `ltx_s3` | The S3 backend: path-style and virtual-host SigV4, TLS, bounded retry, paginated prefix-scoped listings, object read/write/delete, conditional writes, automatic single/multipart transactional upload, and bucket creation. |
+| `ltx_object` | The storage-neutral object contract, bounded sequential readers over exact ranges, transactional writer sessions, the filesystem backend in the Litestream layout, and the backend-agnostic conformance suite. |
+| `ltx_s3` | The S3 backend: path-style and virtual-host SigV4, TLS, bounded retry, paginated prefix-scoped listings, exact ranged reads, object write/delete, conditional writes, automatic single/multipart transactional upload, and bucket creation. |
 | `ltx_replica` | The level ladder, restore planning, compaction and retention planners, and the restore and compaction executors over `ltx` codecs. |
 | `ltx_capture` | The SQLite capture session: WAL-mode lifecycle, Litestream control tables, a checkpoint-blocking read lock, snapshot/incremental/fallback transitions, seeded continuation, mid-WAL resume, and three-tier passive checkpointing. Links SQLite through a hand-written extern surface provided by the host build. |
 | `ltx_resources` | Checked public resource formulas and fixed-arena binding for byte and typed workspaces. |
@@ -44,6 +44,11 @@ explicit limits, workspaces, and timestamps. Consult
   inputs. A post-commit confirmation failure reports or documents an
   indeterminate publication; reconcile that identity before retrying or
   discarding its source.
+- Restore and compaction consume each listed object through a caller-owned
+  sequential read window. Every adapter must fill each requested range exactly
+  and independently reject a current total object length different from the
+  listing. No page, position, or output becomes trusted before the decoder
+  verifies the complete index, trailer, checksum, and logical EOF.
 
 ## What the host owns
 
@@ -99,6 +104,14 @@ simultaneously live workspace must be disjoint; opaque adapter storage such as
 an S3 send buffer is also caller-owned and cannot be checked through the
 storage-neutral client interface.
 
+`Config.read_workspace_bytes` sets the required capacity of the restore read
+window and every simultaneous compaction-input read window. It must be nonzero
+and no larger than `Limits.max_input_bytes`. Object admission still uses
+`max_input_bytes`, while `max_compaction_input_bytes` continues to bound the
+aggregate source plan; neither value is a request-buffer allocation. A 64 KiB
+window is a practical local starting point, while remote deployments can use a
+larger fixed window to reduce range-request count.
+
 ## Controller lifecycle
 
 ```zig
@@ -127,6 +140,13 @@ const plan = try ltx_replica.calc_restore_plan(&lists, target_txid, &plan_storag
 var job = ltx_replica.RestoreJob{ ... };
 const position = try job.run(plan);
 ```
+
+`RestoreJob.read_workspace` is one bounded window, not whole-object storage.
+Each `CompactionJobInput` similarly supplies `read_workspace`; the executor
+owns the buffered reader state and interleaves the fixed windows as the
+compactor advances its inputs. Both executors preflight their complete source
+metadata against every mutable workspace before the first read, so a refill
+cannot corrupt a later planned identity after earlier publication.
 
 Compaction and retention follow the same shape: `plan_compaction` selects the
 destination-continuing prefix, `CompactionJob.run` merges it through the
@@ -162,6 +182,13 @@ checkpointed original across 512 compacted L0 files. Remote object stores
 will be bounded by network rather than these codec paths; re-run the tool
 per deployment and record the numbers where this section points.
 
+The M7 bounded-read qualification repeatedly ran the same ReleaseSafe tool at
+its required 64 MiB sprint size with 64 KiB input windows. Observed throughput
+was 63.5–66.9 MiB/s for capture, 146.7–157.2 MiB/s for L0-to-L1 compaction,
+and 371.1–397.7 MiB/s for restore. Every run compacted 64 L0 files and restored
+a byte-identical 85.6 MiB image. These scale-sensitive numbers supplement
+rather than replace the 512 MiB series above.
+
 ## Known boundaries
 
 - `ltx_s3`: both path-style and virtual-host addressing
@@ -171,11 +198,20 @@ per deployment and record the numbers where this section points.
   parts numbered from one without gaps, every part but the last at the
   store's 5 MiB minimum). Transactional writers buffer at most one part and
   automatically use a single PUT for small objects or multipart for larger
-  ones. Listings request at most eight keys per page so the maximum S3 key and
+  ones. Sequential input uses signed single-range GETs, accepts only exact
+  `206 Partial Content` responses, and validates `Content-Range` start, end,
+  and total length against the listing before returning bytes. Listings
+  request at most eight keys per page so the maximum S3 key and
   its XML expansion remain inside the fixed 64 KiB response workspace, and
   `Config.max_listing_pages` bounds total remote pagination even when foreign
   keys are ignored. Failed multipart aborts retain their upload identity and
   block new writes until an explicit cleanup retry or `deinit` succeeds.
+- `ltx_object.ObjectReader` relies on each `Client.read_range` adapter to
+  verify the listed total length on every range, but it does not pin a backend
+  generation across ranges. The host's existing ownership/fencing boundary
+  must prevent replacement of the same object key from the first range through
+  final LTX verification. Supporting unfenced cross-writer reads would require
+  a future generation-token or conditional ETag read-session seam.
 - `ltx_capture`: passive checkpointing only — no writer barrier, which the
   single-writer-per-database model makes unnecessary. Three tiers bound the
   WAL: `checkpoint_threshold_bytes`, `checkpoint_interval_ms`, and

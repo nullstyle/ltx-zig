@@ -47,6 +47,9 @@ pub const Config = struct {
     max_files_per_level: u32,
     max_restore_files: u32,
     max_compaction_input_bytes: u64,
+    /// Capacity of each sequential object-read window used by restore and
+    /// compaction, independently of the maximum accepted object size.
+    read_workspace_bytes: u32,
     checkpoint_threshold_bytes: u64 = 0,
     checkpoint_interval_ms: u64 = 0,
     checkpoint_max_frames: u32 = 0,
@@ -115,13 +118,12 @@ pub const Resources = struct {
     level_listings: []ltx.FileInfo,
     restore_plan: []ltx.FileInfo,
     retention_plan: []ltx.FileInfo,
-    restore_storage: []u8,
+    restore_read_workspace: []u8,
     restore_page_workspace: []u8,
     restore_compressed_workspace: []u8,
     restore_index_workspace: []ltx.PageIndexEntry,
     compaction_job_inputs: []replica.CompactionJobInput,
     compaction_inputs: []ltx.CompactionInput,
-    compaction_readers: []ltx.SliceReader,
     /// Whole-object fallback; may be empty when `Options.client` supports
     /// transactional write sessions.
     compaction_output_storage: []u8,
@@ -167,8 +169,8 @@ const State = enum {
 };
 
 const Capacities = struct {
-    max_input_bytes: usize,
     max_output_bytes: usize,
+    read_workspace_bytes: usize,
     max_page_bytes: usize,
     max_compressed_bytes: usize,
     max_index_entries: usize,
@@ -341,7 +343,7 @@ pub const Controller = struct {
             .codec_limits = self.config.codec_limits,
             .apply_limits = self.config.apply_limits,
             .backend = backend,
-            .storage = self.resources.restore_storage,
+            .read_workspace = self.resources.restore_read_workspace,
             .page_workspace = self.resources.restore_page_workspace,
             .compressed_workspace = self.resources.restore_compressed_workspace,
             .index_workspace = self.resources.restore_index_workspace,
@@ -422,7 +424,6 @@ pub const Controller = struct {
             .compaction_limits = self.config.compaction_limits,
             .inputs = self.resources.compaction_job_inputs,
             .compaction_inputs = self.resources.compaction_inputs,
-            .readers = self.resources.compaction_readers,
             .output_storage = self.resources.compaction_output_storage,
             .output_compressed_workspace = self.resources.compaction_output_compressed_workspace,
             .output_compression_workspace = self.resources.compaction_output_compression_workspace,
@@ -594,6 +595,9 @@ fn validate_configuration(options: Options) Error!Capacities {
     if (options.config.max_files_per_level == 0 or
         options.config.max_restore_files == 0 or
         options.config.max_compaction_input_bytes == 0 or
+        options.config.read_workspace_bytes == 0 or
+        options.config.read_workspace_bytes >
+            options.config.codec_limits.max_input_bytes or
         options.config.codec_limits.max_output_bytes >
             options.config.codec_limits.max_input_bytes or
         options.config.max_restore_files < options.config.compaction_limits.max_inputs)
@@ -626,8 +630,8 @@ fn reject_restore_sidecars(options: Options) Error!void {
 }
 
 fn calculate_capacities(config: Config) !Capacities {
-    const max_input: usize = try cast_usize(config.codec_limits.max_input_bytes);
     const max_output: usize = try cast_usize(config.codec_limits.max_output_bytes);
+    const read_workspace: usize = try cast_usize(config.read_workspace_bytes);
     const max_page: usize = try cast_usize(config.codec_limits.max_page_size);
     const max_compressed: usize = try cast_usize(
         config.codec_limits.max_compressed_page_size,
@@ -644,8 +648,8 @@ fn calculate_capacities(config: Config) !Capacities {
     );
     const files: usize = try cast_usize(config.max_files_per_level);
     return .{
-        .max_input_bytes = max_input,
         .max_output_bytes = max_output,
+        .read_workspace_bytes = read_workspace,
         .max_page_bytes = max_page,
         .max_compressed_bytes = max_compressed,
         .max_index_entries = max_index,
@@ -678,8 +682,7 @@ fn validate_control_lengths(
         resources.restore_plan.len < capacities.max_restore_files or
         resources.retention_plan.len < capacities.max_files_per_level or
         resources.compaction_job_inputs.len < capacities.max_compaction_inputs or
-        resources.compaction_inputs.len < capacities.max_compaction_inputs or
-        resources.compaction_readers.len < capacities.max_compaction_inputs)
+        resources.compaction_inputs.len < capacities.max_compaction_inputs)
     {
         return error.InvalidResources;
     }
@@ -699,9 +702,6 @@ fn validate_control_aliases(
         ),
         std.mem.sliceAsBytes(
             resources.compaction_inputs[0..capacities.max_compaction_inputs],
-        ),
-        std.mem.sliceAsBytes(
-            resources.compaction_readers[0..capacities.max_compaction_inputs],
         ),
     };
     try validate_disjoint(&ranges);
@@ -728,6 +728,9 @@ fn validate_capture_resources(
     }
     const ranges = [_][]const u8{
         std.mem.asBytes(all_resources),
+        std.mem.sliceAsBytes(
+            all_resources.compaction_job_inputs[0..capacities.max_compaction_inputs],
+        ),
         resources.wal_storage,
         std.mem.sliceAsBytes(resources.map_slots),
         std.mem.sliceAsBytes(resources.map_pending),
@@ -746,7 +749,7 @@ fn validate_restore_resources(
     resources: *const Resources,
     capacities: Capacities,
 ) Error!void {
-    if (resources.restore_storage.len < capacities.max_input_bytes or
+    if (resources.restore_read_workspace.len < capacities.read_workspace_bytes or
         resources.restore_page_workspace.len < capacities.max_page_bytes or
         resources.restore_compressed_workspace.len < capacities.max_compressed_bytes or
         resources.restore_index_workspace.len < capacities.max_index_entries)
@@ -754,7 +757,7 @@ fn validate_restore_resources(
         return error.InvalidResources;
     }
     const workspaces = [_][]const u8{
-        resources.restore_storage,
+        resources.restore_read_workspace,
         resources.restore_page_workspace,
         resources.restore_compressed_workspace,
         std.mem.sliceAsBytes(resources.restore_index_workspace),
@@ -763,6 +766,9 @@ fn validate_restore_resources(
         std.mem.asBytes(resources),
         std.mem.sliceAsBytes(resources.level_listings[0..capacities.listing_entries]),
         std.mem.sliceAsBytes(resources.restore_plan[0..capacities.max_restore_files]),
+        std.mem.sliceAsBytes(
+            resources.compaction_job_inputs[0..capacities.max_compaction_inputs],
+        ),
     };
     try validate_disjoint(&workspaces);
     try validate_disjoint_groups(&controls, &workspaces);
@@ -782,7 +788,7 @@ fn validate_compaction_resources(
         return error.InvalidResources;
     }
     for (resources.compaction_job_inputs[0..capacities.max_compaction_inputs]) |input| {
-        if (input.storage.len < capacities.max_input_bytes or
+        if (input.read_workspace.len < capacities.read_workspace_bytes or
             input.page_workspace.len < capacities.max_page_bytes or
             input.compressed_workspace.len < capacities.max_compressed_bytes or
             input.index_workspace.len < capacities.max_index_entries)
@@ -818,7 +824,7 @@ fn validate_compaction_aliases(
 fn compaction_control_ranges(
     resources: *const Resources,
     capacities: Capacities,
-) [7][]const u8 {
+) [6][]const u8 {
     return .{
         std.mem.asBytes(resources),
         std.mem.sliceAsBytes(resources.level_listings[0..capacities.listing_entries]),
@@ -830,15 +836,12 @@ fn compaction_control_ranges(
         std.mem.sliceAsBytes(
             resources.compaction_inputs[0..capacities.max_compaction_inputs],
         ),
-        std.mem.sliceAsBytes(
-            resources.compaction_readers[0..capacities.max_compaction_inputs],
-        ),
     };
 }
 
 fn compaction_input_ranges(input: replica.CompactionJobInput) [4][]const u8 {
     return .{
-        input.storage,
+        input.read_workspace,
         input.page_workspace,
         input.compressed_workspace,
         std.mem.sliceAsBytes(input.index_workspace),

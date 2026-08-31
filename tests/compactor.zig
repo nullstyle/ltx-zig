@@ -697,6 +697,69 @@ test "compactor rejects cross-input workspace aliasing" {
     ));
 }
 
+test "compactor rejects overlapping mutable reader backings" {
+    var source_a = ltx.SliceReader.init(current_snapshot_fixture);
+    var source_b = ltx.SliceReader.init(current_snapshot_fixture);
+    var reader_a = source_a.reader();
+    reader_a.backing_is_mutable = true;
+    var page_a: [max_page_bytes]u8 = undefined;
+    var page_b: [max_page_bytes]u8 = undefined;
+    var compressed_a: [max_compressed_bytes]u8 = undefined;
+    var compressed_b: [max_compressed_bytes]u8 = undefined;
+    var index_a: [max_pages]ltx.PageIndexEntry = undefined;
+    var index_b: [max_pages]ltx.PageIndexEntry = undefined;
+    var inputs = [_]ltx.CompactionInput{
+        ltx.CompactionInput.init(.v3, reader_a, &page_a, &compressed_a, &index_a),
+        ltx.CompactionInput.init(.v3, source_b.reader(), &page_b, &compressed_b, &index_b),
+    };
+    var output: [max_output_bytes]u8 = undefined;
+    var sink = ltx.SliceWriter.init(&output);
+    var output_compressed: [max_compressed_bytes]u8 = undefined;
+    var output_compression: ltx.LZ4CompressionWorkspace = undefined;
+    var output_index: [max_pages]ltx.PageIndexEntry = undefined;
+    try std.testing.expectError(error.WorkspaceAliasing, ltx.Compactor.init(
+        .v3,
+        codec_limits,
+        compaction_limits,
+        &inputs,
+        sink.writer(),
+        &output_compressed,
+        &output_compression,
+        &output_index,
+    ));
+}
+
+test "compactor permits overlapping immutable reader backings" {
+    var source_a = ltx.SliceReader.init(current_snapshot_fixture);
+    var source_b = ltx.SliceReader.init(current_snapshot_fixture);
+    var page_a: [max_page_bytes]u8 = undefined;
+    var page_b: [max_page_bytes]u8 = undefined;
+    var compressed_a: [max_compressed_bytes]u8 = undefined;
+    var compressed_b: [max_compressed_bytes]u8 = undefined;
+    var index_a: [max_pages]ltx.PageIndexEntry = undefined;
+    var index_b: [max_pages]ltx.PageIndexEntry = undefined;
+    var inputs = [_]ltx.CompactionInput{
+        ltx.CompactionInput.init(.v3, source_a.reader(), &page_a, &compressed_a, &index_a),
+        ltx.CompactionInput.init(.v3, source_b.reader(), &page_b, &compressed_b, &index_b),
+    };
+    var output: [max_output_bytes]u8 = undefined;
+    var sink = ltx.SliceWriter.init(&output);
+    var output_compressed: [max_compressed_bytes]u8 = undefined;
+    var output_compression: ltx.LZ4CompressionWorkspace = undefined;
+    var output_index: [max_pages]ltx.PageIndexEntry = undefined;
+    var compactor = try ltx.Compactor.init(
+        .v3,
+        codec_limits,
+        compaction_limits,
+        &inputs,
+        sink.writer(),
+        &output_compressed,
+        &output_compression,
+        &output_index,
+    );
+    try std.testing.expectEqual(ltx.CompactorState.initialized, compactor.current_state());
+}
+
 test "compactor rejects input workspace aliasing output storage" {
     var workspace: InputWorkspace = undefined;
     var inputs = [_]ltx.CompactionInput{workspace.input(current_snapshot_fixture)};

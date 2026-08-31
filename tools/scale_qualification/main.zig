@@ -22,6 +22,7 @@ const page_size = 4096;
 const row_blob_bytes = 1024;
 const rows_per_batch = 1024;
 const max_pages = 512 * 1024;
+const read_workspace_bytes = 64 * 1024;
 
 const sqlite = struct {
     const ok: c_int = 0;
@@ -284,18 +285,16 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(inputs);
     const compaction_state = try allocator.alloc(ltx.CompactionInput, compaction_plan.input_count);
     defer allocator.free(compaction_state);
-    const readers = try allocator.alloc(ltx.SliceReader, compaction_plan.input_count);
-    defer allocator.free(readers);
     for (inputs) |*input| {
         input.* = .{
-            .storage = try allocator.alloc(u8, 1 << 28),
+            .read_workspace = try allocator.alloc(u8, read_workspace_bytes),
             .page_workspace = try allocator.alloc(u8, page_size),
             .compressed_workspace = try allocator.alloc(u8, page_size + 1024),
             .index_workspace = try allocator.alloc(ltx.PageIndexEntry, max_pages),
         };
     }
     defer for (inputs) |input| {
-        allocator.free(input.storage);
+        allocator.free(input.read_workspace);
         allocator.free(input.page_workspace);
         allocator.free(input.compressed_workspace);
         allocator.free(input.index_workspace);
@@ -315,7 +314,6 @@ pub fn main(init: std.process.Init) !void {
         },
         .inputs = inputs,
         .compaction_inputs = compaction_state,
-        .readers = readers,
         .output_storage = workspaces.output,
         .output_compressed_workspace = output_compressed,
         .output_compression_workspace = output_compression,
@@ -338,6 +336,8 @@ pub fn main(init: std.process.Init) !void {
     var plan_storage: [4096]ltx.FileInfo = undefined;
     const plan = try ltx_replica.calc_restore_plan(&level_lists, ltx.TXID.init(0), &plan_storage);
     var backend = try ltx_replica.RestoreBackend.init(dir, io, "restored.db");
+    const restore_read_workspace = try allocator.alloc(u8, read_workspace_bytes);
+    defer allocator.free(restore_read_workspace);
     var job = ltx_replica.RestoreJob{
         .client = client,
         .codec_limits = limits,
@@ -346,7 +346,7 @@ pub fn main(init: std.process.Init) !void {
             .max_database_bytes = 1 << 30,
         },
         .backend = backend.backend(),
-        .storage = workspaces.output,
+        .read_workspace = restore_read_workspace,
         .page_workspace = workspaces.page,
         .compressed_workspace = workspaces.compressed,
         .index_workspace = workspaces.index,
