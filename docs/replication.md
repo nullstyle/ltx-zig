@@ -41,9 +41,11 @@ explicit limits, workspaces, and timestamps. Consult
 - Filesystem and S3 producers stream encoded output into private transactional
   staging. `finish` is the requested object publication boundary; encoding or
   transport failure does not advance capture position or delete compacted
-  inputs. A post-commit confirmation failure reports or documents an
-  indeterminate publication; reconcile that identity before retrying or
-  discarding its source.
+  inputs. A post-commit confirmation failure reports
+  `PublicationIndeterminate`; reconcile that exact identity before retrying or
+  discarding its source. In particular, loss of the S3
+  `CompleteMultipartUpload` acknowledgement can mean that the object is
+  already visible even though the client did not receive the success body.
 - Restore and compaction consume each listed object through a caller-owned
   sequential read window. Every adapter must fill each requested range exactly
   and independently reject a current total object length different from the
@@ -132,6 +134,31 @@ requires a distinct host-quiesced backend target. The controller centralizes
 the common synchronous path, while `ltx_capture` and `ltx_replica` remain
 public for custom policy.
 
+Maintenance publishes and fully verifies the compacted upper-level object
+before it attempts to delete any lower-level source. If deletion is
+interrupted, that controller is poisoned: finish it and create a fresh
+controller rather than continuing to use uncertain in-memory state. The fresh
+controller rebuilds its view from object listings, reads and fully verifies
+each candidate covering upper-level LTX object, and only then reconciles
+retention. It deletes only selected lower-level objects whose exact TXID range
+the verified object covers. Snapshot maintenance also removes covered older
+snapshots after that same verification, including on a restart where source
+cleanup had already completed. Retained sources and snapshots are safe
+duplicates until reconciliation completes. A restore across the mixed
+pre-cleanup tree must still verify to the same durable latest position and
+database image. A cleanup-only call returns
+`MaintenanceResult.reconciled` before it compacts an uncovered tail; call
+`maintain` again to continue the bounded work.
+
+For S3 multipart publication, treat `PublicationIndeterminate` as a distinct
+reconciliation state, not as permission to upload the same logical transition
+blindly. A lost completion acknowledgement may leave either an unfinished
+upload or a published object. The write session is poisoned and performs a
+best-effort abort; a missing upload is already clean, while a failed abort
+retains cleanup state and blocks new writes until an explicit cleanup retry
+succeeds. The host must inspect the exact object identity and validate its LTX
+contents before advancing durable position or deleting source objects.
+
 ## Consumer lifecycle
 
 ```zig
@@ -205,7 +232,11 @@ rather than replace the 512 MiB series above.
   its XML expansion remain inside the fixed 64 KiB response workspace, and
   `Config.max_listing_pages` bounds total remote pagination even when foreign
   keys are ignored. Failed multipart aborts retain their upload identity and
-  block new writes until an explicit cleanup retry or `deinit` succeeds.
+  block new writes until an explicit cleanup retry or `deinit` succeeds. If
+  multipart initiation reaches the store but its acknowledgement is lost, the
+  client never receives an upload ID and therefore has no local cleanup handle;
+  deployments must bound those unknown incomplete uploads with store-side
+  lifecycle cleanup.
 - `ltx_object.ObjectReader` relies on each `Client.read_range` adapter to
   verify the listed total length on every range, but it does not pin a backend
   generation across ranges. The host's existing ownership/fencing boundary

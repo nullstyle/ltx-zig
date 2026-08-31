@@ -20,10 +20,10 @@
 //! injected — no ambient time reads.
 //!
 //! S3 publication is remote: after request delivery begins, a transport error
-//! can hide either a committed or rejected write. Conditional methods surface
-//! `PublicationIndeterminate`; a transactional writer reports its contract's
-//! `StorageFailure`, so the host must reconcile the object identity before it
-//! advances a durable position or discards source objects.
+//! can hide either a committed or rejected write. Conditional methods and
+//! transactional publication, including multipart completion, surface
+//! `PublicationIndeterminate`, so the host must reconcile the object identity
+//! before it advances a durable position or discards source objects.
 //!
 //! The gate for this backend is `mise run s3-integration`, which starts a
 //! local MinIO server and runs the backend-agnostic conformance suite
@@ -56,8 +56,9 @@ pub const RetryCause = union(enum) {
 
 /// Caller-injected retry policy. Retries apply to transport failures and
 /// to retryable statuses on idempotent methods only (GET, HEAD, DELETE, and
-/// unconditional PUT). Conditional PUT and POST requests are never retried:
-/// after a lost response their publication outcome can be indeterminate.
+/// unconditional PUT). Conditional PUT and POST requests are never retried.
+/// Transactional publication may retry a definite pre-send transport failure,
+/// but never retries after delivery begins or after a response status arrives.
 /// Delay selection and sleeping are both injected so the module never reads
 /// an ambient clock; hosts encode jitter, caps, cancellation, and the actual
 /// wait in these callbacks.
@@ -527,9 +528,12 @@ pub const S3Client = struct {
             .{
                 .payload = self.send_workspace[0..state.buffered_bytes],
                 .metadata_ms = state.created_at_ms,
+                .publication = .indeterminate_after_send,
             },
         );
-        if (outcome.status != .ok) return error.StorageFailure;
+        if (outcome.status != .ok) {
+            return publication_status_failure(outcome.status);
+        }
     }
 
     fn abort_write_session(context: *anyopaque) void {
@@ -663,9 +667,10 @@ pub const S3Client = struct {
     }
 
     /// Completes the in-flight multipart upload, publishing the object. A
-    /// `StorageFailure` after request delivery begins is indeterminate: the
-    /// caller must reconcile the object identity before retrying or deleting
-    /// source state.
+    /// transport failure, retryable status, or invalid acknowledgement after
+    /// request delivery begins returns `PublicationIndeterminate` and is never
+    /// retried automatically. The caller must reconcile the object identity
+    /// before retrying or deleting source state.
     pub fn complete_multipart(self: *S3Client) Error!void {
         if (self.write_session != null) return error.InvalidState;
         return self.complete_multipart_owned(.manual);
@@ -713,10 +718,14 @@ pub const S3Client = struct {
             .{
                 .payload = body_buffer[0..body_offset],
                 .body_destination = &self.xml_workspace,
+                .publication = .indeterminate_after_send,
             },
         );
-        if (outcome.status != .ok) return error.StorageFailure;
-        try validate_complete_multipart_response(outcome.bytes);
+        if (outcome.status != .ok) {
+            return publication_status_failure(outcome.status);
+        }
+        validate_complete_multipart_response(outcome.bytes) catch
+            return error.PublicationIndeterminate;
         self.multipart = null;
         self.multipart_owner = null;
     }
@@ -885,6 +894,12 @@ pub const S3Client = struct {
         body_destination: ?[]u8 = null,
         conditional: Conditional = .none,
         byte_range: ?ByteRange = null,
+        publication: Publication = .definite,
+    };
+
+    const Publication = enum {
+        definite,
+        indeterminate_after_send,
     };
 
     const Outcome = struct {
@@ -914,15 +929,7 @@ pub const S3Client = struct {
             .create_only, .match_etag => unreachable,
         }
         const policy = self.config.retry orelse
-            return self.perform_once(
-                method,
-                key,
-                query,
-                options,
-            ) catch |err| switch (err) {
-                error.PublicationIndeterminate => unreachable,
-                else => |other| return other,
-            };
+            return self.perform_once(method, key, query, options);
         var attempt: u32 = 1;
         while (true) : (attempt += 1) {
             const outcome = self.perform_once(
@@ -931,11 +938,8 @@ pub const S3Client = struct {
                 query,
                 options,
             ) catch |err| {
-                const definite_error: Error = switch (err) {
-                    error.PublicationIndeterminate => unreachable,
-                    else => |other| other,
-                };
-                if (definite_error != error.StorageFailure) return definite_error;
+                if (err == error.PublicationIndeterminate) return err;
+                if (err != error.StorageFailure) return err;
                 if (retry_delay(
                     policy,
                     attempt,
@@ -946,11 +950,14 @@ pub const S3Client = struct {
                     try policy.sleep_ms(delay);
                     continue;
                 }
-                return definite_error;
+                return err;
             };
             const retryable = @intFromEnum(outcome.status) >= 500 or
                 outcome.status == .too_many_requests;
             if (retryable) {
+                if (options.publication == .indeterminate_after_send) {
+                    return outcome;
+                }
                 if (retry_delay(policy, attempt, .{
                     .status = @intFromEnum(outcome.status),
                 }, method, options.conditional)) |delay| {
@@ -1107,18 +1114,18 @@ pub const S3Client = struct {
 
         if (options.payload) |body| {
             request.sendBodyComplete(body) catch
-                return post_send_failure(options.conditional);
+                return post_send_failure(options);
         } else if (method.requestHasBody()) {
             // PUT without a payload still carries a zero-length body.
             const empty = self.send_workspace[0..0];
             request.sendBodyComplete(empty) catch
-                return post_send_failure(options.conditional);
+                return post_send_failure(options);
         } else {
             request.sendBodiless() catch
-                return post_send_failure(options.conditional);
+                return post_send_failure(options);
         }
         var response = request.receiveHead(&self.redirect_buffer) catch
-            return post_send_failure(options.conditional);
+            return post_send_failure(options);
         const status = response.head.status;
         mark_bodyless_response_complete(&request, method, status);
         var etag: ?[]const u8 = null;
@@ -1150,6 +1157,9 @@ pub const S3Client = struct {
         };
         const reader = response.reader(&self.transfer_buffer);
         const bytes = read_bounded_response_body(reader, destination) catch |err| {
+            if (options.publication == .indeterminate_after_send) {
+                return error.PublicationIndeterminate;
+            }
             if (options.byte_range != null and err == error.ObjectTooLarge) {
                 return error.StorageFailure;
             }
@@ -1795,14 +1805,24 @@ fn retry_delay(
     return policy.next_delay_ms_fn(policy.context, attempt, cause);
 }
 
-fn post_send_failure(conditional: Conditional) ConditionalWriteError {
-    return switch (conditional) {
+fn post_send_failure(options: S3Client.RequestOptions) ConditionalWriteError {
+    if (options.publication == .indeterminate_after_send) {
+        return error.PublicationIndeterminate;
+    }
+    return switch (options.conditional) {
         .none => error.StorageFailure,
         .create_only, .match_etag => error.PublicationIndeterminate,
     };
 }
 
 fn conditional_status_failure(status: std.http.Status) ConditionalWriteError {
+    if (@intFromEnum(status) >= 500 or status == .too_many_requests) {
+        return error.PublicationIndeterminate;
+    }
+    return error.StorageFailure;
+}
+
+fn publication_status_failure(status: std.http.Status) Error {
     if (@intFromEnum(status) >= 500 or status == .too_many_requests) {
         return error.PublicationIndeterminate;
     }
@@ -2103,15 +2123,36 @@ test "retry decisions respect budget, method, and policy callback" {
 test "conditional publication classifies post-send failure as indeterminate" {
     try std.testing.expectEqual(
         error.StorageFailure,
-        post_send_failure(.none),
+        post_send_failure(.{}),
     );
     try std.testing.expectEqual(
         error.PublicationIndeterminate,
-        post_send_failure(.create_only),
+        post_send_failure(.{ .conditional = .create_only }),
     );
     try std.testing.expectEqual(
         error.PublicationIndeterminate,
-        post_send_failure(.{ .match_etag = "\"generation\"" }),
+        post_send_failure(.{
+            .conditional = .{ .match_etag = "\"generation\"" },
+        }),
+    );
+    try std.testing.expectEqual(
+        error.PublicationIndeterminate,
+        post_send_failure(.{ .publication = .indeterminate_after_send }),
+    );
+}
+
+test "publication status failures preserve uncertainty" {
+    try std.testing.expectEqual(
+        error.PublicationIndeterminate,
+        publication_status_failure(.internal_server_error),
+    );
+    try std.testing.expectEqual(
+        error.PublicationIndeterminate,
+        publication_status_failure(.too_many_requests),
+    );
+    try std.testing.expectEqual(
+        error.StorageFailure,
+        publication_status_failure(.bad_request),
     );
 }
 

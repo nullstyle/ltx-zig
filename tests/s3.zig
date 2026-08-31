@@ -236,6 +236,420 @@ fn expect_scripted_range_error(
     try std.testing.expectError(expected_error, result);
 }
 
+const ScriptedMultipartAction = union(enum) {
+    respond: struct {
+        status: std.http.Status,
+        headers: []const std.http.Header = &.{},
+        body: []const u8 = "",
+    },
+    drop_after_body,
+    drop_response_body,
+};
+
+const ScriptedMultipartRequest = struct {
+    method: std.http.Method,
+    target: []const u8,
+    action: ScriptedMultipartAction,
+};
+
+fn serve_scripted_multipart_request(
+    server: *std.Io.net.Server,
+    scripted: ScriptedMultipartRequest,
+) !void {
+    var stream = try server.accept(std.testing.io);
+    defer stream.close(std.testing.io);
+    var read_buffer: [8192]u8 = undefined;
+    var write_buffer: [8192]u8 = undefined;
+    var body_buffer: [4096]u8 = undefined;
+    var stream_reader = stream.reader(std.testing.io, &read_buffer);
+    var stream_writer = stream.writer(std.testing.io, &write_buffer);
+    var http_server = std.http.Server.init(
+        &stream_reader.interface,
+        &stream_writer.interface,
+    );
+    var request = try http_server.receiveHead();
+    const valid_request = request.head.method == scripted.method and
+        std.mem.eql(u8, request.head.target, scripted.target);
+    if (request.head.method.requestHasBody()) {
+        const body_reader = try request.readerExpectContinue(&body_buffer);
+        _ = try body_reader.discardRemaining();
+    }
+    if (!valid_request) return error.TestUnexpectedResult;
+    switch (scripted.action) {
+        .respond => |response| try request.respond(response.body, .{
+            .status = response.status,
+            .keep_alive = false,
+            .extra_headers = response.headers,
+        }),
+        .drop_after_body => {},
+        .drop_response_body => {
+            try request.server.out.writeAll(
+                "HTTP/1.1 200 OK\r\n" ++
+                    "content-length: 128\r\n" ++
+                    "connection: close\r\n\r\n" ++
+                    "<CompleteMultipartUploadResult>",
+            );
+            try request.server.out.flush();
+        },
+    }
+}
+
+fn serve_scripted_multipart_requests(
+    server: *std.Io.net.Server,
+    requests: []const ScriptedMultipartRequest,
+) !void {
+    for (requests) |request| {
+        try serve_scripted_multipart_request(server, request);
+    }
+}
+
+const scripted_multipart_identity = ltx.FileIdentity{
+    .min_txid = .init(71),
+    .max_txid = .init(71),
+};
+const scripted_multipart_key =
+    "/scripted-multipart/0000/0000000000000047-0000000000000047.ltx";
+const scripted_upload_id = "scripted-upload";
+const scripted_initiation_target = scripted_multipart_key ++ "?uploads=";
+const scripted_upload_target =
+    scripted_multipart_key ++ "?uploadId=" ++ scripted_upload_id;
+const scripted_part_one_target =
+    scripted_multipart_key ++ "?partNumber=1&uploadId=" ++ scripted_upload_id;
+const scripted_part_two_target =
+    scripted_multipart_key ++ "?partNumber=2&uploadId=" ++ scripted_upload_id;
+const scripted_initiation_body =
+    "<InitiateMultipartUploadResult><UploadId>" ++
+    scripted_upload_id ++
+    "</UploadId></InitiateMultipartUploadResult>";
+const scripted_oversized_completion_body: [64 * 1024 + 1]u8 = @splat('x');
+const scripted_part_headers = [_]std.http.Header{.{
+    .name = "etag",
+    .value = "\"scripted-part\"",
+}};
+const scripted_begin_success = ScriptedMultipartRequest{
+    .method = .POST,
+    .target = scripted_initiation_target,
+    .action = .{ .respond = .{
+        .status = .ok,
+        .body = scripted_initiation_body,
+    } },
+};
+const scripted_part_one_success = ScriptedMultipartRequest{
+    .method = .PUT,
+    .target = scripted_part_one_target,
+    .action = .{ .respond = .{
+        .status = .ok,
+        .headers = &scripted_part_headers,
+    } },
+};
+const scripted_part_two_success = ScriptedMultipartRequest{
+    .method = .PUT,
+    .target = scripted_part_two_target,
+    .action = .{ .respond = .{
+        .status = .ok,
+        .headers = &scripted_part_headers,
+    } },
+};
+const scripted_abort_clean = ScriptedMultipartRequest{
+    .method = .DELETE,
+    .target = scripted_upload_target,
+    .action = .{ .respond = .{ .status = .not_found } },
+};
+
+fn init_scripted_s3(
+    port: u16,
+    send_workspace: []u8,
+    retry: ?ltx_s3.RetryPolicy,
+) !ltx_s3.S3Client {
+    return ltx_s3.S3Client.init(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .host = "127.0.0.1",
+            .port = port,
+            .bucket = "scripted-multipart",
+            .access_key = "test-access",
+            .secret_key = "test-secret",
+            .clock = .{
+                .context = &plain_clock_context,
+                .now_ms_fn = TestClock.now_ms,
+            },
+            .retry = retry,
+        },
+        send_workspace,
+    );
+}
+
+fn expect_indeterminate_multipart_completion(
+    completion_action: ScriptedMultipartAction,
+) !void {
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const requests = [_]ScriptedMultipartRequest{
+        scripted_begin_success,
+        scripted_part_one_success,
+        .{
+            .method = .POST,
+            .target = scripted_upload_target,
+            .action = completion_action,
+        },
+        scripted_abort_clean,
+    };
+    var server_task = std.testing.io.async(
+        serve_scripted_multipart_requests,
+        .{ &server, &requests },
+    );
+    defer _ = server_task.cancel(std.testing.io) catch {};
+
+    var retry_probe = RetryProbe{};
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try init_scripted_s3(
+        server.socket.address.getPort(),
+        &send_workspace,
+        .{
+            .context = &retry_probe,
+            .next_delay_ms_fn = RetryProbe.next,
+            .sleep_ms_fn = RetryProbe.sleep,
+            .max_attempts = 3,
+        },
+    );
+    defer s3.deinit();
+
+    try s3.begin_multipart(0, scripted_multipart_identity, 10_000);
+    try s3.put_part(1, "tail");
+    try std.testing.expectError(
+        error.PublicationIndeterminate,
+        s3.complete_multipart(),
+    );
+    try std.testing.expect(s3.multipart != null);
+    try std.testing.expectError(
+        error.InvalidState,
+        s3.client().begin_write(0, scripted_multipart_identity, 10_001),
+    );
+    try s3.abort_multipart();
+    try std.testing.expect(s3.multipart == null);
+    try std.testing.expectEqual(@as(u32, 0), retry_probe.calls);
+    try server_task.await(std.testing.io);
+}
+
+test "scripted multipart completion lost acknowledgement is indeterminate" {
+    try expect_indeterminate_multipart_completion(.drop_after_body);
+}
+
+test "scripted multipart completion truncated acknowledgement is indeterminate" {
+    try expect_indeterminate_multipart_completion(.drop_response_body);
+}
+
+test "scripted multipart completion 5xx is indeterminate and not retried" {
+    try expect_indeterminate_multipart_completion(.{ .respond = .{
+        .status = .internal_server_error,
+    } });
+}
+
+test "scripted multipart completion malformed success is indeterminate" {
+    try expect_indeterminate_multipart_completion(.{ .respond = .{
+        .status = .ok,
+        .body = "<NotACompletionResult/>",
+    } });
+}
+
+test "scripted multipart completion oversized success is indeterminate" {
+    try expect_indeterminate_multipart_completion(.{ .respond = .{
+        .status = .ok,
+        .body = &scripted_oversized_completion_body,
+    } });
+}
+
+test "scripted multipart initiation lost acknowledgement is not retried" {
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const requests = [_]ScriptedMultipartRequest{.{
+        .method = .POST,
+        .target = scripted_initiation_target,
+        .action = .drop_after_body,
+    }};
+    var server_task = std.testing.io.async(
+        serve_scripted_multipart_requests,
+        .{ &server, &requests },
+    );
+    defer _ = server_task.cancel(std.testing.io) catch {};
+
+    var retry_probe = RetryProbe{};
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try init_scripted_s3(server.socket.address.getPort(), &send_workspace, .{
+        .context = &retry_probe,
+        .next_delay_ms_fn = RetryProbe.next,
+        .sleep_ms_fn = RetryProbe.sleep,
+        .max_attempts = 3,
+    });
+    defer s3.deinit();
+
+    try std.testing.expectError(
+        error.StorageFailure,
+        s3.begin_multipart(0, scripted_multipart_identity, 10_100),
+    );
+    try std.testing.expect(s3.multipart == null);
+    try std.testing.expectEqual(@as(u32, 0), retry_probe.calls);
+    var replacement = try s3.client().begin_write(
+        0,
+        scripted_multipart_identity,
+        10_101,
+    );
+    replacement.abort();
+    try server_task.await(std.testing.io);
+}
+
+test "scripted small write session lost acknowledgement is indeterminate" {
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const requests = [_]ScriptedMultipartRequest{.{
+        .method = .PUT,
+        .target = scripted_multipart_key,
+        .action = .drop_after_body,
+    }};
+    var server_task = std.testing.io.async(
+        serve_scripted_multipart_requests,
+        .{ &server, &requests },
+    );
+    defer _ = server_task.cancel(std.testing.io) catch {};
+
+    var retry_probe = RetryProbe{};
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try init_scripted_s3(server.socket.address.getPort(), &send_workspace, .{
+        .context = &retry_probe,
+        .next_delay_ms_fn = RetryProbe.next,
+        .sleep_ms_fn = RetryProbe.sleep,
+        .max_attempts = 3,
+    });
+    defer s3.deinit();
+    var session = try s3.client().begin_write(
+        0,
+        scripted_multipart_identity,
+        10_150,
+    );
+    try session.writer().write_all("small payload");
+    try std.testing.expectError(error.PublicationIndeterminate, session.finish());
+    try std.testing.expectEqual(
+        ltx_object.WriteSessionState.failed,
+        session.current_state(),
+    );
+    try std.testing.expect(s3.write_session == null);
+    try std.testing.expectEqual(@as(u32, 0), retry_probe.calls);
+    var replacement = try s3.client().begin_write(
+        0,
+        scripted_multipart_identity,
+        10_151,
+    );
+    replacement.abort();
+    try server_task.await(std.testing.io);
+}
+
+test "scripted multipart part and abort failures retain cleanup identity" {
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const requests = [_]ScriptedMultipartRequest{
+        scripted_begin_success,
+        .{
+            .method = .PUT,
+            .target = scripted_part_one_target,
+            .action = .drop_after_body,
+        },
+        .{
+            .method = .DELETE,
+            .target = scripted_upload_target,
+            .action = .{ .respond = .{ .status = .internal_server_error } },
+        },
+        scripted_abort_clean,
+    };
+    var server_task = std.testing.io.async(
+        serve_scripted_multipart_requests,
+        .{ &server, &requests },
+    );
+    defer _ = server_task.cancel(std.testing.io) catch {};
+
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try init_scripted_s3(
+        server.socket.address.getPort(),
+        &send_workspace,
+        null,
+    );
+    defer s3.deinit();
+    try s3.begin_multipart(0, scripted_multipart_identity, 10_200);
+    try std.testing.expectError(error.StorageFailure, s3.put_part(1, "tail"));
+    try std.testing.expectError(error.StorageFailure, s3.abort_multipart());
+    try std.testing.expect(s3.multipart != null);
+    try std.testing.expectError(
+        error.InvalidState,
+        s3.client().begin_write(0, scripted_multipart_identity, 10_201),
+    );
+    try s3.abort_multipart();
+    try std.testing.expect(s3.multipart == null);
+    try server_task.await(std.testing.io);
+}
+
+test "scripted write session poisons and retains failed multipart cleanup" {
+    @memset(&multipart_a, 0x8c);
+    @memset(&multipart_tail, 0xc8);
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const requests = [_]ScriptedMultipartRequest{
+        scripted_begin_success,
+        scripted_part_one_success,
+        scripted_part_two_success,
+        .{
+            .method = .POST,
+            .target = scripted_upload_target,
+            .action = .drop_after_body,
+        },
+        .{
+            .method = .DELETE,
+            .target = scripted_upload_target,
+            .action = .{ .respond = .{ .status = .internal_server_error } },
+        },
+        scripted_abort_clean,
+    };
+    var server_task = std.testing.io.async(
+        serve_scripted_multipart_requests,
+        .{ &server, &requests },
+    );
+    defer _ = server_task.cancel(std.testing.io) catch {};
+
+    var s3 = try init_scripted_s3(
+        server.socket.address.getPort(),
+        &automatic_send_workspace,
+        null,
+    );
+    defer s3.deinit();
+    var session = try s3.client().begin_write(
+        0,
+        scripted_multipart_identity,
+        10_300,
+    );
+    try session.writer().write_all(&multipart_a);
+    try session.writer().write_all(&multipart_tail);
+    try std.testing.expectError(error.PublicationIndeterminate, session.finish());
+    try std.testing.expectEqual(
+        ltx_object.WriteSessionState.failed,
+        session.current_state(),
+    );
+    try std.testing.expect(s3.write_session == null);
+    try std.testing.expect(s3.multipart != null);
+    try std.testing.expectError(error.InvalidState, session.finish());
+    try std.testing.expectError(error.OutputFailure, session.writer().write_all("late"));
+    try std.testing.expectError(
+        error.InvalidState,
+        s3.client().begin_write(0, scripted_multipart_identity, 10_301),
+    );
+    try s3.abort_multipart();
+    try std.testing.expect(s3.multipart == null);
+    try server_task.await(std.testing.io);
+}
+
 const valid_range_header = [_]std.http.Header{.{
     .name = "content-range",
     .value = "bytes 0-2/6",

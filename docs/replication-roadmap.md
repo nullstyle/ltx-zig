@@ -3,9 +3,10 @@
 This roadmap records the completed extension of `ltx-zig` from an LTX codec
 toolkit into bounded SQLite-to-object-store replication building blocks,
 informed by the pinned `denoland/celld` LTX crate and exposed as an embeddable
-library rather than a daemon. The M1–M7 stack is shipped: the original
+library rather than a daemon. The M1–M8 stack is shipped: the original
 foundations, a public checked resource binder, transactional object writes,
-bounded object reads, and a synchronous per-database controller.
+bounded object reads, a synchronous per-database controller, and deterministic
+qualification of interrupted maintenance and multipart publication.
 
 The consumer built above this library — for example, a stateful actor system
 giving each actor its own SQLite database — owns which databases exist, when
@@ -94,14 +95,16 @@ and `resource-check` verifies them.
 | M5 — consolidation ✅ | This roadmap, engineering rules, upstream evidence, resource budgets, the `replicate-once` consumer template, and [`replication.md`](replication.md) as the deployment contract. | `fmt-check`, `test`, `resource-check`, `fuzz`, `capture-integration`, `s3-integration`, `consumer-smoke`, Litestream interoperability, and canonical source-archive qualification. |
 | M6 — orchestration and bounded publication ✅ | Public resource formulas and fixed-arena binding; exact object sizes; generic identity-checked restore; transactional filesystem and S3 writer sessions; direct capture/compaction publication; and the `ltx_replication.Controller`. | Hermetic session and planner tests, live SQLite controller lifecycle, zero-output-buffer capture, automatic MinIO single/multipart publication, scale qualification, consumer wiring, and release gates. |
 | M7 — bounded object reads ✅ | Exact range reads in the object contract; an allocation-free sequential `ObjectReader` poisoned by range failures; filesystem positional reads; signed S3 single-range GETs with exact `Content-Range` validation; and restore/compaction input windows sized independently of the accepted object limit. | Backend conformance and malformed-range tests, MinIO range qualification, tiny-window restore and interleaved compaction, controller capacity and alias checks, scale qualification, and release gates. |
+| M8 — deterministic interruption hardening ✅ | Restart-safe controller retention reconciliation that re-verifies the covering upper-level restore plan before source or covered-snapshot deletion; precise S3 transactional publication uncertainty as `PublicationIndeterminate`; and fixed, deterministic fault checkpoints at the existing object and HTTP seams rather than a new production fault API. | Hermetic controller restart tests cover interruption before and during source and older-snapshot cleanup and require an exact restored image; scripted S3 tests cover single PUT, multipart initiation, part upload, completion acknowledgement loss, abort failure, and cleanup retry, with the MinIO gate retaining real-protocol coverage. |
 
 Normal tests stay network-free. The dedicated S3/MinIO gate and
 Litestream-binary interoperability gate are implemented and run in hosted CI;
 their external tools remain outside the hermetic unit-test step.
 
-## Candidate next increments
+## Candidate next increment
 
-No post-M7 feature sprint is committed. The remaining high-value candidates
-are fault-injection qualification around interrupted controller maintenance
-and remote multipart publication, and controller-level resource view helpers
-that bind a complete `Resources` value from one fixed arena.
+No post-M8 feature sprint is committed. The next high-value increment is a
+controller-level fixed-arena binder that derives and binds one complete
+`Resources` value. It should preserve the individually checked formulas and
+explicit lifetime/alias rules while removing error-prone manual slicing from
+the common controller setup path.

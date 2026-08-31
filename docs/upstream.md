@@ -71,10 +71,11 @@ whole-block LZ4 framing, and no page index.
 For `denoland/celld` v0.3.0: `crates/ltx/README.md`, `Cargo.toml`,
 `reference/ltx-format.md`, `src/codec.rs`, `src/ltx.rs`, `src/lz4_block.rs`,
 `src/compactor.rs`, `src/replica_compactor.rs`, `src/replica.rs`,
-`src/wal.rs`, `src/faults_inject.rs`, `tests/differential_xtool.rs`, the
-golden-fixture manifest and capture script, the low-level reader assertions,
-the Litestream Go WAL testdata under `reference/litestream-go/testdata/`, and
-the file-restore integration test. Celld's writer remains a secondary
+`src/wal.rs`, `tests/faults_inject.rs`,
+`tests/differential_xtool.rs`, the golden-fixture manifest and capture script,
+the low-level reader assertions, the Litestream Go WAL testdata under
+`reference/litestream-go/testdata/`, and the file-restore integration test.
+Celld's writer remains a secondary
 interoperability and deployment reference rather than the valid-output oracle.
 Its immutable golden replica is separately a real-Litestream reader oracle.
 The crate pins Go LTX v0.5.2 and provides a byte-exact port of Go's block
@@ -116,6 +117,24 @@ The official
 includes `range` in the canonical and signed header sets; Zig adopts that
 integrity hardening. These are transport behavior and hardening references
 only; M7 does not infer or alter LTX wire semantics.
+
+The M8 interruption audit returned to the v0.3.0
+[`faults_inject` integration test](https://github.com/denoland/celld/blob/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx/tests/faults_inject.rs)
+at the exact pinned commit. That self-contained historical suite mutates
+replica trees with truncated, empty, corrupt, and gapped LTX files. Its safety
+invariant is useful deployment evidence: a
+recovery attempt must either produce a valid SQLite image no newer than the
+last known durable TXID or return a clean error. The v0.4.0 tree no longer
+contains that test. Its active
+[`ReplicaCompactor`](https://github.com/denoland/celld/blob/a52f9905425bc41134d817694bdc2c50bcc5e856/crates/ltx/src/replica_compactor.rs)
+is explicitly additive and does not delete source objects, leaving retention
+to a separate policy. Zig keeps that publication-before-retention separation,
+then adds deterministic qualification that a fresh controller re-verifies the
+covering upper-level object before reconciling sources or covered older
+snapshots left behind after its publication. These Celld files remain
+secondary recovery and deployment
+references; the pinned
+`superfly/ltx` encoder and tests remain the valid-output wire oracle.
 
 For Litestream v0.5.16: the release archive manifest, `go.mod`,
 `cmd/litestream/restore.go`, `replica.go` restore planning and decode path, and

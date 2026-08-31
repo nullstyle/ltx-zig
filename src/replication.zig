@@ -155,8 +155,20 @@ pub const MaintenanceReport = struct {
     page_count: u32,
 };
 
+pub const MaintenanceReconciliationReport = struct {
+    destination_level: u8,
+    covered_through_txid: ltx.TXID,
+    verified_file_count: u32,
+    deleted_file_count: u64,
+};
+
 pub const MaintenanceResult = union(enum) {
     idle,
+    /// A previously published upper restore plan was fully verified before
+    /// covered source objects or superseded snapshots were removed. This
+    /// bounded call returns before compacting any uncovered tail; call
+    /// `maintain` again to continue.
+    reconciled: MaintenanceReconciliationReport,
     compacted: MaintenanceReport,
 };
 
@@ -357,7 +369,13 @@ pub const Controller = struct {
     fn maintain_internal(self: *Controller, destination_level: u8) Error!MaintenanceResult {
         const source_level_value = try self.source_level(destination_level);
         try self.list_all_levels();
-        const coverage_txid = try self.upper_coverage_txid(destination_level);
+        const upper_plan = try self.upper_restore_plan(destination_level);
+        const coverage_txid = restore_plan_coverage(upper_plan);
+        if (try self.reconcile_covered_objects(
+            destination_level,
+            source_level_value,
+            upper_plan,
+        )) |report| return .{ .reconciled = report };
         const source = source_after(self.level_lists[source_level_value], coverage_txid);
         if (source.len == 0) return .idle;
         const snapshot = if (destination_level == ltx.snapshot_level)
@@ -473,23 +491,81 @@ pub const Controller = struct {
         }
     }
 
-    fn upper_coverage_txid(
+    fn upper_restore_plan(
         self: *Controller,
         destination_level: u8,
-    ) Error!ltx.TXID {
+    ) Error![]const ltx.FileInfo {
         var upper_lists: [level_count][]const ltx.FileInfo = @splat(&.{});
         for (destination_level..level_count) |level| {
             upper_lists[level] = self.level_lists[level];
         }
-        const plan = replica.calc_restore_plan(
+        return replica.calc_restore_plan(
             &upper_lists,
             ltx.TXID.init(0),
             self.resources.restore_plan[0..self.config.max_restore_files],
         ) catch |err| switch (err) {
-            error.TxNotAvailable => return ltx.TXID.init(0),
+            error.TxNotAvailable => return self.resources.restore_plan[0..0],
             else => return err,
         };
-        return plan[plan.len - 1].max_txid;
+    }
+
+    fn reconcile_covered_objects(
+        self: *Controller,
+        destination_level: u8,
+        source_level_value: u8,
+        upper_plan: []const ltx.FileInfo,
+    ) Error!?MaintenanceReconciliationReport {
+        if (upper_plan.len == 0) return null;
+        const covered = replica.plan_retention(
+            self.level_lists[source_level_value],
+            upper_plan,
+            self.resources.retention_plan[0..self.config.max_files_per_level],
+        );
+        const snapshot = if (destination_level == ltx.snapshot_level)
+            upper_plan[0]
+        else
+            null;
+        const covered_snapshot_count = if (snapshot) |info|
+            self.count_covered_snapshots(info)
+        else
+            0;
+        if (covered.len == 0 and covered_snapshot_count == 0) return null;
+        var job = self.verification_job();
+        const position_value = try job.run(upper_plan);
+        const coverage_txid = restore_plan_coverage(upper_plan);
+        if (position_value.txid.value != coverage_txid.value) {
+            return error.ObjectIdentityMismatch;
+        }
+        const verified_file_count = std.math.cast(u32, upper_plan.len) orelse
+            return error.PlanCapacityExceeded;
+        var deleted_file_count = std.math.cast(u64, covered.len) orelse
+            return error.PlanCapacityExceeded;
+        if (covered.len != 0) try self.client.delete(covered);
+        if (snapshot) |info| {
+            const snapshot_deleted = try self.delete_covered_snapshots(info);
+            deleted_file_count = std.math.add(
+                u64,
+                deleted_file_count,
+                snapshot_deleted,
+            ) catch return error.PlanCapacityExceeded;
+        }
+        return .{
+            .destination_level = destination_level,
+            .covered_through_txid = coverage_txid,
+            .verified_file_count = verified_file_count,
+            .deleted_file_count = deleted_file_count,
+        };
+    }
+
+    fn verification_job(self: *Controller) replica.VerificationJob {
+        return .{
+            .client = self.client,
+            .codec_limits = self.config.codec_limits,
+            .read_workspace = self.resources.restore_read_workspace,
+            .page_workspace = self.resources.restore_page_workspace,
+            .compressed_workspace = self.resources.restore_compressed_workspace,
+            .index_workspace = self.resources.restore_index_workspace,
+        };
     }
 
     fn source_level(self: *const Controller, destination_level: u8) Error!u8 {
@@ -553,6 +629,14 @@ pub const Controller = struct {
             }
         }
         if (count != 0) try self.client.delete(self.resources.retention_plan[0..count]);
+        return count;
+    }
+
+    fn count_covered_snapshots(self: *const Controller, output: ltx.FileInfo) usize {
+        var count: usize = 0;
+        for (self.level_lists[ltx.snapshot_level]) |info| {
+            if (!same_identity(info, output) and contains(output, info)) count += 1;
+        }
         return count;
     }
 
@@ -875,6 +959,11 @@ fn source_after(source: []const ltx.FileInfo, covered: ltx.TXID) []const ltx.Fil
         index += 1;
     }
     return source[index..];
+}
+
+fn restore_plan_coverage(plan: []const ltx.FileInfo) ltx.TXID {
+    if (plan.len == 0) return ltx.TXID.init(0);
+    return plan[plan.len - 1].max_txid;
 }
 
 fn newest_snapshot(listed: []const ltx.FileInfo) ?ltx.FileInfo {

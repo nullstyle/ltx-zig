@@ -357,6 +357,99 @@ pub fn plan_retention(
 
 // ── Restore execution ─────────────────────────────────────────────────────────
 
+/// Caller-owned storage for validating a restore plan without applying it.
+/// Every object is decoded through EOF, including its index, trailer, file
+/// checksum, and snapshot checksum. Object-key identities and cross-object
+/// position continuity are also verified. The job allocates nothing.
+pub const VerificationJob = struct {
+    client: object.Client,
+    codec_limits: ltx.Limits,
+    read_workspace: []u8,
+    page_workspace: []u8,
+    compressed_workspace: []u8,
+    index_workspace: []ltx.PageIndexEntry,
+
+    pub fn run(self: *VerificationJob, plan: []const ltx.FileInfo) Error!ltx.Position {
+        if (plan.len == 0) return error.TxNotAvailable;
+        for (plan) |info| try validate_source_info(self.codec_limits, info);
+        try self.validate_resource_aliases(plan);
+        var position: ?ltx.Position = null;
+        var page_size: ?u32 = null;
+        for (plan) |info| {
+            const verified = try self.verify_object(info);
+            try verify_identity(verified, .{
+                .min_txid = info.min_txid,
+                .max_txid = info.max_txid,
+            });
+            if (position) |current| {
+                try verified.check_contiguous(current);
+                if (verified.header.page_size != page_size.?) {
+                    return error.DatabasePageSizeMismatch;
+                }
+            } else if (verified.header.min_txid.value != 1) {
+                return error.NonContiguousPlan;
+            }
+            position = verified.post_apply_position();
+            page_size = verified.header.page_size;
+        }
+        return position.?;
+    }
+
+    fn verify_object(
+        self: *VerificationJob,
+        info: ltx.FileInfo,
+    ) Error!ltx.VerifiedLTX {
+        var source = try object.ObjectReader.init(
+            self.client,
+            info,
+            self.read_workspace,
+        );
+        var decoder = try ltx.Decoder.init(
+            .v3,
+            self.codec_limits,
+            source.reader(),
+            self.page_workspace,
+            self.compressed_workspace,
+            self.index_workspace,
+        );
+        var event_count: u64 = 0;
+        const event_limit = decoder.event_budget();
+        while (event_count < event_limit) : (event_count += 1) {
+            const event = decoder.next() catch |err| {
+                if (source.failure()) |storage_error| return storage_error;
+                return err;
+            };
+            switch (event) {
+                .verified => |verified| return verified,
+                else => {},
+            }
+        }
+        return error.InvalidState;
+    }
+
+    fn validate_resource_aliases(
+        self: *const VerificationJob,
+        plan: []const ltx.FileInfo,
+    ) Error!void {
+        const controls = [_][]const u8{
+            std.mem.asBytes(self),
+            std.mem.sliceAsBytes(plan),
+        };
+        const workspaces = [_][]const u8{
+            self.read_workspace,
+            self.page_workspace,
+            self.compressed_workspace,
+            std.mem.sliceAsBytes(self.index_workspace),
+        };
+        if (ranges_overlap(&controls, &controls) or
+            ranges_overlap(&workspaces, &workspaces) or
+            ranges_overlap(&controls, &workspaces))
+        {
+            return error.WorkspaceAliasing;
+        }
+    }
+};
+
 const restore_temporary_suffix = ".restore-tmp";
 const copy_chunk_bytes = 4096;
 

@@ -41,6 +41,10 @@ version is zero, the Zig source API is intentionally unstable.
 - `ltx_capture.Session.checkpoint_pending`, which exposes a deferred automatic
   PASSIVE-checkpoint retry without turning an already published capture into a
   failed sync.
+- Deterministic interruption qualification for controller maintenance and S3
+  multipart publication, including publication-before-cleanup restart,
+  partial source deletion, completion acknowledgement loss, abort failure, and
+  cleanup retry.
 
 ### Changed
 
@@ -67,6 +71,10 @@ version is zero, the Zig source API is intentionally unstable.
 - The replication controller copies its compaction ladder, preflights encoder
   capacity and live workspace ranges, preserves readiness after caller-input
   errors, and requires sidecar-free quiescence for startup restore.
+- A fresh replication controller re-verifies each covering upper-level object
+  before reconciling retained lower-level sources and covered older snapshots
+  after interrupted maintenance, without requiring the compacted output to be
+  republished.
 
 ### Fixed
 
@@ -87,6 +95,13 @@ version is zero, the Zig source API is intentionally unstable.
 - Controller retention deletes only the selected sources proven to be covered
   by the newly verified output; corrupt upper metadata cannot delete an
   unselected lower object.
+- Snapshot-maintenance recovery resumes either cleanup phase, including the
+  case where source deletion completed but covered older snapshots remain.
+- S3 transactional single-PUT and multipart publication report
+  `PublicationIndeterminate` when the publication request may have reached the
+  server but its acknowledgement was lost, so callers reconcile the exact
+  object instead of treating the outcome as an ordinary retryable transport
+  failure.
 
 ## [0.3.0] - 2026-08-27
 

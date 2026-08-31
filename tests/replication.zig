@@ -295,6 +295,90 @@ fn free_level(files: []const ltx.FileInfo) void {
     if (files.len != 0) std.testing.allocator.free(files);
 }
 
+const DeleteFaultMode = enum {
+    before_batch,
+    after_first,
+};
+
+const DeleteFaultClient = struct {
+    backing: object.Client,
+    mode: DeleteFaultMode,
+    enabled: bool = true,
+    successful_calls_before_fault: u32 = 0,
+    fault_fired: bool = false,
+    delete_call_count: u32 = 0,
+
+    fn client(self: *DeleteFaultClient) object.Client {
+        return .{
+            .context = self,
+            .list_fn = list,
+            .read_range_fn = read_range,
+            .write_fn = write,
+            .begin_write_fn = begin_write,
+            .delete_fn = delete_objects,
+        };
+    }
+
+    fn list(
+        context: *anyopaque,
+        level: u8,
+        seek: ltx.TXID,
+        destination: []ltx.FileInfo,
+    ) object.Error![]const ltx.FileInfo {
+        const self: *DeleteFaultClient = @ptrCast(@alignCast(context));
+        return self.backing.list(level, seek, destination);
+    }
+
+    fn read_range(
+        context: *anyopaque,
+        info: ltx.FileInfo,
+        offset_bytes: u64,
+        destination: []u8,
+    ) object.Error!void {
+        const self: *DeleteFaultClient = @ptrCast(@alignCast(context));
+        return self.backing.read_range(info, offset_bytes, destination);
+    }
+
+    fn write(
+        context: *anyopaque,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+        bytes: []const u8,
+    ) object.Error!void {
+        const self: *DeleteFaultClient = @ptrCast(@alignCast(context));
+        return self.backing.write(level, identity, created_at_ms, bytes);
+    }
+
+    fn begin_write(
+        context: *anyopaque,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+    ) object.Error!object.WriteSession {
+        const self: *DeleteFaultClient = @ptrCast(@alignCast(context));
+        return self.backing.begin_write(level, identity, created_at_ms);
+    }
+
+    fn delete_objects(
+        context: *anyopaque,
+        files: []const ltx.FileInfo,
+    ) object.Error!void {
+        const self: *DeleteFaultClient = @ptrCast(@alignCast(context));
+        self.delete_call_count += 1;
+        if (!self.enabled or self.fault_fired) return self.backing.delete(files);
+        if (self.successful_calls_before_fault != 0) {
+            self.successful_calls_before_fault -= 1;
+            return self.backing.delete(files);
+        }
+        self.fault_fired = true;
+        if (self.mode == .after_first and files.len != 0) {
+            try self.backing.delete(files[0..1]);
+        }
+        return error.StorageFailure;
+    }
+};
+
 test "sync reports publication and require-empty rejects its object tree" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -608,6 +692,171 @@ fn compact_levels(controller: *replication.Controller, levels: []const u8) !void
     }
 }
 
+fn expect_reconciliation(
+    result: replication.MaintenanceResult,
+    deleted_file_count: u64,
+) !void {
+    switch (result) {
+        .reconciled => |report| {
+            try std.testing.expectEqual(@as(u8, 1), report.destination_level);
+            try std.testing.expectEqual(@as(u64, 4), report.covered_through_txid.value);
+            try std.testing.expectEqual(@as(u32, 1), report.verified_file_count);
+            try std.testing.expectEqual(deleted_file_count, report.deleted_file_count);
+        },
+        else => return error.TestExpectedReconciliation,
+    }
+}
+
+fn run_delete_fault_recovery(
+    mode: DeleteFaultMode,
+    retained_after_failure: usize,
+    deleted_on_recovery: u64,
+) !void {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    var fault = DeleteFaultClient{ .backing = store.client(), .mode = mode };
+    const storage = try std.testing.allocator.create(TestResources);
+    defer std.testing.allocator.destroy(storage);
+    var resources = storage.bind();
+    use_transactional_output(&resources);
+    var controller = try replication.Controller.init(
+        options(&temporary, fault.client(), "app.db", .require_empty),
+        &resources,
+    );
+    try exec_sql(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        "CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)",
+    );
+    for (1..6) |row| try publish_row(&controller, &temporary, @intCast(row));
+    const expected_position = try controller.position();
+    try std.testing.expectError(error.StorageFailure, controller.maintain(1));
+    try std.testing.expectError(error.Poisoned, controller.position());
+    try std.testing.expectEqual(@as(u32, 1), fault.delete_call_count);
+    const retained = try expect_level(store.client(), 0, retained_after_failure);
+    defer free_level(retained);
+    const published = try expect_level(store.client(), 1, 1);
+    defer free_level(published);
+    try std.testing.expectEqual(@as(u64, 4), published[0].max_txid.value);
+    controller.finish();
+
+    resources = storage.bind();
+    use_transactional_output(&resources);
+    var recovered = try replication.Controller.init(
+        options(
+            &temporary,
+            store.client(),
+            "app.db",
+            .{ .verified_local = expected_position },
+        ),
+        &resources,
+    );
+    defer recovered.finish();
+    try expect_reconciliation(try recovered.maintain(1), deleted_on_recovery);
+    const tail = try expect_level(store.client(), 0, 1);
+    defer free_level(tail);
+    try std.testing.expectEqual(@as(u64, 5), tail[0].max_txid.value);
+
+    var backend = try replica.RestoreBackend.init(
+        temporary.dir,
+        std.testing.io,
+        "verified.db",
+    );
+    const restored = try recovered.restore(ltx.TXID.init(0), backend.backend());
+    try std.testing.expectEqual(expected_position, restored.position);
+    try expect_row_count(temporary.dir, std.testing.io, "verified.db", 5);
+    try std.testing.expect((try recovered.maintain(1)) == .compacted);
+    const empty = try expect_level(store.client(), 0, 0);
+    defer free_level(empty);
+}
+
+test "maintenance restart reconciles a published output after delete fails" {
+    try run_delete_fault_recovery(.before_batch, 5, 4);
+}
+
+test "maintenance restart converges after a partial batch delete" {
+    try run_delete_fault_recovery(.after_first, 4, 3);
+}
+
+test "maintenance restart reconciles covered snapshots after cleanup fails" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    var fault = DeleteFaultClient{
+        .backing = store.client(),
+        .mode = .before_batch,
+        .enabled = false,
+    };
+    const storage = try std.testing.allocator.create(TestResources);
+    defer std.testing.allocator.destroy(storage);
+    var resources = storage.bind();
+    use_transactional_output(&resources);
+    var controller = try replication.Controller.init(
+        options(&temporary, fault.client(), "app.db", .require_empty),
+        &resources,
+    );
+    try exec_sql(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        "CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)",
+    );
+    try publish_row(&controller, &temporary, 1);
+    try compact_levels(&controller, &.{ 1, 2, 3, ltx.snapshot_level });
+    try publish_row(&controller, &temporary, 2);
+    try compact_levels(&controller, &.{ 1, 2, 3 });
+
+    fault.enabled = true;
+    fault.successful_calls_before_fault = 1;
+    const expected_position = try controller.position();
+    try std.testing.expectError(
+        error.StorageFailure,
+        controller.maintain(ltx.snapshot_level),
+    );
+    try std.testing.expectError(error.Poisoned, controller.position());
+    const retained = try expect_level(store.client(), ltx.snapshot_level, 2);
+    defer free_level(retained);
+    try std.testing.expectEqual(@as(u64, 1), retained[0].max_txid.value);
+    try std.testing.expectEqual(@as(u64, 2), retained[1].max_txid.value);
+    const source = try expect_level(store.client(), 3, 0);
+    defer free_level(source);
+    controller.finish();
+
+    resources = storage.bind();
+    use_transactional_output(&resources);
+    var recovered = try replication.Controller.init(
+        options(
+            &temporary,
+            store.client(),
+            "app.db",
+            .{ .verified_local = expected_position },
+        ),
+        &resources,
+    );
+    defer recovered.finish();
+    const result = try recovered.maintain(ltx.snapshot_level);
+    switch (result) {
+        .reconciled => |report| {
+            try std.testing.expectEqual(
+                @as(u8, ltx.snapshot_level),
+                report.destination_level,
+            );
+            try std.testing.expectEqual(
+                @as(u64, 2),
+                report.covered_through_txid.value,
+            );
+            try std.testing.expectEqual(@as(u32, 1), report.verified_file_count);
+            try std.testing.expectEqual(@as(u64, 1), report.deleted_file_count);
+        },
+        else => return error.TestExpectedReconciliation,
+    }
+    const snapshots = try expect_level(store.client(), ltx.snapshot_level, 1);
+    defer free_level(snapshots);
+    try std.testing.expectEqual(@as(u64, 2), snapshots[0].max_txid.value);
+}
+
 test "maintenance compacts one adjacent job and safely retains covered files" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -653,7 +902,7 @@ test "maintenance compacts one adjacent job and safely retains covered files" {
     try expect_row_count(temporary.dir, std.testing.io, "verified.db", 4);
 }
 
-test "maintenance retains unselected source hidden by corrupt upper metadata" {
+test "maintenance verifies a covering upper before deleting any source" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
@@ -680,14 +929,18 @@ test "maintenance retains unselected source hidden by corrupt upper metadata" {
         .min_txid = ltx.TXID.init(1),
         .max_txid = ltx.TXID.init(1),
     };
-    try client.write(1, first, 1500, "not-an-ltx-object");
-    try std.testing.expect((try controller.maintain(1)) == .compacted);
+    const corrupt_bytes: [256]u8 = @splat(0);
+    try client.write(1, first, 1500, &corrupt_bytes);
+    try std.testing.expectError(error.InvalidMagic, controller.maintain(1));
+    try std.testing.expectError(error.Poisoned, controller.position());
 
-    const retained = try expect_level(client, 0, 1);
+    const retained = try expect_level(client, 0, 2);
     defer free_level(retained);
     try std.testing.expectEqual(@as(u64, 1), retained[0].min_txid.value);
     try std.testing.expectEqual(@as(u64, 1), retained[0].max_txid.value);
-    const upper = try expect_level(client, 1, 2);
+    try std.testing.expectEqual(@as(u64, 2), retained[1].min_txid.value);
+    try std.testing.expectEqual(@as(u64, 2), retained[1].max_txid.value);
+    const upper = try expect_level(client, 1, 1);
     defer free_level(upper);
 }
 

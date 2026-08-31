@@ -275,6 +275,75 @@ const ReadFaultClient = struct {
     }
 };
 
+const VerificationHarness = struct {
+    read_workspace: [read_workspace_bytes]u8 = undefined,
+    page_workspace: [page_size]u8 = undefined,
+    compressed_workspace: [600]u8 = undefined,
+    index_workspace: [4]ltx.PageIndexEntry = undefined,
+
+    fn job(self: *VerificationHarness, client: object.Client) replica.VerificationJob {
+        return .{
+            .client = client,
+            .codec_limits = codec_limits,
+            .read_workspace = &self.read_workspace,
+            .page_workspace = &self.page_workspace,
+            .compressed_workspace = &self.compressed_workspace,
+            .index_workspace = &self.index_workspace,
+        };
+    }
+};
+
+test "verification fully decodes a bounded plan and preserves read errors" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    try write_chain(&store);
+    var listing: [8]ltx.FileInfo = undefined;
+    const plan = try store.client().list(0, ltx.TXID.init(0), &listing);
+
+    var harness = VerificationHarness{};
+    var job = harness.job(store.client());
+    const position = try job.run(plan);
+    try std.testing.expectEqual(@as(u64, 3), position.txid.value);
+
+    var fault = ReadFaultClient{
+        .backing = store.client(),
+        .fail_at_call = 2,
+    };
+    var fault_harness = VerificationHarness{};
+    var fault_job = fault_harness.job(fault.client());
+    try std.testing.expectError(error.StorageFailure, fault_job.run(plan));
+    try std.testing.expectEqual(@as(u32, 2), fault.read_call_count);
+}
+
+test "verification rejects a fully decoded object under the wrong key" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    try write_chain(&store);
+    const client = store.client();
+    const source_identity = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(1),
+        .max_txid = ltx.TXID.init(1),
+    };
+    const source_info = try find_info(client, 0, source_identity);
+    var storage: [4096]u8 = undefined;
+    const bytes = try client.read_all(source_info, &storage);
+    const false_identity = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(1),
+        .max_txid = ltx.TXID.init(9),
+    };
+    try client.write(1, false_identity, 9000, bytes);
+    const false_info = try find_info(client, 1, false_identity);
+
+    var harness = VerificationHarness{};
+    var job = harness.job(client);
+    try std.testing.expectError(
+        error.ObjectIdentityMismatch,
+        job.run(&.{false_info}),
+    );
+}
+
 const NeverBeginBackend = struct {
     begin_count: u32 = 0,
     stage_count: u32 = 0,

@@ -42,9 +42,9 @@ relax those byte-level compatibility or safety requirements.
   client with path-style or virtual-host SigV4, TLS, bounded retry, paginated
   listings, conditional writes, and automatic single-or-multipart
   transactional upload. Its pooled HTTP connections use the allocator supplied
-  at initialization. Remote post-send failures can be publication-indeterminate;
-  fenced writes report that condition explicitly, while transactional writers
-  require reconciliation by object identity before durable progress advances.
+  at initialization. Fenced and transactional publication report remote
+  post-send uncertainty as `PublicationIndeterminate`; reconcile the exact
+  object identity before durable progress advances.
 - `ltx_replica` provides the Litestream level ladder, restore, compaction, and
   retention planners, plus restore and compaction executors over caller-owned
   workspaces. They remain public lower-level escape hatches beneath the
