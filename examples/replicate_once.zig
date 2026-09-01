@@ -184,6 +184,15 @@ pub fn main() !void {
     });
 
     controller.finish();
+    const diagnostics = controller.diagnostics();
+    std.debug.print(
+        "controller {s}: {d} syncs and {d} restore operations succeeded\n",
+        .{
+            @tagName(diagnostics.lifecycle),
+            diagnostics.sync.succeeded_count,
+            diagnostics.restore.succeeded_count,
+        },
+    );
     try verify_restored_rows(dir, io, restored_database_name);
     std.debug.print("verified restored SQLite rows: one, two, three\n", .{});
 }

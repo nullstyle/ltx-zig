@@ -50,6 +50,11 @@ version is zero, the Zig source API is intentionally unstable.
   fixed arena with checked capacity, alignment, and arithmetic. Transactional
   clients omit the two whole-object fallback buffers; manual `Resources`
   construction remains supported.
+- `ltx_replication.Controller.diagnostics`, an infallible copied snapshot of
+  lifecycle, saturating accepted/rejected/succeeded/failed counts for each
+  operation, and the exact last accepted result or error. The pointer-free
+  snapshot remains available after poison and finish without callbacks,
+  allocation, or policy in the controller.
 
 ### Changed
 

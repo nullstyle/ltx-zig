@@ -16,7 +16,7 @@ the codec trust model they build on is [`design.md`](design.md).
 | `ltx_replica` | The level ladder, restore planning, compaction and retention planners, and the restore and compaction executors over `ltx` codecs. |
 | `ltx_capture` | The SQLite capture session: WAL-mode lifecycle, Litestream control tables, a checkpoint-blocking read lock, snapshot/incremental/fallback transitions, seeded continuation, mid-WAL resume, and three-tier passive checkpointing. Links SQLite through a hand-written extern surface provided by the host build. |
 | `ltx_resources` | Checked public resource formulas and fixed-arena binding for byte and typed workspaces. |
-| `ltx_replication` | The synchronous per-database controller: complete fixed-arena resource binding, startup restore, capture position, restore, one adjacent-level maintenance quantum, and safe retention. |
+| `ltx_replication` | The synchronous per-database controller: complete fixed-arena resource binding, startup restore, capture position, restore, one adjacent-level maintenance quantum, safe retention, and bounded polling diagnostics. |
 
 Every module is synchronous, allocation-free after initialization (the S3
 HTTP transport's pooled connections are the single exception), and driven by
@@ -135,6 +135,7 @@ defer controller.finish();
 _ = try controller.sync(now_ms);
 _ = try controller.maintain(1); // one caller-selected adjacent-level quantum
 const durable = try controller.position();
+const diagnostics = controller.diagnostics();
 ```
 
 The allocation above is host initialization, not controller-time growth. The
@@ -155,6 +156,27 @@ existing `-wal`, `-shm`, or `-journal` sidecar. Runtime `restore` likewise
 requires a distinct host-quiesced backend target. The controller centralizes
 the common synchronous path, while `ltx_capture` and `ltx_replica` remain
 public for custom policy.
+
+`Controller.diagnostics()` is infallible and returns one copied, pointer-free,
+fixed-size `ControllerDiagnostics` value. Its lifecycle is `ready`, `poisoned`,
+or `finished`. Separate `sync`, `restore`, and `maintain` counters record
+accepted, rejected, succeeded, and failed calls. Every count saturates at
+`maxInt(u64)`; `counters_saturated` becomes sticky only when an increment is
+lost at that limit, so a maximum-valued count alone is not evidence that an
+event was dropped.
+
+`last_accepted_operation` contains the exact result of the latest successful
+accepted call, or the operation and exact error from the latest accepted call
+that failed. Entry rejections, such as an invalid timestamp, destination
+level, or a call after poison or finish, increment only `rejected_count` and do
+not erase the causal accepted result or failure. The host may therefore poll
+after a processing error and again after `finish` without losing the cause.
+`TxNotAvailable` is an accepted restore failure but leaves the controller
+ready. Only explicit `sync`, `restore`, and `maintain` calls are counted;
+initialization work, `position`, diagnostics polling, and `finish` are not.
+Poll only between synchronous controller calls from its single owner: the
+snapshot is observation, not synchronization, and the controller adds no
+callbacks, clock reads, reset, event history, scheduling policy, or allocation.
 
 Maintenance publishes and fully verifies the compacted upper-level object
 before it attempts to delete any lower-level source. If deletion is

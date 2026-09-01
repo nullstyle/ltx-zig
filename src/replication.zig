@@ -197,12 +197,75 @@ pub const MaintenanceResult = union(enum) {
     compacted: MaintenanceReport,
 };
 
+pub const ControllerLifecycle = enum {
+    ready,
+    poisoned,
+    finished,
+};
+
+pub const ControllerOperation = enum {
+    sync,
+    restore,
+    maintain,
+};
+
+pub const OperationCounters = struct {
+    /// Calls that passed lifecycle and argument validation and entered work.
+    accepted_count: u64 = 0,
+    /// Calls returned before work because entry validation failed.
+    rejected_count: u64 = 0,
+    /// Accepted calls that returned a result, including unchanged or idle.
+    succeeded_count: u64 = 0,
+    /// Accepted calls that returned an error, whether or not they poisoned.
+    failed_count: u64 = 0,
+};
+
+pub const OperationFailure = struct {
+    operation: ControllerOperation,
+    cause: Error,
+};
+
+pub const LastOperation = union(enum) {
+    sync: SyncResult,
+    restore: RestoreReport,
+    maintain: MaintenanceResult,
+    failed: OperationFailure,
+};
+
+/// A copied, pointer-free observation of controller activity. It is intended
+/// for inspection between synchronous calls, including after poison or finish.
+/// Rejected calls update only their counter and preserve the last accepted
+/// result or failure. Initialization, queries, diagnostics, and finish are not
+/// counted. Counters saturate independently; `counters_saturated` becomes
+/// sticky when an increment cannot be represented.
+pub const ControllerDiagnostics = struct {
+    lifecycle: ControllerLifecycle,
+    sync: OperationCounters = .{},
+    restore: OperationCounters = .{},
+    maintain: OperationCounters = .{},
+    last_accepted_operation: ?LastOperation = null,
+    counters_saturated: bool = false,
+};
+
 const State = enum {
     initializing,
     ready,
     running,
     poisoned,
     finished,
+};
+
+const DiagnosticState = struct {
+    sync: OperationCounters = .{},
+    restore: OperationCounters = .{},
+    maintain: OperationCounters = .{},
+    last_accepted_operation: ?LastOperation = null,
+    counters_saturated: bool = false,
+};
+
+const FailureDisposition = enum {
+    ready,
+    poisoned,
 };
 
 const Capacities = struct {
@@ -703,6 +766,7 @@ pub const Controller = struct {
     level_lists: [level_count][]const ltx.FileInfo = @splat(&.{}),
     last_sync_timestamp_ms: ?i64 = null,
     state: State = .initializing,
+    diagnostic_state: DiagnosticState = .{},
 
     pub fn init(options: Options, resources: *Resources) Error!Controller {
         const capacities = try validate_configuration(options);
@@ -734,14 +798,17 @@ pub const Controller = struct {
     }
 
     pub fn sync(self: *Controller, timestamp_ms: i64) Error!SyncResult {
-        try self.require_ready();
-        try self.validate_sync_timestamp(timestamp_ms);
-        try self.begin_operation();
-        const result = self.sync_internal(timestamp_ms) catch |err| {
-            self.poison();
+        try self.require_operation_ready(.sync);
+        self.validate_sync_timestamp(timestamp_ms) catch |err| {
+            self.reject_operation(.sync);
             return err;
         };
-        self.state = .ready;
+        self.accept_operation(.sync);
+        const result = self.sync_internal(timestamp_ms) catch |err| {
+            self.fail_operation(.sync, err, .poisoned);
+            return err;
+        };
+        self.succeed_operation(.{ .sync = result });
         return result;
     }
 
@@ -752,15 +819,17 @@ pub const Controller = struct {
         target_txid: ltx.TXID,
         backend: ltx.ApplyBackend,
     ) Error!RestoreReport {
-        try self.begin_operation();
+        try self.require_operation_ready(.restore);
+        self.accept_operation(.restore);
         const report = self.restore_internal(target_txid, backend) catch |err| {
-            switch (err) {
-                error.TxNotAvailable => self.state = .ready,
-                else => self.poison(),
-            }
+            const disposition: FailureDisposition = if (err == error.TxNotAvailable)
+                .ready
+            else
+                .poisoned;
+            self.fail_operation(.restore, err, disposition);
             return err;
         };
-        self.state = .ready;
+        self.succeed_operation(.{ .restore = report });
         return report;
     }
 
@@ -768,15 +837,34 @@ pub const Controller = struct {
         self: *Controller,
         destination_level: u8,
     ) Error!MaintenanceResult {
-        try self.require_ready();
-        _ = try self.source_level(destination_level);
-        try self.begin_operation();
-        const report = self.maintain_internal(destination_level) catch |err| {
-            self.poison();
+        try self.require_operation_ready(.maintain);
+        _ = self.source_level(destination_level) catch |err| {
+            self.reject_operation(.maintain);
             return err;
         };
-        self.state = .ready;
+        self.accept_operation(.maintain);
+        const report = self.maintain_internal(destination_level) catch |err| {
+            self.fail_operation(.maintain, err, .poisoned);
+            return err;
+        };
+        self.succeed_operation(.{ .maintain = report });
         return report;
+    }
+
+    pub fn diagnostics(self: *const Controller) ControllerDiagnostics {
+        return .{
+            .lifecycle = switch (self.state) {
+                .ready => .ready,
+                .poisoned => .poisoned,
+                .finished => .finished,
+                .initializing, .running => unreachable,
+            },
+            .sync = self.diagnostic_state.sync,
+            .restore = self.diagnostic_state.restore,
+            .maintain = self.diagnostic_state.maintain,
+            .last_accepted_operation = self.diagnostic_state.last_accepted_operation,
+            .counters_saturated = self.diagnostic_state.counters_saturated,
+        };
     }
 
     pub fn position(self: *const Controller) Error!ltx.Position {
@@ -1140,11 +1228,6 @@ pub const Controller = struct {
         return count;
     }
 
-    fn begin_operation(self: *Controller) Error!void {
-        try self.require_ready();
-        self.state = .running;
-    }
-
     fn require_ready(self: *const Controller) Error!void {
         switch (self.state) {
             .ready => {},
@@ -1154,16 +1237,85 @@ pub const Controller = struct {
         }
     }
 
+    fn require_operation_ready(
+        self: *Controller,
+        operation: ControllerOperation,
+    ) Error!void {
+        self.require_ready() catch |err| {
+            self.reject_operation(operation);
+            return err;
+        };
+    }
+
+    fn accept_operation(self: *Controller, operation: ControllerOperation) void {
+        std.debug.assert(self.state == .ready);
+        increment_counter(
+            &self.operation_counters(operation).accepted_count,
+            &self.diagnostic_state.counters_saturated,
+        );
+        self.state = .running;
+    }
+
+    fn reject_operation(self: *Controller, operation: ControllerOperation) void {
+        increment_counter(
+            &self.operation_counters(operation).rejected_count,
+            &self.diagnostic_state.counters_saturated,
+        );
+    }
+
+    fn succeed_operation(self: *Controller, last: LastOperation) void {
+        std.debug.assert(self.state == .running);
+        const operation: ControllerOperation = switch (last) {
+            .sync => .sync,
+            .restore => .restore,
+            .maintain => .maintain,
+            .failed => unreachable,
+        };
+        increment_counter(
+            &self.operation_counters(operation).succeeded_count,
+            &self.diagnostic_state.counters_saturated,
+        );
+        self.diagnostic_state.last_accepted_operation = last;
+        self.state = .ready;
+    }
+
+    fn fail_operation(
+        self: *Controller,
+        operation: ControllerOperation,
+        cause: Error,
+        disposition: FailureDisposition,
+    ) void {
+        std.debug.assert(self.state == .running);
+        increment_counter(
+            &self.operation_counters(operation).failed_count,
+            &self.diagnostic_state.counters_saturated,
+        );
+        self.diagnostic_state.last_accepted_operation = .{ .failed = .{
+            .operation = operation,
+            .cause = cause,
+        } };
+        self.state = switch (disposition) {
+            .ready => .ready,
+            .poisoned => .poisoned,
+        };
+    }
+
+    fn operation_counters(
+        self: *Controller,
+        operation: ControllerOperation,
+    ) *OperationCounters {
+        return switch (operation) {
+            .sync => &self.diagnostic_state.sync,
+            .restore => &self.diagnostic_state.restore,
+            .maintain => &self.diagnostic_state.maintain,
+        };
+    }
+
     fn validate_sync_timestamp(self: *const Controller, timestamp_ms: i64) Error!void {
         if (timestamp_ms < 0) return error.InvalidTimestamp;
         if (self.last_sync_timestamp_ms) |previous| {
             if (timestamp_ms < previous) return error.TimestampRegression;
         }
-    }
-
-    fn poison(self: *Controller) void {
-        std.debug.assert(self.state == .running);
-        self.state = .poisoned;
     }
 };
 
@@ -1574,4 +1726,30 @@ fn resource_add(left: usize, right: usize) ResourceBindError!usize {
 
 fn resource_mul(left: usize, right: usize) ResourceBindError!usize {
     return std.math.mul(usize, left, right) catch error.ResourceBudgetOverflow;
+}
+
+fn increment_counter(counter: *u64, counters_saturated: *bool) void {
+    if (counter.* == std.math.maxInt(u64)) {
+        counters_saturated.* = true;
+        return;
+    }
+    counter.* += 1;
+}
+
+test "operation counter saturation is sticky only after a blocked increment" {
+    var counter = std.math.maxInt(u64) - 1;
+    var counters_saturated = false;
+
+    increment_counter(&counter, &counters_saturated);
+    try std.testing.expectEqual(std.math.maxInt(u64), counter);
+    try std.testing.expect(!counters_saturated);
+
+    increment_counter(&counter, &counters_saturated);
+    try std.testing.expectEqual(std.math.maxInt(u64), counter);
+    try std.testing.expect(counters_saturated);
+
+    counter = 0;
+    increment_counter(&counter, &counters_saturated);
+    try std.testing.expectEqual(@as(u64, 1), counter);
+    try std.testing.expect(counters_saturated);
 }

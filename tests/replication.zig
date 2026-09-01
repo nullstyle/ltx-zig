@@ -194,6 +194,71 @@ fn expect_init_error(
     }
 }
 
+fn expect_counters(
+    actual: replication.OperationCounters,
+    accepted_count: u64,
+    rejected_count: u64,
+    succeeded_count: u64,
+    failed_count: u64,
+) !void {
+    try std.testing.expectEqual(accepted_count, actual.accepted_count);
+    try std.testing.expectEqual(rejected_count, actual.rejected_count);
+    try std.testing.expectEqual(succeeded_count, actual.succeeded_count);
+    try std.testing.expectEqual(failed_count, actual.failed_count);
+}
+
+fn expect_last_sync(
+    diagnostics: replication.ControllerDiagnostics,
+    expected: replication.SyncResult,
+) !void {
+    const last = diagnostics.last_accepted_operation orelse
+        return error.TestExpectedSyncDiagnostics;
+    switch (last) {
+        .sync => |actual| try std.testing.expectEqual(expected, actual),
+        else => return error.TestExpectedSyncDiagnostics,
+    }
+}
+
+fn expect_last_restore(
+    diagnostics: replication.ControllerDiagnostics,
+    expected: replication.RestoreReport,
+) !void {
+    const last = diagnostics.last_accepted_operation orelse
+        return error.TestExpectedRestoreDiagnostics;
+    switch (last) {
+        .restore => |actual| try std.testing.expectEqual(expected, actual),
+        else => return error.TestExpectedRestoreDiagnostics,
+    }
+}
+
+fn expect_last_maintenance(
+    diagnostics: replication.ControllerDiagnostics,
+    expected: replication.MaintenanceResult,
+) !void {
+    const last = diagnostics.last_accepted_operation orelse
+        return error.TestExpectedMaintenanceDiagnostics;
+    switch (last) {
+        .maintain => |actual| try std.testing.expectEqual(expected, actual),
+        else => return error.TestExpectedMaintenanceDiagnostics,
+    }
+}
+
+fn expect_last_failure(
+    diagnostics: replication.ControllerDiagnostics,
+    expected_operation: replication.ControllerOperation,
+    expected_cause: replication.Error,
+) !void {
+    const last = diagnostics.last_accepted_operation orelse
+        return error.TestExpectedFailureDiagnostics;
+    switch (last) {
+        .failed => |actual| {
+            try std.testing.expectEqual(expected_operation, actual.operation);
+            try std.testing.expectEqual(expected_cause, actual.cause);
+        },
+        else => return error.TestExpectedFailureDiagnostics,
+    }
+}
+
 fn sqlite_path(
     dir: std.Io.Dir,
     io: std.Io,
@@ -1353,4 +1418,152 @@ test "invalid calls stay ready and processing failures poison until finish" {
     try std.testing.expectError(error.Poisoned, controller.sync(1000));
     controller.finish();
     try std.testing.expectError(error.Finished, controller.position());
+}
+
+test "controller diagnostics preserve accepted operation results" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const storage = try std.testing.allocator.create(TestResources);
+    defer std.testing.allocator.destroy(storage);
+    var resources = storage.bind();
+    use_transactional_output(&resources);
+    var controller = try replication.Controller.init(
+        options(&temporary, store.client(), "app.db", .require_empty),
+        &resources,
+    );
+    defer controller.finish();
+
+    const initial = controller.diagnostics();
+    try std.testing.expectEqual(replication.ControllerLifecycle.ready, initial.lifecycle);
+    try expect_counters(initial.sync, 0, 0, 0, 0);
+    try expect_counters(initial.restore, 0, 0, 0, 0);
+    try expect_counters(initial.maintain, 0, 0, 0, 0);
+    try std.testing.expectEqual(@as(?replication.LastOperation, null), initial.last_accepted_operation);
+    try std.testing.expect(!initial.counters_saturated);
+    _ = try controller.position();
+
+    try exec_sql(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        "CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT); INSERT INTO kv VALUES (1, 'one');",
+    );
+    const synced = try controller.sync(1000);
+    var diagnostics = controller.diagnostics();
+    try expect_counters(diagnostics.sync, 1, 0, 1, 0);
+    try expect_last_sync(diagnostics, synced);
+
+    const unchanged = try controller.sync(1001);
+    try std.testing.expectEqual(replication.SyncResult.unchanged, unchanged);
+    diagnostics = controller.diagnostics();
+    try expect_counters(diagnostics.sync, 2, 0, 2, 0);
+    try expect_last_sync(diagnostics, unchanged);
+
+    try std.testing.expectError(error.InvalidTimestamp, controller.sync(-1));
+    try std.testing.expectError(error.InvalidDestinationLevel, controller.maintain(0));
+    diagnostics = controller.diagnostics();
+    try expect_counters(diagnostics.sync, 2, 1, 2, 0);
+    try expect_counters(diagnostics.maintain, 0, 1, 0, 0);
+    try expect_last_sync(diagnostics, unchanged);
+
+    const maintained = try controller.maintain(1);
+    try expect_last_maintenance(controller.diagnostics(), maintained);
+    var backend = try replica.RestoreBackend.init(
+        temporary.dir,
+        std.testing.io,
+        "verified.db",
+    );
+    const restored = try controller.restore(ltx.TXID.init(0), backend.backend());
+    diagnostics = controller.diagnostics();
+    try expect_counters(diagnostics.sync, 2, 1, 2, 0);
+    try expect_counters(diagnostics.maintain, 1, 1, 1, 0);
+    try expect_counters(diagnostics.restore, 1, 0, 1, 0);
+    try expect_last_restore(diagnostics, restored);
+
+    controller.finish();
+    diagnostics = controller.diagnostics();
+    try std.testing.expectEqual(replication.ControllerLifecycle.finished, diagnostics.lifecycle);
+    try expect_counters(diagnostics.sync, 2, 1, 2, 0);
+    try expect_counters(diagnostics.maintain, 1, 1, 1, 0);
+    try expect_counters(diagnostics.restore, 1, 0, 1, 0);
+    try expect_last_restore(diagnostics, restored);
+
+    try std.testing.expectError(error.Finished, controller.maintain(1));
+    diagnostics = controller.diagnostics();
+    try std.testing.expectEqual(replication.ControllerLifecycle.finished, diagnostics.lifecycle);
+    try expect_counters(diagnostics.sync, 2, 1, 2, 0);
+    try expect_counters(diagnostics.maintain, 1, 2, 1, 0);
+    try expect_counters(diagnostics.restore, 1, 0, 1, 0);
+    try expect_last_restore(diagnostics, restored);
+}
+
+test "controller diagnostics retain accepted failures through poison and finish" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const storage = try std.testing.allocator.create(TestResources);
+    defer std.testing.allocator.destroy(storage);
+    var resources = storage.bind();
+    const seeded = ltx.Position{
+        .txid = ltx.TXID.init(7),
+        .post_apply_checksum = ltx.Checksum.init(0),
+    };
+    var controller = try replication.Controller.init(
+        options(
+            &temporary,
+            store.client(),
+            "app.db",
+            .{ .verified_local = seeded },
+        ),
+        &resources,
+    );
+    defer controller.finish();
+    var backend = try replica.RestoreBackend.init(
+        temporary.dir,
+        std.testing.io,
+        "restored.db",
+    );
+
+    try std.testing.expectError(
+        error.TxNotAvailable,
+        controller.restore(ltx.TXID.init(0), backend.backend()),
+    );
+    var diagnostics = controller.diagnostics();
+    try std.testing.expectEqual(replication.ControllerLifecycle.ready, diagnostics.lifecycle);
+    try expect_counters(diagnostics.restore, 1, 0, 0, 1);
+    try expect_last_failure(diagnostics, .restore, error.TxNotAvailable);
+    _ = try controller.position();
+
+    const corrupt = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(1),
+        .max_txid = ltx.TXID.init(1),
+    };
+    try store.client().write(0, corrupt, 1000, "not-an-ltx-object");
+    const processing_error: replication.Error = blk: {
+        if (controller.restore(ltx.TXID.init(0), backend.backend())) |_| {
+            return error.TestExpectedError;
+        } else |cause| {
+            break :blk cause;
+        }
+    };
+    diagnostics = controller.diagnostics();
+    try std.testing.expectEqual(replication.ControllerLifecycle.poisoned, diagnostics.lifecycle);
+    try expect_counters(diagnostics.restore, 2, 0, 0, 2);
+    try expect_last_failure(diagnostics, .restore, processing_error);
+
+    try std.testing.expectError(error.Poisoned, controller.sync(1000));
+    try std.testing.expectError(error.Poisoned, controller.position());
+    diagnostics = controller.diagnostics();
+    try expect_counters(diagnostics.sync, 0, 1, 0, 0);
+    try expect_counters(diagnostics.restore, 2, 0, 0, 2);
+    try expect_last_failure(diagnostics, .restore, processing_error);
+
+    controller.finish();
+    diagnostics = controller.diagnostics();
+    try std.testing.expectEqual(replication.ControllerLifecycle.finished, diagnostics.lifecycle);
+    try expect_counters(diagnostics.sync, 0, 1, 0, 0);
+    try expect_counters(diagnostics.restore, 2, 0, 0, 2);
+    try expect_last_failure(diagnostics, .restore, processing_error);
+    try std.testing.expect(!diagnostics.counters_saturated);
 }
