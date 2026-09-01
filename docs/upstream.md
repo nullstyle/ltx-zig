@@ -118,6 +118,23 @@ includes `range` in the canonical and signed header sets; Zig adopts that
 integrity hardening. These are transport behavior and hardening references
 only; M7 does not infer or alter LTX wire semantics.
 
+The M11 generation-read re-audit returned to the same pinned Celld commit
+(which remains the `main` head as of 2026-08-31). Its
+[`ReplicaClient`](https://github.com/denoland/celld/blob/a52f9905425bc41134d817694bdc2c50bcc5e856/crates/ltx/src/client/mod.rs#L46-L49)
+still exposes one complete `Vec<u8>` read, and the filesystem adapter still
+uses one whole-file
+[`tokio::fs::read`](https://github.com/denoland/celld/blob/a52f9905425bc41134d817694bdc2c50bcc5e856/crates/ltx/src/client/file.rs#L119-L123).
+Celld therefore supplies deployment and orchestration context but no
+cross-request generation seam to port. Zig's fixed `ReadGeneration` receipt is
+an original storage-neutral hardening layer over its bounded M7 range API.
+For S3, the official
+[`GetObject` contract](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html)
+permits `Range` and `If-Match` on the same request and specifies
+`412 Precondition Failed` when the current ETag does not match. Zig uses that
+condition only to bind reads; it does not alter wire encoding, infer content
+integrity from ETag, or move lease policy into the library. Full LTX
+verification and the pinned Go encoder remain authoritative.
+
 The M8 interruption audit returned to the v0.3.0
 [`faults_inject` integration test](https://github.com/denoland/celld/blob/89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9/crates/ltx/tests/faults_inject.rs)
 at the exact pinned commit. That self-contained historical suite mutates

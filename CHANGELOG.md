@@ -55,6 +55,9 @@ version is zero, the Zig source API is intentionally unstable.
   operation, and the exact last accepted result or error. The pointer-free
   snapshot remains available after poison and finish without callbacks,
   allocation, or policy in the controller.
+- `ltx_object.ReadGeneration`, a fixed-capacity, pointer-free receipt that
+  binds every refill of one `ObjectReader` to the same backend generation
+  without adding allocation or a read-session cleanup lifecycle.
 
 ### Changed
 
@@ -88,6 +91,10 @@ version is zero, the Zig source API is intentionally unstable.
 - The `replicate-once` consumer template now obtains its complete controller
   resource arena during host initialization instead of manually declaring and
   wiring every workspace.
+- `ObjectReader` now carries the generation receipt returned by its first
+  successful range into every later refill. Filesystem reads compare canonical
+  opened-file metadata before and after each positional read; S3 reads capture
+  the first response ETag and sign later range requests with `If-Match`.
 
 ### Fixed
 
@@ -115,6 +122,10 @@ version is zero, the Zig source API is intentionally unstable.
   server but its acknowledgement was lost, so callers reconcile the exact
   object instead of treating the outcome as an ordinary retryable transport
   failure.
+- S3 ranged reads reject missing, duplicate, empty, or over-capacity ETags
+  instead of accepting an unbound or silently truncated generation receipt;
+  an `If-Match` rejection is reported as `ObjectChanged` and never as
+  publication uncertainty.
 
 ## [0.3.0] - 2026-08-27
 

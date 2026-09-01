@@ -120,11 +120,18 @@ const FaultingClient = struct {
     fn read_range(
         context: *anyopaque,
         info: ltx.FileInfo,
+        expected_generation: ?ltx_object.ReadGeneration,
         offset_bytes: u64,
         destination: []u8,
-    ) ltx_object.Error!void {
+    ) ltx_object.Error!ltx_object.ReadGeneration {
         const self: *FaultingClient = @ptrCast(@alignCast(context));
-        return self.backing.read_range(info, offset_bytes, destination);
+        return self.backing.read_range_fn(
+            self.backing.context,
+            info,
+            expected_generation,
+            offset_bytes,
+            destination,
+        );
     }
 
     fn write_object(

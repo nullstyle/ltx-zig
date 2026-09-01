@@ -3,13 +3,15 @@
 This roadmap records the completed extension of `ltx-zig` from an LTX codec
 toolkit into bounded SQLite-to-object-store replication building blocks,
 informed by the pinned `denoland/celld` LTX crate and exposed as an embeddable
-library rather than a daemon. The M1–M10 stack is shipped: the original
+library rather than a daemon. The M1–M11 stack is shipped: the original
 foundations, a public checked resource binder, transactional object writes,
 bounded object reads, a synchronous per-database controller, and deterministic
 qualification of interrupted maintenance and multipart publication. The
 controller's descriptor and complete workspace set can now be derived and
 bound from one fixed caller-owned arena, and its single owner can poll bounded
 operation diagnostics without adding a logging or synchronization seam.
+Sequential object reads additionally bind every refill to the backend
+generation selected by their first successful range.
 
 The consumer built above this library — for example, a stateful actor system
 giving each actor its own SQLite database — owns which databases exist, when
@@ -45,7 +47,7 @@ Out of scope (consumer):
 | --- | --- | --- |
 | `ltx_wal` (M1) | `wal.rs` | WAL header/frame parsing, salts, cumulative checksum chains, committed page map (bitmap plus entries, newest-wins, caller-owned), salt census for checkpoint detection, torn-tail tolerance, and mid-WAL resume seeding. |
 | `ltx_capture` (M2) | `db.rs` | WAL-mode open, `_litestream_seq`/`_litestream_lock` control tables, a checkpoint-blocking read lock, snapshot and incremental collection with database-file fallback and grown pages, foreign-discontinuity snapshot fallback, seeded continuation after restore, mid-WAL resume, three-tier passive checkpoint policy, and atomic L0 publication. The Celld writer barrier is intentionally omitted for the single-writer-per-database model. |
-| `ltx_object`, `ltx_s3` (M3/M6/M7) | `client/*` | The object-client contract and filesystem backend plus S3-compatible path-style and virtual-host SigV4, bounded paginated `ListObjectsV2`, exact ranged reads with bounded sequential reader windows, idempotent per-object deletes, conditional create/replace, TLS, bounded retry, `litestream-timestamp` metadata, and transactional writer sessions that publish through filesystem staging or automatic single/multipart upload. |
+| `ltx_object`, `ltx_s3` (M3/M6/M7/M11) | `client/*` | The object-client contract and filesystem backend plus S3-compatible path-style and virtual-host SigV4, bounded paginated `ListObjectsV2`, exact generation-bound ranged reads with bounded sequential reader windows, idempotent per-object deletes, conditional create/replace, TLS, bounded retry, `litestream-timestamp` metadata, and transactional writer sessions that publish through filesystem staging or automatic single/multipart upload. |
 | `ltx_replica` (M4) | `replica.rs`, `replica_compactor.rs`, `compaction_level.rs` | Restore planning and generic staged-apply execution, the level ladder (L0/L1/L2/L3 plus snapshot level 9), bounded level compaction over the existing `Compactor`, and retention planning. |
 | `ltx_resources` (M6) | — | Checked public codec, apply, WAL, and wire capacity formulas plus an alignment-aware fixed-arena binder. |
 | `ltx_replication` (M6/M9/M10) | `replica.rs`, `db.rs` | One synchronous controller for empty, verified-local, or restore-latest startup; complete fixed-arena resource derivation and binding; capture and trusted position; all-level restore; caller-selected adjacent-level compaction; publish-before-delete retention; and copied, allocation-free operation diagnostics. Scheduling, fencing, acknowledgement, and telemetry export stay outside. |
@@ -101,6 +103,7 @@ and `resource-check` verifies them.
 | M8 — deterministic interruption hardening ✅ | Restart-safe controller retention reconciliation that re-verifies the covering upper-level restore plan before source or covered-snapshot deletion; precise S3 transactional publication uncertainty as `PublicationIndeterminate`; and fixed, deterministic fault checkpoints at the existing object and HTTP seams rather than a new production fault API. | Hermetic controller restart tests cover interruption before and during source and older-snapshot cleanup and require an exact restored image; scripted S3 tests cover single PUT, multipart initiation, part upload, completion acknowledgement loss, abort failure, and cleanup retry, with the MinIO gate retaining real-protocol coverage. |
 | M9 — complete controller arena ✅ | `Resources.arena_capacity_bytes` derives the complete checked budget for a configuration and client capability; `Resources.bind` places the descriptor and all controller workspaces in one caller-owned arena while preserving manual construction. Transactional adapters omit whole-object fallback storage. | Exact-capacity and one-byte-short arenas, hostile starting alignment, overflow and invalid configuration, transactional and whole-object client paths, manual-resource compatibility, the simplified consumer example, and the existing controller lifecycle gates. |
 | M10 — bounded controller diagnostics ✅ | `Controller.diagnostics()` returns one infallible, pointer-free snapshot with ready/poisoned/finished lifecycle; saturating accepted/rejected/succeeded/failed counters for sync, restore, and maintenance; sticky saturation; and the exact last accepted result or error. Rejections preserve the causal accepted failure, and polling remains safe after poison and finish. No callback, clock, reset, history, scheduling policy, or allocation is added. | Hermetic lifecycle tests cover initial state, each operation's success path, preflight and terminal-state rejection, non-poisoning and poisoning accepted failures, cause preservation through rejection and finish, plus the counter saturation boundary. The consumer example polls the final snapshot, and the existing controller lifecycle and release gates remain authoritative. |
+| M11 — generation-bound object reads ✅ | Every nonempty range returns one bounded, opaque generation receipt. `ObjectReader` carries the first receipt across refills while ordinary one-shot reads remain source-compatible. File reads compare explicit opened-handle identity before and after positional I/O; S3 binds the first response ETag and signs later ranges with `If-Match`. Mismatch poisons the reader as `ObjectChanged`; full LTX verification remains authoritative. | Receipt boundary and reader-poison tests, adversarial equal-length replacement, interleaved-reader independence, filesystem rename/in-place mutation, scripted S3 ETag and conditional-range failures, real MinIO replacement, scale qualification, and the existing release gates. |
 
 Normal tests stay network-free. The dedicated S3/MinIO gate and
 Litestream-binary interoperability gate are implemented and run in hosted CI;
@@ -108,14 +111,7 @@ their external tools remain outside the hermetic unit-test step.
 
 ## Candidate next increment
 
-No post-M10 feature sprint is committed. The strongest next hardening
-candidate is generation-bound ranged reads. `ObjectReader` currently relies on
-each adapter to validate a returned range against the listed total length, but
-relies on the host's ownership or fencing to prevent replacement of the same
-key between ranges.
-An optional, storage-neutral read-session seam could pin one filesystem object
-or S3 generation through terminal LTX verification without whole-object
-buffering or moving lease policy into the library. Design work should first
-prove the narrow contract against adversarial between-range replacement,
-filesystem conformance, and real MinIO behavior; the pre-1.0 API remains free
-to change while that seam is shaped.
+No post-M11 feature sprint is committed. The next increment should be chosen
+after the generation-bound read contract has completed its full local CI,
+MinIO, scale, and source-archive qualification; the pre-1.0 API remains free
+to change as deployment evidence accumulates.

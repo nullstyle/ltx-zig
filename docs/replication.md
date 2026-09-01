@@ -11,8 +11,8 @@ the codec trust model they build on is [`design.md`](design.md).
 | Module | Role |
 | --- | --- |
 | `ltx_wal` | SQLite WAL bytes to committed page maps, salt scans, and mid-WAL resume. Standalone; no filesystem or SQLite linkage. |
-| `ltx_object` | The storage-neutral object contract, bounded sequential readers over exact ranges, transactional writer sessions, the filesystem backend in the Litestream layout, and the backend-agnostic conformance suite. |
-| `ltx_s3` | The S3 backend: path-style and virtual-host SigV4, TLS, bounded retry, paginated prefix-scoped listings, exact ranged reads, object write/delete, conditional writes, automatic single/multipart transactional upload, and bucket creation. |
+| `ltx_object` | The storage-neutral object contract, generation-bound sequential readers over exact ranges, transactional writer sessions, the filesystem backend in the Litestream layout, and the backend-agnostic conformance suite. |
+| `ltx_s3` | The S3 backend: path-style and virtual-host SigV4, TLS, bounded retry, paginated prefix-scoped listings, ETag-bound ranged reads, object write/delete, conditional writes, automatic single/multipart transactional upload, and bucket creation. |
 | `ltx_replica` | The level ladder, restore planning, compaction and retention planners, and the restore and compaction executors over `ltx` codecs. |
 | `ltx_capture` | The SQLite capture session: WAL-mode lifecycle, Litestream control tables, a checkpoint-blocking read lock, snapshot/incremental/fallback transitions, seeded continuation, mid-WAL resume, and three-tier passive checkpointing. Links SQLite through a hand-written extern surface provided by the host build. |
 | `ltx_resources` | Checked public resource formulas and fixed-arena binding for byte and typed workspaces. |
@@ -47,8 +47,10 @@ explicit limits, workspaces, and timestamps. Consult
   `CompleteMultipartUpload` acknowledgement can mean that the object is
   already visible even though the client did not receive the success body.
 - Restore and compaction consume each listed object through a caller-owned
-  sequential read window. Every adapter must fill each requested range exactly
-  and independently reject a current total object length different from the
+  sequential read window. The first successful range returns one bounded,
+  opaque generation receipt; every later refill is conditioned on that receipt
+  and must return the same value. Every adapter must also fill each requested
+  range exactly and reject a current total object length different from the
   listing. No page, position, or output becomes trusted before the decoder
   verifies the complete index, trailer, checksum, and logical EOF.
 
@@ -269,9 +271,12 @@ rather than replace the 512 MiB series above.
   parts numbered from one without gaps, every part but the last at the
   store's 5 MiB minimum). Transactional writers buffer at most one part and
   automatically use a single PUT for small objects or multipart for larger
-  ones. Sequential input uses signed single-range GETs, accepts only exact
-  `206 Partial Content` responses, and validates `Content-Range` start, end,
-  and total length against the listing before returning bytes. Listings
+  ones. Sequential input uses signed single-range GETs, requires one bounded
+  response ETag, signs every refill after the first with `If-Match`, accepts
+  only exact `206 Partial Content` responses, and validates `Content-Range`
+  start, end, and total length against the listing before returning bytes. A
+  `412 Precondition Failed` response is `ObjectChanged`, not publication
+  uncertainty. Listings
   request at most eight keys per page so the maximum S3 key and
   its XML expansion remain inside the fixed 64 KiB response workspace, and
   `Config.max_listing_pages` bounds total remote pagination even when foreign
@@ -281,12 +286,17 @@ rather than replace the 512 MiB series above.
   client never receives an upload ID and therefore has no local cleanup handle;
   deployments must bound those unknown incomplete uploads with store-side
   lifecycle cleanup.
-- `ltx_object.ObjectReader` relies on each `Client.read_range` adapter to
-  verify the listed total length on every range, but it does not pin a backend
-  generation across ranges. The host's existing ownership/fencing boundary
-  must prevent replacement of the same object key from the first range through
-  final LTX verification. Supporting unfenced cross-writer reads would require
-  a future generation-token or conditional ETag read-session seam.
+- `ltx_object.ObjectReader` binds the first nonempty range to an adapter-defined
+  `ReadGeneration` receipt and poisons on any later mismatch. Receipts are
+  fixed at 128 bytes and are independent for interleaved readers; one-shot
+  `Client.read_range` calls intentionally bind and discard their own receipt.
+  The filesystem adapter fingerprints the opened handle's inode, size, and
+  modification/status-change timestamps before and after each positional read.
+  This detects replacement under the supported temporary-file-and-rename
+  publication model and ordinary in-place mutation, but portable metadata is
+  not a cryptographic defense against a hostile metadata-preserving ABA. S3
+  uses the object's ETag as the receipt and conditions later ranges with
+  `If-Match`. Full LTX verification remains the authoritative content check.
 - `ltx_capture`: passive checkpointing only — no writer barrier, which the
   single-writer-per-database model makes unnecessary. Three tiers bound the
   WAL: `checkpoint_threshold_bytes`, `checkpoint_interval_ms`, and

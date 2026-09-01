@@ -403,9 +403,10 @@ stack; see
 milestones and remaining candidates. Import `ltx_wal` for bounded SQLite
 WAL parsing with committed page maps and salt scans, `ltx_object` for the
 storage-neutral object contract, exact ranged reads with a bounded sequential
-reader, transactional write sessions, its filesystem backend, and conformance
+reader whose refills remain bound to one backend generation, transactional
+write sessions, its filesystem backend, and conformance
 suite, `ltx_s3` for S3-compatible stores (path-style
-or virtual-host SigV4, TLS, paginated listings, signed exact ranged reads,
+or virtual-host SigV4, TLS, paginated listings, ETag-bound signed ranged reads,
 object write/delete, conditional writes, bounded retry, automatic
 single-or-multipart transactional publication, and bucket creation over the
 standard-library HTTP client),

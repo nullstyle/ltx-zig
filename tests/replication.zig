@@ -397,11 +397,18 @@ const DeleteFaultClient = struct {
     fn read_range(
         context: *anyopaque,
         info: ltx.FileInfo,
+        expected_generation: ?object.ReadGeneration,
         offset_bytes: u64,
         destination: []u8,
-    ) object.Error!void {
+    ) object.Error!object.ReadGeneration {
         const self: *DeleteFaultClient = @ptrCast(@alignCast(context));
-        return self.backing.read_range(info, offset_bytes, destination);
+        return self.backing.read_range_fn(
+            self.backing.context,
+            info,
+            expected_generation,
+            offset_bytes,
+            destination,
+        );
     }
 
     fn write(
@@ -470,11 +477,18 @@ const WholeObjectClient = struct {
     fn read_range(
         context: *anyopaque,
         info: ltx.FileInfo,
+        expected_generation: ?object.ReadGeneration,
         offset_bytes: u64,
         destination: []u8,
-    ) object.Error!void {
+    ) object.Error!object.ReadGeneration {
         const self: *WholeObjectClient = @ptrCast(@alignCast(context));
-        return self.backing.read_range(info, offset_bytes, destination);
+        return self.backing.read_range_fn(
+            self.backing.context,
+            info,
+            expected_generation,
+            offset_bytes,
+            destination,
+        );
     }
 
     fn write(

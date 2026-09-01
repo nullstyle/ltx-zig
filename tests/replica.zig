@@ -234,15 +234,22 @@ const ReadFaultClient = struct {
     fn read_range(
         context: *anyopaque,
         info: ltx.FileInfo,
+        expected_generation: ?object.ReadGeneration,
         offset_bytes: u64,
         destination: []u8,
-    ) object.Error!void {
+    ) object.Error!object.ReadGeneration {
         const self: *ReadFaultClient = @ptrCast(@alignCast(context));
         self.read_call_count += 1;
         if (self.read_call_count == self.fail_at_call) {
             return error.StorageFailure;
         }
-        return self.backing.read_range(info, offset_bytes, destination);
+        return self.backing.read_range_fn(
+            self.backing.context,
+            info,
+            expected_generation,
+            offset_bytes,
+            destination,
+        );
     }
 
     fn write(

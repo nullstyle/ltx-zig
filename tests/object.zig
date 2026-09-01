@@ -77,6 +77,8 @@ const FailingWriteBackend = struct {
 
 const FailingReadBackend = struct {
     bytes: []const u8,
+    generation_bytes: []const u8 = "generation-1",
+    invalid_generation_length_bytes: ?u8 = null,
     fail_at_call: ?u32 = null,
     call_count: u32 = 0,
 
@@ -102,16 +104,28 @@ const FailingReadBackend = struct {
     fn read_range(
         context: *anyopaque,
         info: ltx.FileInfo,
+        expected_generation: ?object.ReadGeneration,
         offset_bytes: u64,
         destination: []u8,
-    ) object.Error!void {
+    ) object.Error!object.ReadGeneration {
         const self: *FailingReadBackend = @ptrCast(@alignCast(context));
         self.call_count += 1;
         if (self.fail_at_call == self.call_count) return error.StorageFailure;
         if (info.size_bytes != self.bytes.len) return error.ObjectChanged;
+        const generation = if (self.invalid_generation_length_bytes) |length_bytes|
+            object.ReadGeneration{
+                .bytes = undefined,
+                .length_bytes = length_bytes,
+            }
+        else
+            try object.ReadGeneration.init(self.generation_bytes);
+        if (expected_generation) |expected| {
+            if (!expected.eql(generation)) return error.ObjectChanged;
+        }
         const offset = std.math.cast(usize, offset_bytes) orelse
             return error.InvalidReadRange;
         @memcpy(destination, self.bytes[offset..][0..destination.len]);
+        return generation;
     }
 
     fn write(
@@ -147,6 +161,53 @@ const SyncFault = struct {
         return std.testing.io.vtable.fileSync(userdata, file);
     }
 };
+
+test "read generation enforces nonempty fixed-capacity receipts" {
+    try std.testing.expectError(
+        error.GenerationUnavailable,
+        object.ReadGeneration.init(""),
+    );
+    var maximum: [object.max_read_generation_bytes]u8 = undefined;
+    @memset(&maximum, 0xa5);
+    const first = try object.ReadGeneration.init(&maximum);
+    const second = try object.ReadGeneration.init(&maximum);
+    try std.testing.expectEqual(maximum.len, first.value().len);
+    try std.testing.expect(first.eql(second));
+
+    var oversized: [object.max_read_generation_bytes + 1]u8 = undefined;
+    @memset(&oversized, 0xa5);
+    try std.testing.expectError(
+        error.GenerationTooLarge,
+        object.ReadGeneration.init(&oversized),
+    );
+
+    const identity = ltx.FileIdentity{
+        .min_txid = .init(1),
+        .max_txid = .init(1),
+    };
+    var destination: [1]u8 = undefined;
+    var backend = FailingReadBackend{
+        .bytes = "x",
+        .invalid_generation_length_bytes = 0,
+    };
+    try std.testing.expectError(
+        error.GenerationUnavailable,
+        backend.client().read_range(
+            file_info(0, identity, 1),
+            0,
+            &destination,
+        ),
+    );
+    backend.invalid_generation_length_bytes = object.max_read_generation_bytes + 1;
+    try std.testing.expectError(
+        error.GenerationTooLarge,
+        backend.client().read_range(
+            file_info(0, identity, 1),
+            0,
+            &destination,
+        ),
+    );
+}
 
 fn fault_io(vtable: *std.Io.VTable, fail_at: ?u32) std.Io {
     SyncFault.reset(fail_at);
@@ -236,6 +297,34 @@ test "object reader retains a range failure and remains poisoned" {
     try std.testing.expectEqual(@as(usize, 2), try reader.read(&output));
     try std.testing.expectError(error.InputFailure, reader.read(output[2..]));
     try std.testing.expectEqual(error.StorageFailure, source.failure().?);
+    try std.testing.expectEqual(@as(u32, 2), backend.call_count);
+
+    try std.testing.expectError(error.InputFailure, reader.read(output[2..]));
+    try std.testing.expectError(error.InputFailure, reader.at_end());
+    try std.testing.expectEqual(@as(u32, 2), backend.call_count);
+}
+
+test "object reader rejects an equal-size replacement and remains poisoned" {
+    var backend = FailingReadBackend{ .bytes = "abcdef" };
+    const identity = ltx.FileIdentity{
+        .min_txid = .init(3),
+        .max_txid = .init(3),
+    };
+    var workspace: [2]u8 = undefined;
+    var source = try object.ObjectReader.init(
+        backend.client(),
+        file_info(0, identity, backend.bytes.len),
+        &workspace,
+    );
+    const reader = source.reader();
+    var output: [6]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try reader.read(&output));
+    try std.testing.expectEqualStrings("ab", output[0..2]);
+
+    backend.bytes = "UVWXYZ";
+    backend.generation_bytes = "generation-2";
+    try std.testing.expectError(error.InputFailure, reader.read(output[2..]));
+    try std.testing.expectEqual(error.ObjectChanged, source.failure().?);
     try std.testing.expectEqual(@as(u32, 2), backend.call_count);
 
     try std.testing.expectError(error.InputFailure, reader.read(output[2..]));
@@ -711,6 +800,124 @@ test "file client writes the litestream filesystem layout" {
             &storage,
         ),
     );
+}
+
+test "file object reader rejects an equal-size rename replacement" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var file_client = try object.FileClient.init(temporary.dir, std.testing.io, "");
+    const client = file_client.client();
+    const identity = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(21),
+        .max_txid = ltx.TXID.init(21),
+    };
+    try client.write(0, identity, 1, "abcdef");
+
+    var workspace: [2]u8 = undefined;
+    var source = try object.ObjectReader.init(
+        client,
+        file_info(0, identity, "abcdef".len),
+        &workspace,
+    );
+    const reader = source.reader();
+    var output: [6]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try reader.read(&output));
+    try client.write(0, identity, 2, "UVWXYZ");
+
+    try std.testing.expectError(error.InputFailure, reader.read(output[2..]));
+    try std.testing.expectEqual(error.ObjectChanged, source.failure().?);
+    try std.testing.expectError(error.InputFailure, reader.read(output[2..]));
+}
+
+test "file object reader rejects same-path in-place mutation" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var file_client = try object.FileClient.init(temporary.dir, std.testing.io, "");
+    const client = file_client.client();
+    const identity = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(22),
+        .max_txid = ltx.TXID.init(22),
+    };
+    try client.write(0, identity, 1, "abcdef");
+
+    var workspace: [2]u8 = undefined;
+    var source = try object.ObjectReader.init(
+        client,
+        file_info(0, identity, "abcdef".len),
+        &workspace,
+    );
+    const reader = source.reader();
+    var output: [6]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try reader.read(&output));
+
+    var path_storage: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try ltx.format_file_path("", 0, identity, &path_storage);
+    {
+        const file = try temporary.dir.openFile(
+            std.testing.io,
+            path,
+            .{ .mode = .read_write },
+        );
+        defer file.close(std.testing.io);
+        const before = try file.stat(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "ZZ", 2);
+        try file.setTimestamps(std.testing.io, .{
+            .modify_timestamp = .{ .new = .{
+                .nanoseconds = before.mtime.nanoseconds + 2 * std.time.ns_per_s,
+            } },
+        });
+    }
+
+    try std.testing.expectError(error.InputFailure, reader.read(output[2..]));
+    try std.testing.expectEqual(error.ObjectChanged, source.failure().?);
+}
+
+test "file object readers keep independent interleaved generations" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var file_client = try object.FileClient.init(temporary.dir, std.testing.io, "");
+    const client = file_client.client();
+    const first = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(31),
+        .max_txid = ltx.TXID.init(31),
+    };
+    const second = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(32),
+        .max_txid = ltx.TXID.init(32),
+    };
+    try client.write(0, first, 1, "abc");
+    try client.write(0, second, 1, "XYZ");
+
+    var first_workspace: [1]u8 = undefined;
+    var second_workspace: [1]u8 = undefined;
+    var first_source = try object.ObjectReader.init(
+        client,
+        file_info(0, first, 3),
+        &first_workspace,
+    );
+    var second_source = try object.ObjectReader.init(
+        client,
+        file_info(0, second, 3),
+        &second_workspace,
+    );
+    const first_reader = first_source.reader();
+    const second_reader = second_source.reader();
+    var first_output: [3]u8 = undefined;
+    var second_output: [3]u8 = undefined;
+    for (0..3) |index| {
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            try first_reader.read(first_output[index..]),
+        );
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            try second_reader.read(second_output[index..]),
+        );
+    }
+    try std.testing.expectEqualStrings("abc", &first_output);
+    try std.testing.expectEqualStrings("XYZ", &second_output);
+    try std.testing.expectEqual(@as(?object.Error, null), first_source.failure());
+    try std.testing.expectEqual(@as(?object.Error, null), second_source.failure());
 }
 
 test "file client ignores foreign and hidden files when listing" {

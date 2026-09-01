@@ -151,20 +151,33 @@ const ScriptedRangeResponse = struct {
     headers: []const std.http.Header = &.{},
     body: []const u8,
     expected_range: []const u8 = "bytes=0-2",
+    expected_etag: ?[]const u8 = null,
 };
 
-fn request_has_exact_range(
+fn request_has_exact_header(
     request: *const std.http.Server.Request,
+    name: []const u8,
     expected: []const u8,
 ) bool {
     var found: ?[]const u8 = null;
     var headers = request.iterateHeaders();
     while (headers.next()) |header| {
-        if (!std.ascii.eqlIgnoreCase(header.name, "range")) continue;
+        if (!std.ascii.eqlIgnoreCase(header.name, name)) continue;
         if (found != null) return false;
         found = header.value;
     }
     return if (found) |value| std.mem.eql(u8, value, expected) else false;
+}
+
+fn request_lacks_header(
+    request: *const std.http.Server.Request,
+    name: []const u8,
+) bool {
+    var headers = request.iterateHeaders();
+    while (headers.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name)) return false;
+    }
+    return true;
 }
 
 fn serve_scripted_range_responses(
@@ -184,7 +197,11 @@ fn serve_scripted_range_responses(
         );
         var request = try http_server.receiveHead();
         const valid_request = request.head.method == .GET and
-            request_has_exact_range(&request, response.expected_range);
+            request_has_exact_header(&request, "range", response.expected_range) and
+            if (response.expected_etag) |etag|
+                request_has_exact_header(&request, "if-match", etag)
+            else
+                request_lacks_header(&request, "if-match");
         try request.respond(response.body, .{
             .status = response.status,
             .keep_alive = false,
@@ -650,30 +667,67 @@ test "scripted write session poisons and retains failed multipart cleanup" {
     try server_task.await(std.testing.io);
 }
 
-const valid_range_header = [_]std.http.Header{.{
-    .name = "content-range",
-    .value = "bytes 0-2/6",
-}};
+const generation_one = "\"generation-one\"";
+const generation_two = "\"generation-two\"";
+
+const valid_range_headers = [_]std.http.Header{
+    .{ .name = "content-range", .value = "bytes 0-2/6" },
+    .{ .name = "etag", .value = generation_one },
+};
+
+const valid_second_range_headers = [_]std.http.Header{
+    .{ .name = "content-range", .value = "bytes 3-5/6" },
+    .{ .name = "etag", .value = generation_one },
+};
+
+const changed_second_range_headers = [_]std.http.Header{
+    .{ .name = "content-range", .value = "bytes 3-5/6" },
+    .{ .name = "etag", .value = generation_two },
+};
 
 const duplicate_range_headers = [_]std.http.Header{
     .{ .name = "content-range", .value = "bytes 0-2/6" },
     .{ .name = "Content-Range", .value = "bytes 0-2/6" },
+    .{ .name = "etag", .value = generation_one },
 };
 
-const mismatched_interval_header = [_]std.http.Header{.{
+const mismatched_interval_headers = [_]std.http.Header{
+    .{ .name = "content-range", .value = "bytes 1-3/6" },
+    .{ .name = "etag", .value = generation_one },
+};
+
+const mismatched_total_headers = [_]std.http.Header{
+    .{ .name = "content-range", .value = "bytes 0-2/7" },
+    .{ .name = "etag", .value = generation_one },
+};
+
+const second_mismatched_total_headers = [_]std.http.Header{
+    .{ .name = "content-range", .value = "bytes 3-5/7" },
+    .{ .name = "etag", .value = generation_one },
+};
+
+const range_without_etag_headers = [_]std.http.Header{.{
     .name = "content-range",
-    .value = "bytes 1-3/6",
+    .value = "bytes 0-2/6",
 }};
 
-const mismatched_total_header = [_]std.http.Header{.{
-    .name = "content-range",
-    .value = "bytes 0-2/7",
-}};
+const duplicate_etag_headers = [_]std.http.Header{
+    .{ .name = "content-range", .value = "bytes 0-2/6" },
+    .{ .name = "etag", .value = generation_one },
+    .{ .name = "ETag", .value = generation_one },
+};
 
-const second_mismatched_total_header = [_]std.http.Header{.{
-    .name = "content-range",
-    .value = "bytes 3-5/7",
-}};
+const empty_etag_headers = [_]std.http.Header{
+    .{ .name = "content-range", .value = "bytes 0-2/6" },
+    .{ .name = "etag", .value = "" },
+};
+
+const oversized_etag_value: [ltx_object.max_read_generation_bytes + 1]u8 =
+    @splat('e');
+const oversized_etag_headers = [_]std.http.Header{
+    .{ .name = "content-range", .value = "bytes 0-2/6" },
+    .{ .name = "etag", .value = &oversized_etag_value },
+};
 
 test "scripted S3 range read rejects a whole-object success response" {
     try expect_scripted_range_error(.{
@@ -685,6 +739,10 @@ test "scripted S3 range read rejects a whole-object success response" {
 test "scripted S3 range read requires exactly one Content-Range header" {
     try expect_scripted_range_error(.{
         .status = .partial_content,
+        .headers = &[_]std.http.Header{.{
+            .name = "etag",
+            .value = generation_one,
+        }},
         .body = "abc",
     }, error.StorageFailure);
     try expect_scripted_range_error(.{
@@ -697,12 +755,12 @@ test "scripted S3 range read requires exactly one Content-Range header" {
 test "scripted S3 range read validates the complete Content-Range value" {
     try expect_scripted_range_error(.{
         .status = .partial_content,
-        .headers = &mismatched_interval_header,
+        .headers = &mismatched_interval_headers,
         .body = "abc",
     }, error.StorageFailure);
     try expect_scripted_range_error(.{
         .status = .partial_content,
-        .headers = &mismatched_total_header,
+        .headers = &mismatched_total_headers,
         .body = "abc",
     }, error.ObjectChanged);
 }
@@ -710,14 +768,166 @@ test "scripted S3 range read validates the complete Content-Range value" {
 test "scripted S3 range read rejects short and oversized response bodies" {
     try expect_scripted_range_error(.{
         .status = .partial_content,
-        .headers = &valid_range_header,
+        .headers = &valid_range_headers,
         .body = "ab",
     }, error.StorageFailure);
     try expect_scripted_range_error(.{
         .status = .partial_content,
-        .headers = &valid_range_header,
+        .headers = &valid_range_headers,
         .body = "abcd",
     }, error.StorageFailure);
+}
+
+test "scripted S3 range read requires one bounded nonempty ETag" {
+    try expect_scripted_range_error(.{
+        .status = .partial_content,
+        .headers = &range_without_etag_headers,
+        .body = "abc",
+    }, error.StorageFailure);
+    try expect_scripted_range_error(.{
+        .status = .partial_content,
+        .headers = &duplicate_etag_headers,
+        .body = "abc",
+    }, error.StorageFailure);
+    try expect_scripted_range_error(.{
+        .status = .partial_content,
+        .headers = &empty_etag_headers,
+        .body = "abc",
+    }, error.StorageFailure);
+    try expect_scripted_range_error(.{
+        .status = .partial_content,
+        .headers = &oversized_etag_headers,
+        .body = "abc",
+    }, error.StorageFailure);
+}
+
+test "scripted S3 object reader binds ETag and sends If-Match on refill" {
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const responses = [_]ScriptedRangeResponse{
+        .{
+            .status = .partial_content,
+            .headers = &valid_range_headers,
+            .body = "abc",
+        },
+        .{
+            .status = .partial_content,
+            .headers = &valid_second_range_headers,
+            .body = "def",
+            .expected_range = "bytes=3-5",
+            .expected_etag = generation_one,
+        },
+    };
+    var server_task = std.testing.io.async(
+        serve_scripted_range_responses,
+        .{ &server, &responses },
+    );
+    defer _ = server_task.cancel(std.testing.io) catch {};
+
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try ltx_s3.S3Client.init(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .host = "127.0.0.1",
+            .port = server.socket.address.getPort(),
+            .bucket = "scripted-reader",
+            .access_key = "test-access",
+            .secret_key = "test-secret",
+            .clock = .{
+                .context = &plain_clock_context,
+                .now_ms_fn = TestClock.now_ms,
+            },
+        },
+        &send_workspace,
+    );
+    defer s3.deinit();
+
+    const info = object_info(.{ .min_txid = .init(2), .max_txid = .init(2) }, 6);
+    var workspace: [3]u8 = undefined;
+    var source = try ltx_object.ObjectReader.init(s3.client(), info, &workspace);
+    const reader = source.reader();
+    var output: [6]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try reader.read(&output));
+    try std.testing.expectEqual(@as(usize, 3), try reader.read(output[3..]));
+    try std.testing.expectEqualStrings("abcdef", &output);
+    try std.testing.expect(try reader.at_end());
+    try std.testing.expect(source.failure() == null);
+    try server_task.await(std.testing.io);
+}
+
+fn expect_scripted_refill_error(
+    second_response: ScriptedRangeResponse,
+    expected_error: ltx_object.Error,
+) !void {
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const responses = [_]ScriptedRangeResponse{
+        .{
+            .status = .partial_content,
+            .headers = &valid_range_headers,
+            .body = "abc",
+        },
+        second_response,
+    };
+    var server_task = std.testing.io.async(
+        serve_scripted_range_responses,
+        .{ &server, &responses },
+    );
+    defer _ = server_task.cancel(std.testing.io) catch {};
+
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try ltx_s3.S3Client.init(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .host = "127.0.0.1",
+            .port = server.socket.address.getPort(),
+            .bucket = "scripted-reader",
+            .access_key = "test-access",
+            .secret_key = "test-secret",
+            .clock = .{
+                .context = &plain_clock_context,
+                .now_ms_fn = TestClock.now_ms,
+            },
+        },
+        &send_workspace,
+    );
+    defer s3.deinit();
+
+    const info = object_info(.{ .min_txid = .init(3), .max_txid = .init(3) }, 6);
+    var workspace: [3]u8 = undefined;
+    var source = try ltx_object.ObjectReader.init(s3.client(), info, &workspace);
+    const reader = source.reader();
+    var first: [3]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try reader.read(&first));
+    try std.testing.expectEqualStrings("abc", &first);
+    var second: [3]u8 = @splat(0xcc);
+    try std.testing.expectError(error.InputFailure, reader.read(&second));
+    try std.testing.expectEqual(expected_error, source.failure().?);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xcc} ** 3), &second);
+    try server_task.await(std.testing.io);
+}
+
+test "scripted S3 conditional refill maps precondition failure to object change" {
+    try expect_scripted_refill_error(.{
+        .status = .precondition_failed,
+        .body = "",
+        .expected_range = "bytes=3-5",
+        .expected_etag = generation_one,
+    }, error.ObjectChanged);
+}
+
+test "scripted S3 successful refill rejects a changed response ETag" {
+    try expect_scripted_refill_error(.{
+        .status = .partial_content,
+        .headers = &changed_second_range_headers,
+        .body = "def",
+        .expected_range = "bytes=3-5",
+        .expected_etag = generation_one,
+    }, error.ObjectChanged);
 }
 
 test "scripted S3 object reader poisons without exposing failed range bytes" {
@@ -728,14 +938,15 @@ test "scripted S3 object reader poisons without exposing failed range bytes" {
     const responses = [_]ScriptedRangeResponse{
         .{
             .status = .partial_content,
-            .headers = &valid_range_header,
+            .headers = &valid_range_headers,
             .body = "abc",
         },
         .{
             .status = .partial_content,
-            .headers = &second_mismatched_total_header,
+            .headers = &second_mismatched_total_headers,
             .body = "def",
             .expected_range = "bytes=3-5",
+            .expected_etag = generation_one,
         },
     };
     var server_task = std.testing.io.async(
@@ -892,6 +1103,52 @@ test "range and whole reads honor the listed object size" {
         error.ObjectChanged,
         client.read_range(stale, 0, &one),
     );
+}
+
+test "object reader rejects equal-size S3 replacement between refills" {
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try ltx_s3.S3Client.init(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .host = minio_host,
+            .port = minio_port,
+            .bucket = "ltx-gate",
+            .access_key = minio_root_user,
+            .secret_key = minio_root_password,
+            .prefix = "generation-read",
+            .clock = .{
+                .context = &plain_clock_context,
+                .now_ms_fn = TestClock.now_ms,
+            },
+        },
+        &send_workspace,
+    );
+    defer s3.deinit();
+    try s3.ensure_bucket();
+
+    const client = s3.client();
+    const identity = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(91),
+        .max_txid = ltx.TXID.init(91),
+    };
+    try delete_identity(client, identity);
+    defer delete_identity(client, identity) catch {};
+    try client.write(0, identity, 1, "abcdef");
+
+    const info = object_info(identity, 6);
+    var workspace: [3]u8 = undefined;
+    var source = try ltx_object.ObjectReader.init(client, info, &workspace);
+    const reader = source.reader();
+    var first: [3]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try reader.read(&first));
+    try std.testing.expectEqualStrings("abc", &first);
+
+    try client.write(0, identity, 2, "uvwxyz");
+    var second: [3]u8 = @splat(0xcc);
+    try std.testing.expectError(error.InputFailure, reader.read(&second));
+    try std.testing.expectEqual(error.ObjectChanged, source.failure().?);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xcc} ** 3), &second);
 }
 
 test "s3 backend passes the conformance suite and a plan round trip" {

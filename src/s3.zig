@@ -3,7 +3,8 @@
 //! Implements the object-client contract against S3-compatible stores using
 //! path-style requests and AWS Signature Version 4, at the granularity this
 //! milestone covers: single-request `PutObject` with the
-//! `litestream-timestamp` metadata header, ranged `GetObject`, per-object
+//! `litestream-timestamp` metadata header, ETag-bound ranged `GetObject`,
+//! per-object
 //! `DeleteObject`, paginated `ListObjectsV2` with `start-after` seek, and
 //! bucket creation. Transactional write sessions stay in one caller-owned
 //! buffer for small objects and switch automatically to multipart upload only
@@ -56,7 +57,9 @@ pub const RetryCause = union(enum) {
 
 /// Caller-injected retry policy. Retries apply to transport failures and
 /// to retryable statuses on idempotent methods only (GET, HEAD, DELETE, and
-/// unconditional PUT). Conditional PUT and POST requests are never retried.
+/// unconditional PUT). A ranged GET constrained by `If-Match` is also safe to
+/// retry with the same generation. Conditional PUT and POST requests are never
+/// retried.
 /// Transactional publication may retry a definite pre-send transport failure,
 /// but never retries after delivery begins or after a response status arrives.
 /// Delay selection and sleeping are both injected so the module never reads
@@ -188,7 +191,7 @@ pub const S3Client = struct {
     key_slices: [max_list_keys_per_page][]const u8 = undefined,
     size_values: [max_list_keys_per_page]u64 = undefined,
     token_workspace: [256]u8 = undefined,
-    etag_workspace: [128]u8 = undefined,
+    etag_workspace: [object.max_read_generation_bytes]u8 = undefined,
     multipart: ?MultipartState = null,
     multipart_owner: ?MultipartOwner = null,
     write_session: ?StreamingWriteState = null,
@@ -345,11 +348,12 @@ pub const S3Client = struct {
     fn read_range(
         context: *anyopaque,
         info: ltx.FileInfo,
+        expected_generation: ?object.ReadGeneration,
         offset_bytes: u64,
         destination: []u8,
-    ) Error!void {
+    ) Error!object.ReadGeneration {
         const self: *S3Client = @ptrCast(@alignCast(context));
-        if (destination.len == 0) return;
+        std.debug.assert(destination.len > 0);
         const length_bytes = std.math.cast(u64, destination.len) orelse
             return error.InvalidReadRange;
         const end_exclusive_bytes = std.math.add(
@@ -365,12 +369,17 @@ pub const S3Client = struct {
         });
         const outcome = try self.perform(.GET, key, "", .{
             .body_destination = destination,
+            .conditional = if (expected_generation) |generation|
+                .{ .match_etag = generation.value() }
+            else
+                .none,
             .byte_range = .{
                 .start_bytes = offset_bytes,
                 .end_bytes = end_bytes,
             },
         });
         if (outcome.status == .not_found) return error.ObjectNotFound;
+        if (outcome.status == .precondition_failed) return error.ObjectChanged;
         if (outcome.status == .range_not_satisfiable) return error.ObjectChanged;
         if (outcome.status != .partial_content) return error.StorageFailure;
         const content_range = outcome.content_range orelse
@@ -383,6 +392,9 @@ pub const S3Client = struct {
         {
             return error.StorageFailure;
         }
+        return object.ReadGeneration.init(
+            outcome.etag orelse return error.StorageFailure,
+        );
     }
 
     fn write(
@@ -926,7 +938,12 @@ pub const S3Client = struct {
     ) Error!Outcome {
         switch (options.conditional) {
             .none => {},
-            .create_only, .match_etag => unreachable,
+            .create_only => unreachable,
+            .match_etag => {
+                std.debug.assert(method == .GET);
+                std.debug.assert(options.byte_range != null);
+                std.debug.assert(options.publication == .definite);
+            },
         }
         const policy = self.config.retry orelse
             return self.perform_once(method, key, query, options);
@@ -985,7 +1002,9 @@ pub const S3Client = struct {
             .create_only, .match_etag => {},
         }
         std.debug.assert(options.byte_range == null);
-        return self.perform_once(method, key, query, options);
+        var publication_options = options;
+        publication_options.publication = .indeterminate_after_send;
+        return self.perform_once(method, key, query, publication_options);
     }
 
     /// Signs and performs exactly one request attempt.
@@ -1133,9 +1152,13 @@ pub const S3Client = struct {
         var header_iterator = response.head.iterateHeaders();
         while (header_iterator.next()) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "etag")) {
-                const length = @min(header.value.len, self.etag_workspace.len);
-                @memcpy(self.etag_workspace[0..length], header.value[0..length]);
-                etag = self.etag_workspace[0..length];
+                if (etag != null or header.value.len == 0 or
+                    header.value.len > self.etag_workspace.len)
+                {
+                    return error.StorageFailure;
+                }
+                @memcpy(self.etag_workspace[0..header.value.len], header.value);
+                etag = self.etag_workspace[0..header.value.len];
             } else if (status == .partial_content and
                 std.ascii.eqlIgnoreCase(header.name, "content-range"))
             {
@@ -1799,7 +1822,8 @@ fn retry_delay(
     if (attempt >= policy.max_attempts) return null;
     switch (conditional) {
         .none => {},
-        .create_only, .match_etag => return null,
+        .create_only => return null,
+        .match_etag => if (method != .GET) return null,
     }
     if (!method_retryable(method)) return null;
     return policy.next_delay_ms_fn(policy.context, attempt, cause);
@@ -1809,10 +1833,7 @@ fn post_send_failure(options: S3Client.RequestOptions) ConditionalWriteError {
     if (options.publication == .indeterminate_after_send) {
         return error.PublicationIndeterminate;
     }
-    return switch (options.conditional) {
-        .none => error.StorageFailure,
-        .create_only, .match_etag => error.PublicationIndeterminate,
-    };
+    return error.StorageFailure;
 }
 
 fn conditional_status_failure(status: std.http.Status) ConditionalWriteError {
@@ -2100,6 +2121,17 @@ test "retry decisions respect budget, method, and policy callback" {
         @as(?u64, null),
         retry_delay(policy, 1, .transport, .PUT, .create_only),
     );
+    // A conditional read remains bound to the same generation on retry.
+    try std.testing.expectEqual(
+        @as(?u64, 10),
+        retry_delay(
+            policy,
+            1,
+            .transport,
+            .GET,
+            .{ .match_etag = "\"generation\"" },
+        ),
+    );
     // The last allowed attempt produces no further delay.
     try std.testing.expectEqual(
         @as(?u64, null),
@@ -2114,23 +2146,23 @@ test "retry decisions respect budget, method, and policy callback" {
         @as(?u64, 20),
         retry_delay(policy, 1, .{ .status = 429 }, .PUT, .none),
     );
-    try std.testing.expectEqual(@as(u32, 3), probe.calls);
+    try std.testing.expectEqual(@as(u32, 4), probe.calls);
     try policy.sleep_ms(20);
     try std.testing.expectEqual(@as(u32, 1), probe.sleep_calls);
     try std.testing.expectEqual(@as(u64, 20), probe.last_delay_ms);
 }
 
-test "conditional publication classifies post-send failure as indeterminate" {
+test "only publication classifies post-send failure as indeterminate" {
     try std.testing.expectEqual(
         error.StorageFailure,
         post_send_failure(.{}),
     );
     try std.testing.expectEqual(
-        error.PublicationIndeterminate,
+        error.StorageFailure,
         post_send_failure(.{ .conditional = .create_only }),
     );
     try std.testing.expectEqual(
-        error.PublicationIndeterminate,
+        error.StorageFailure,
         post_send_failure(.{
             .conditional = .{ .match_etag = "\"generation\"" },
         }),

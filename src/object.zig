@@ -2,7 +2,8 @@
 //!
 //! The `Client` contract mirrors the storage half of the pinned Celld crate's
 //! `ReplicaClient` trait: listings ascending by TXID range, exact bounded
-//! range reads, idempotent writes, and idempotent deletes — all over
+//! generation-bound range reads, idempotent writes, and idempotent deletes —
+//! all over
 //! caller-owned buffers, with no allocation inside this module. Objects are
 //! opaque byte blobs at this layer; only their level and TXID-range identity
 //! are interpreted here, while listings also report their exact stored length.
@@ -23,8 +24,12 @@ pub const Error = error{
     InvalidTimestamp,
     ObjectNotFound,
     ObjectExists,
-    /// The stored object no longer has the exact size reported by its listing.
+    /// The stored object no longer has the listed size or generation.
     ObjectChanged,
+    /// An adapter could not supply a stable, nonempty read generation.
+    GenerationUnavailable,
+    /// An adapter's generation token exceeds the fixed receipt capacity.
+    GenerationTooLarge,
     /// A conditional replace saw a different stored generation than the
     /// caller expected; the caller must re-read and decide.
     ETagMismatch,
@@ -41,6 +46,43 @@ pub const Error = error{
     WriteSessionUnsupported,
     StagingCapacityExceeded,
     ReadWorkspaceTooSmall,
+};
+
+pub const max_read_generation_bytes: usize = 128;
+
+/// One fixed-capacity, pointer-free receipt identifying the object generation
+/// that supplied a range. Adapter tokens are opaque to callers, but must be
+/// nonempty and stable for the lifetime of that stored generation.
+pub const ReadGeneration = struct {
+    bytes: [max_read_generation_bytes]u8 = undefined,
+    length_bytes: u8,
+
+    pub fn init(value_bytes: []const u8) Error!ReadGeneration {
+        if (value_bytes.len == 0) return error.GenerationUnavailable;
+        if (value_bytes.len > max_read_generation_bytes) {
+            return error.GenerationTooLarge;
+        }
+        var receipt = ReadGeneration{ .length_bytes = @intCast(value_bytes.len) };
+        @memcpy(receipt.bytes[0..value_bytes.len], value_bytes);
+        return receipt;
+    }
+
+    pub fn value(self: *const ReadGeneration) []const u8 {
+        std.debug.assert(self.length_bytes != 0);
+        std.debug.assert(self.length_bytes <= max_read_generation_bytes);
+        return self.bytes[0..self.length_bytes];
+    }
+
+    pub fn eql(self: ReadGeneration, other: ReadGeneration) bool {
+        return std.mem.eql(u8, self.value(), other.value());
+    }
+
+    fn validate(self: ReadGeneration) Error!void {
+        if (self.length_bytes == 0) return error.GenerationUnavailable;
+        if (self.length_bytes > max_read_generation_bytes) {
+            return error.GenerationTooLarge;
+        }
+    }
 };
 
 pub const WriteSessionState = enum {
@@ -129,15 +171,18 @@ pub const Client = struct {
         seek: ltx.TXID,
         destination: []ltx.FileInfo,
     ) Error![]const ltx.FileInfo,
-    /// Fills one exact range from a listed object. The adapter must reject a
-    /// current stored length different from `info.size_bytes`; successful
-    /// short reads are forbidden.
+    /// Fills one exact range from a listed object and returns the generation
+    /// that supplied it. When `expected_generation` is non-null, the adapter
+    /// must reject any other generation before exposing successful bytes. It
+    /// must also reject a current stored length different from
+    /// `info.size_bytes`; successful short reads are forbidden.
     read_range_fn: *const fn (
         context: *anyopaque,
         info: ltx.FileInfo,
+        expected_generation: ?ReadGeneration,
         offset_bytes: u64,
         destination: []u8,
-    ) Error!void,
+    ) Error!ReadGeneration,
     /// Writes one object at the identity's key. Overwrites are idempotent.
     /// `created_at_ms` is the creation timestamp the backend should report
     /// in listings when it supports object metadata.
@@ -178,6 +223,22 @@ pub const Client = struct {
         offset_bytes: u64,
         destination: []u8,
     ) Error!void {
+        var generation: ?ReadGeneration = null;
+        try self.read_range_bound(
+            info,
+            &generation,
+            offset_bytes,
+            destination,
+        );
+    }
+
+    fn read_range_bound(
+        self: Client,
+        info: ltx.FileInfo,
+        generation: *?ReadGeneration,
+        offset_bytes: u64,
+        destination: []u8,
+    ) Error!void {
         try validate_file_info(info);
         const count_bytes = std.math.cast(u64, destination.len) orelse
             return error.InvalidReadRange;
@@ -185,7 +246,19 @@ pub const Client = struct {
             return error.InvalidReadRange;
         if (end_bytes > info.size_bytes) return error.InvalidReadRange;
         if (destination.len == 0) return;
-        return self.read_range_fn(self.context, info, offset_bytes, destination);
+        const returned = try self.read_range_fn(
+            self.context,
+            info,
+            generation.*,
+            offset_bytes,
+            destination,
+        );
+        try returned.validate();
+        if (generation.*) |expected| {
+            if (!expected.eql(returned)) return error.ObjectChanged;
+        } else {
+            generation.* = returned;
+        }
     }
 
     /// Reads one complete listed object through the range seam. The returned
@@ -253,6 +326,7 @@ pub const ObjectReader = struct {
     object_offset_bytes: u64 = 0,
     buffered_offset_bytes: usize = 0,
     buffered_length_bytes: usize = 0,
+    generation: ?ReadGeneration = null,
     failure_value: ?Error = null,
 
     pub fn init(
@@ -325,8 +399,9 @@ pub const ObjectReader = struct {
         const workspace_bytes = std.math.cast(u64, self.workspace.len) orelse
             return error.InvalidReadRange;
         const request_bytes: usize = @intCast(@min(remaining_bytes, workspace_bytes));
-        try self.client.read_range(
+        try self.client.read_range_bound(
             self.info,
+            &self.generation,
             self.object_offset_bytes,
             self.workspace[0..request_bytes],
         );
@@ -445,9 +520,10 @@ pub const FileClient = struct {
     fn read_range(
         context: *anyopaque,
         info: ltx.FileInfo,
+        expected_generation: ?ReadGeneration,
         offset_bytes: u64,
         destination: []u8,
-    ) Error!void {
+    ) Error!ReadGeneration {
         const self: *FileClient = @ptrCast(@alignCast(context));
         const path = try self.file_path(&self.path_a, info.level, .{
             .min_txid = info.min_txid,
@@ -460,11 +536,20 @@ pub const FileClient = struct {
             };
         };
         defer file.close(self.io);
-        const stat = file.stat(self.io) catch return error.StorageFailure;
-        if (stat.size != info.size_bytes) return error.ObjectChanged;
+        const before_stat = file.stat(self.io) catch return error.StorageFailure;
+        if (before_stat.size != info.size_bytes) return error.ObjectChanged;
+        const before_generation = try file_generation(before_stat);
+        if (expected_generation) |expected| {
+            if (!expected.eql(before_generation)) return error.ObjectChanged;
+        }
         const read = file.readPositionalAll(self.io, destination, offset_bytes) catch
             return error.StorageFailure;
         if (read != destination.len) return error.ObjectChanged;
+        const after_stat = file.stat(self.io) catch return error.StorageFailure;
+        if (after_stat.size != info.size_bytes) return error.ObjectChanged;
+        const after_generation = try file_generation(after_stat);
+        if (!before_generation.eql(after_generation)) return error.ObjectChanged;
+        return after_generation;
     }
 
     fn write(
@@ -591,6 +676,21 @@ pub const FileClient = struct {
         }
     }
 };
+
+fn file_generation(stat: std.Io.File.Stat) Error!ReadGeneration {
+    var bytes: [49]u8 = undefined;
+    const inode = std.math.cast(u64, stat.inode) orelse
+        return error.StorageFailure;
+    const nlink = std.math.cast(u64, stat.nlink) orelse
+        return error.StorageFailure;
+    std.mem.writeInt(u64, bytes[0..8], inode, .big);
+    std.mem.writeInt(u64, bytes[8..16], nlink, .big);
+    std.mem.writeInt(u64, bytes[16..24], stat.size, .big);
+    std.mem.writeInt(i96, bytes[24..36], stat.mtime.nanoseconds, .big);
+    std.mem.writeInt(i96, bytes[36..48], stat.ctime.nanoseconds, .big);
+    bytes[48] = @intCast(@intFromEnum(stat.kind));
+    return ReadGeneration.init(&bytes);
+}
 
 fn level_directory_path(
     self: *FileClient,
@@ -744,8 +844,8 @@ fn file_info_before(_: void, left: ltx.FileInfo, right: ltx.FileInfo) bool {
 
 /// Backend-agnostic conformance suite. Run it against empty storage: it
 /// writes at levels 0 and 1, asserts the listing, seek, ranged read, idempotent
-/// overwrite, and delete contracts, and deletes what it wrote. Returns
-/// `ConformanceFailure` on the first violated contract.
+/// overwrite, generation-bound refill, and delete contracts, and deletes what
+/// it wrote. Returns `ConformanceFailure` on the first violated contract.
 pub fn run_conformance(client: Client) Error!void {
     const first = ltx.FileIdentity{
         .min_txid = ltx.TXID.init(1),
@@ -834,9 +934,31 @@ pub fn run_conformance(client: Client) Error!void {
         client.read_range(stale_info, 0, storage[0..1]),
     );
 
-    // Overwrite is idempotent: same identity, new bytes, unchanged listing.
+    var read_workspace: [3]u8 = undefined;
+    var source = try ObjectReader.init(client, second_info, &read_workspace);
+    const reader = source.reader();
+    var original_prefix: [3]u8 = undefined;
+    if (reader.read(&original_prefix)) |count_bytes| {
+        if (count_bytes != original_prefix.len or
+            !std.mem.eql(u8, &original_prefix, two[0..original_prefix.len]))
+        {
+            return error.ConformanceFailure;
+        }
+    } else |_| {
+        return error.ConformanceFailure;
+    }
+
+    // Overwrite is idempotent, but an existing reader remains bound to the
+    // generation that supplied its first range.
     @memset(&two, 0x22);
     try client.write(0, second, 2500, &two);
+    if (reader.read(storage[0..3])) |_| {
+        return error.ConformanceFailure;
+    } else |err| {
+        if (err != error.InputFailure) return error.ConformanceFailure;
+    }
+    const failure = source.failure() orelse return error.ConformanceFailure;
+    if (failure != error.ObjectChanged) return error.ConformanceFailure;
     if ((try client.list(0, ltx.TXID.init(0), &infos)).len != 3) {
         return error.ConformanceFailure;
     }
