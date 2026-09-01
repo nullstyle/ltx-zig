@@ -65,7 +65,11 @@ relax those byte-level compatibility or safety requirements.
   the host retains scheduling, concurrency, acknowledgement, and fencing.
   Restore-latest startup requires a host-quiesced target with no SQLite
   sidecars, and initialization copies the level ladder and validates every
-  simultaneously live resource range.
+  simultaneously live resource range. `Resources.arena_capacity_bytes`
+  derives the checked capacity for a configuration and object client, and
+  `Resources.bind` places the descriptor and every controller workspace in one
+  caller-owned fixed arena. Callers with separately provisioned storage may
+  continue constructing `Resources` manually.
 
 The core remains synchronous and allocation-free after initialization. Page
 events are unverified; publication and trusted post-apply positions are valid

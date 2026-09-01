@@ -16,7 +16,7 @@ the codec trust model they build on is [`design.md`](design.md).
 | `ltx_replica` | The level ladder, restore planning, compaction and retention planners, and the restore and compaction executors over `ltx` codecs. |
 | `ltx_capture` | The SQLite capture session: WAL-mode lifecycle, Litestream control tables, a checkpoint-blocking read lock, snapshot/incremental/fallback transitions, seeded continuation, mid-WAL resume, and three-tier passive checkpointing. Links SQLite through a hand-written extern surface provided by the host build. |
 | `ltx_resources` | Checked public resource formulas and fixed-arena binding for byte and typed workspaces. |
-| `ltx_replication` | The synchronous per-database controller: startup restore, capture position, restore, one adjacent-level maintenance quantum, and safe retention. |
+| `ltx_replication` | The synchronous per-database controller: complete fixed-arena resource binding, startup restore, capture position, restore, one adjacent-level maintenance quantum, and safe retention. |
 
 Every module is synchronous, allocation-free after initialization (the S3
 HTTP transport's pooled connections are the single exception), and driven by
@@ -117,13 +117,35 @@ larger fixed window to reduce range-request count.
 ## Controller lifecycle
 
 ```zig
-var controller = try ltx_replication.Controller.init(options, &resources);
+const capacity_bytes = try ltx_replication.Resources.arena_capacity_bytes(
+    options.config,
+    options.client,
+);
+const resource_arena = try allocator.alloc(u8, capacity_bytes);
+defer allocator.free(resource_arena);
+const resources = try ltx_replication.Resources.bind(
+    options.config,
+    options.client,
+    resource_arena,
+);
+
+var controller = try ltx_replication.Controller.init(options, resources);
 defer controller.finish();
 
 _ = try controller.sync(now_ms);
 _ = try controller.maintain(1); // one caller-selected adjacent-level quantum
 const durable = try controller.position();
 ```
+
+The allocation above is host initialization, not controller-time growth. The
+arena holds the `Resources` descriptor and every controller workspace and must
+remain address-stable until `finish`; declare the arena cleanup before the
+controller defer so cleanup runs afterward. A fixed static slice or a host
+pool with the same lifetime works as well. `arena_capacity_bytes` includes
+whole-object capture and compaction outputs only when the selected client lacks
+transactional write sessions. Calculate, bind, and initialize the controller
+with the same client capability. Existing callers may still assemble
+`Resources` from separate caller-owned buffers.
 
 `Startup.require_empty` rejects any pre-existing object tree,
 `Startup.verified_local` seeds a host-verified image position, and

@@ -107,6 +107,37 @@ whole-object `write` still requires a fallback region bounded by
 `Limits.max_output_bytes`. S3's caller-owned send workspace is transport
 staging (at most one multipart part), not codec output storage.
 
+### Complete controller arena
+
+`ltx_replication.Resources.arena_capacity_bytes(config, client)` is the
+checked source of truth for one complete controller arena. Its result includes
+the aligned `Resources` descriptor, capture storage, level and plan arrays,
+restore storage, every configured compaction-input reader and decoder
+workspace, and compaction encoder storage. The calculation includes
+worst-case alignment padding so a byte slice of the returned length is
+sufficient regardless of its starting address.
+
+`Resources.bind(config, client, arena)` repeats the same checked planning and
+then uses `ArenaCursor` to bind every byte and typed range monotonically. It
+returns the `*Resources` descriptor stored inside the arena. Invalid
+configuration, arithmetic overflow, or insufficient arena capacity fails
+before a controller opens SQLite; no growing collection or allocator is
+retained.
+
+The object client's write-session capability is part of the capacity. A
+transactional client receives empty capture and compaction whole-object output
+slices because publication streams into private adapter staging. A client
+without write sessions receives separate `Limits.max_output_bytes` fallback
+regions for those operations. Capacity must therefore be calculated and bound
+with the same client capability that will be passed to `Controller.init`.
+
+The arena and returned descriptor must remain address-stable and exclusively
+available to the controller until `Controller.finish()`; the caller must not
+mutate or reuse their storage while the controller is live. Manual `Resources`
+construction remains valid for hosts that use separate fixed buffers or an
+existing storage layout; the controller applies the same capacity and
+live-alias validation to both paths.
+
 ## Compression capacity
 
 For a valid SQLite page size `P`, the current fast LZ4 encoder's checked output

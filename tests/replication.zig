@@ -379,6 +379,366 @@ const DeleteFaultClient = struct {
     }
 };
 
+const WholeObjectClient = struct {
+    backing: object.Client,
+
+    fn client(self: *WholeObjectClient) object.Client {
+        return .{
+            .context = self,
+            .list_fn = list,
+            .read_range_fn = read_range,
+            .write_fn = write,
+            .delete_fn = delete_objects,
+        };
+    }
+
+    fn list(
+        context: *anyopaque,
+        level: u8,
+        seek: ltx.TXID,
+        destination: []ltx.FileInfo,
+    ) object.Error![]const ltx.FileInfo {
+        const self: *WholeObjectClient = @ptrCast(@alignCast(context));
+        return self.backing.list(level, seek, destination);
+    }
+
+    fn read_range(
+        context: *anyopaque,
+        info: ltx.FileInfo,
+        offset_bytes: u64,
+        destination: []u8,
+    ) object.Error!void {
+        const self: *WholeObjectClient = @ptrCast(@alignCast(context));
+        return self.backing.read_range(info, offset_bytes, destination);
+    }
+
+    fn write(
+        context: *anyopaque,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+        bytes: []const u8,
+    ) object.Error!void {
+        const self: *WholeObjectClient = @ptrCast(@alignCast(context));
+        return self.backing.write(level, identity, created_at_ms, bytes);
+    }
+
+    fn delete_objects(
+        context: *anyopaque,
+        files: []const ltx.FileInfo,
+    ) object.Error!void {
+        const self: *WholeObjectClient = @ptrCast(@alignCast(context));
+        return self.backing.delete(files);
+    }
+};
+
+const resource_arena_alignment = @max(
+    @alignOf(replication.Resources),
+    @max(
+        @alignOf(ltx.LZ4CompressionWorkspace),
+        @max(
+            @alignOf(ltx.FileInfo),
+            @max(
+                @alignOf(wal.PageSlot),
+                @max(
+                    @alignOf(wal.PageMapEntry),
+                    @max(
+                        @alignOf(ltx.PageIndexEntry),
+                        @max(
+                            @alignOf(replica.CompactionJobInput),
+                            @alignOf(ltx.CompactionInput),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    ),
+);
+
+fn expect_region_in_arena(arena: []const u8, region: []const u8) !void {
+    if (region.len == 0) return;
+    const arena_start = @intFromPtr(arena.ptr);
+    const arena_end = std.math.add(usize, arena_start, arena.len) catch
+        return error.TestUnexpectedResult;
+    const region_start = @intFromPtr(region.ptr);
+    const region_end = std.math.add(usize, region_start, region.len) catch
+        return error.TestUnexpectedResult;
+    try std.testing.expect(region_start >= arena_start);
+    try std.testing.expect(region_end <= arena_end);
+}
+
+fn expect_slice_in_arena(
+    comptime T: type,
+    arena: []const u8,
+    slice: []const T,
+) !void {
+    if (slice.len == 0) return;
+    try expect_region_in_arena(arena, std.mem.sliceAsBytes(slice));
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        @intFromPtr(slice.ptr) % @alignOf(T),
+    );
+}
+
+fn expect_pointer_in_arena(
+    comptime T: type,
+    arena: []const u8,
+    pointer: *const T,
+) !void {
+    try expect_region_in_arena(arena, std.mem.asBytes(pointer));
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        @intFromPtr(pointer) % @alignOf(T),
+    );
+}
+
+fn expect_bound_resources_in_arena(
+    arena: []const u8,
+    resources: *const replication.Resources,
+) !void {
+    try expect_pointer_in_arena(replication.Resources, arena, resources);
+    try expect_slice_in_arena(u8, arena, resources.capture.wal_storage);
+    try expect_slice_in_arena(wal.PageSlot, arena, resources.capture.map_slots);
+    try expect_slice_in_arena(u32, arena, resources.capture.map_pending);
+    try expect_slice_in_arena(u8, arena, resources.capture.map_seen);
+    try expect_slice_in_arena(wal.PageMapEntry, arena, resources.capture.map_entries);
+    try expect_slice_in_arena(u8, arena, resources.capture.output_storage);
+    try expect_slice_in_arena(u8, arena, resources.capture.page_workspace);
+    try expect_slice_in_arena(u8, arena, resources.capture.compressed_workspace);
+    try expect_pointer_in_arena(
+        ltx.LZ4CompressionWorkspace,
+        arena,
+        resources.capture.compression_workspace,
+    );
+    try expect_slice_in_arena(
+        ltx.PageIndexEntry,
+        arena,
+        resources.capture.index_workspace,
+    );
+    try expect_slice_in_arena(ltx.FileInfo, arena, resources.level_listings);
+    try expect_slice_in_arena(ltx.FileInfo, arena, resources.restore_plan);
+    try expect_slice_in_arena(ltx.FileInfo, arena, resources.retention_plan);
+    try expect_slice_in_arena(u8, arena, resources.restore_read_workspace);
+    try expect_slice_in_arena(u8, arena, resources.restore_page_workspace);
+    try expect_slice_in_arena(u8, arena, resources.restore_compressed_workspace);
+    try expect_slice_in_arena(
+        ltx.PageIndexEntry,
+        arena,
+        resources.restore_index_workspace,
+    );
+    try expect_slice_in_arena(
+        replica.CompactionJobInput,
+        arena,
+        resources.compaction_job_inputs,
+    );
+    try expect_slice_in_arena(
+        ltx.CompactionInput,
+        arena,
+        resources.compaction_inputs,
+    );
+    for (resources.compaction_job_inputs) |input| {
+        try expect_slice_in_arena(u8, arena, input.read_workspace);
+        try expect_slice_in_arena(u8, arena, input.page_workspace);
+        try expect_slice_in_arena(u8, arena, input.compressed_workspace);
+        try expect_slice_in_arena(ltx.PageIndexEntry, arena, input.index_workspace);
+    }
+    try expect_slice_in_arena(u8, arena, resources.compaction_output_storage);
+    try expect_slice_in_arena(
+        u8,
+        arena,
+        resources.compaction_output_compressed_workspace,
+    );
+    try expect_pointer_in_arena(
+        ltx.LZ4CompressionWorkspace,
+        arena,
+        resources.compaction_output_compression_workspace,
+    );
+    try expect_slice_in_arena(
+        ltx.PageIndexEntry,
+        arena,
+        resources.compaction_output_index_workspace,
+    );
+}
+
+fn expect_disjoint(left: []const u8, right: []const u8) !void {
+    const left_start = @intFromPtr(left.ptr);
+    const right_start = @intFromPtr(right.ptr);
+    const left_end = try std.math.add(usize, left_start, left.len);
+    const right_end = try std.math.add(usize, right_start, right.len);
+    try std.testing.expect(left_end <= right_start or right_end <= left_start);
+}
+
+fn expect_every_arena_alignment_binds(client: object.Client) !void {
+    const capacity = try replication.Resources.arena_capacity_bytes(config, client);
+    const allocation_bytes = try std.math.add(
+        usize,
+        capacity,
+        resource_arena_alignment,
+    );
+    const storage = try std.testing.allocator.alloc(u8, allocation_bytes);
+    defer std.testing.allocator.free(storage);
+    var seen: [resource_arena_alignment]bool = @splat(false);
+    for (0..resource_arena_alignment) |offset_bytes| {
+        const arena = storage[offset_bytes..][0..capacity];
+        seen[@intFromPtr(arena.ptr) % resource_arena_alignment] = true;
+        const resources = try replication.Resources.bind(config, client, arena);
+        try expect_bound_resources_in_arena(arena, resources);
+    }
+    try std.testing.expect(std.mem.allEqual(bool, &seen, true));
+}
+
+fn expect_one_byte_short_rejected(client: object.Client) !void {
+    const capacity = try replication.Resources.arena_capacity_bytes(config, client);
+    try std.testing.expect(capacity > 0);
+    const allocation_bytes = try std.math.add(
+        usize,
+        capacity,
+        resource_arena_alignment,
+    );
+    const storage = try std.testing.allocator.alloc(u8, allocation_bytes);
+    defer std.testing.allocator.free(storage);
+    const sentinel: u8 = 0xa5;
+    for (0..resource_arena_alignment) |offset_bytes| {
+        @memset(storage, sentinel);
+        const short_arena = storage[offset_bytes..][0 .. capacity - 1];
+        try std.testing.expectError(
+            error.ArenaCapacityExceeded,
+            replication.Resources.bind(config, client, short_arena),
+        );
+        try std.testing.expect(std.mem.allEqual(u8, storage, sentinel));
+    }
+}
+
+test "resource arena binder selects transactional or whole-object output" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const transactional_client = store.client();
+    const transactional_capacity = try replication.Resources.arena_capacity_bytes(
+        config,
+        transactional_client,
+    );
+    const transactional_arena = try std.testing.allocator.alloc(
+        u8,
+        transactional_capacity,
+    );
+    defer std.testing.allocator.free(transactional_arena);
+    const transactional_resources = try replication.Resources.bind(
+        config,
+        transactional_client,
+        transactional_arena,
+    );
+    try std.testing.expectEqual(@as(usize, 0), transactional_resources.capture.output_storage.len);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        transactional_resources.compaction_output_storage.len,
+    );
+
+    var whole_object = WholeObjectClient{ .backing = store.client() };
+    const whole_object_client = whole_object.client();
+    const whole_object_capacity = try replication.Resources.arena_capacity_bytes(
+        config,
+        whole_object_client,
+    );
+    try std.testing.expect(whole_object_capacity > transactional_capacity);
+    try std.testing.expectEqual(
+        @as(usize, 2 * max_object_bytes),
+        whole_object_capacity - transactional_capacity,
+    );
+    const whole_object_arena = try std.testing.allocator.alloc(
+        u8,
+        whole_object_capacity,
+    );
+    defer std.testing.allocator.free(whole_object_arena);
+    const whole_object_resources = try replication.Resources.bind(
+        config,
+        whole_object_client,
+        whole_object_arena,
+    );
+    try std.testing.expectEqual(
+        @as(usize, max_object_bytes),
+        whole_object_resources.capture.output_storage.len,
+    );
+    try std.testing.expectEqual(
+        @as(usize, max_object_bytes),
+        whole_object_resources.compaction_output_storage.len,
+    );
+    try expect_disjoint(
+        whole_object_resources.capture.output_storage,
+        whole_object_resources.compaction_output_storage,
+    );
+    try expect_bound_resources_in_arena(whole_object_arena, whole_object_resources);
+}
+
+test "resource arena capacity covers every base alignment" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    try expect_every_arena_alignment_binds(store.client());
+    try expect_one_byte_short_rejected(store.client());
+
+    var whole_object = WholeObjectClient{ .backing = store.client() };
+    try expect_every_arena_alignment_binds(whole_object.client());
+    try expect_one_byte_short_rejected(whole_object.client());
+}
+
+test "resource arena failures are specific and leave storage unchanged" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+    const sentinel: u8 = 0x3c;
+    var arena: [128]u8 = @splat(sentinel);
+
+    var invalid_config = config;
+    invalid_config.read_workspace_bytes = 0;
+    try std.testing.expectError(
+        error.InvalidConfiguration,
+        replication.Resources.arena_capacity_bytes(invalid_config, client),
+    );
+    try std.testing.expectError(
+        error.InvalidConfiguration,
+        replication.Resources.bind(invalid_config, client, &arena),
+    );
+    try std.testing.expect(std.mem.allEqual(u8, &arena, sentinel));
+
+    var overflow_config = config;
+    overflow_config.codec_limits.max_pages = std.math.maxInt(u32);
+    overflow_config.codec_limits.max_page_index_entries = std.math.maxInt(u32);
+    overflow_config.compaction_limits.max_inputs = std.math.maxInt(u32);
+    overflow_config.compaction_limits.max_total_pages = std.math.maxInt(u64);
+    overflow_config.max_restore_files = std.math.maxInt(u32);
+    overflow_config.max_compaction_input_bytes = std.math.maxInt(u64);
+    try std.testing.expectError(
+        error.ResourceBudgetOverflow,
+        replication.Resources.arena_capacity_bytes(overflow_config, client),
+    );
+    try std.testing.expectError(
+        error.ResourceBudgetOverflow,
+        replication.Resources.bind(overflow_config, client, &arena),
+    );
+    try std.testing.expect(std.mem.allEqual(u8, &arena, sentinel));
+}
+
+test "resource arena binding passes controller lifecycle validation" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+    const capacity = try replication.Resources.arena_capacity_bytes(config, client);
+    const arena = try std.testing.allocator.alloc(u8, capacity);
+    defer std.testing.allocator.free(arena);
+    const resources = try replication.Resources.bind(config, client, arena);
+
+    var controller = try replication.Controller.init(
+        options(&temporary, client, "bound.db", .require_empty),
+        resources,
+    );
+    try std.testing.expectEqual(@as(u64, 0), (try controller.position()).txid.value);
+    controller.finish();
+    try std.testing.expectError(error.Finished, controller.position());
+}
+
 test "sync reports publication and require-empty rejects its object tree" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();

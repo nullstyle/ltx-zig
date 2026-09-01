@@ -28,6 +28,12 @@ pub const Error = error{
     Finished,
 } || ltx.Error || wal.Error || object.Error || replica.Error || capture.Error;
 
+pub const ResourceBindError = error{
+    InvalidConfiguration,
+    ResourceBudgetOverflow,
+    ArenaCapacityExceeded,
+};
+
 pub const Startup = union(enum) {
     /// Proves every level is empty before opening the capture session.
     require_empty,
@@ -130,6 +136,25 @@ pub const Resources = struct {
     compaction_output_compressed_workspace: []u8,
     compaction_output_compression_workspace: *ltx.LZ4CompressionWorkspace,
     compaction_output_index_workspace: []ltx.PageIndexEntry,
+
+    /// Capacity sufficient for an arbitrary arena base address. The total
+    /// includes worst-case padding before the over-aligned descriptor.
+    pub fn arena_capacity_bytes(
+        config: Config,
+        client: object.Client,
+    ) ResourceBindError!usize {
+        return (try plan_resources(config, client)).arena_capacity_bytes;
+    }
+
+    /// Binds one complete controller resource set. The returned descriptor
+    /// lives inside `arena`; both must remain stable through `finish()`.
+    pub fn bind(
+        config: Config,
+        client: object.Client,
+        arena: []u8,
+    ) ResourceBindError!*Resources {
+        return bind_resources(try plan_resources(config, client), arena);
+    }
 };
 
 pub const SyncReport = struct {
@@ -188,11 +213,486 @@ const Capacities = struct {
     max_index_entries: usize,
     max_wal_bytes: usize,
     max_wal_pages: usize,
+    map_seen_bytes: usize,
     max_files_per_level: usize,
     max_restore_files: usize,
     max_compaction_inputs: usize,
     listing_entries: usize,
 };
+
+const InputBankCapacities = struct {
+    read_bytes: usize,
+    page_bytes: usize,
+    compressed_bytes: usize,
+    index_entries: usize,
+};
+
+const ResourcePlan = struct {
+    capacities: Capacities,
+    input_banks: InputBankCapacities,
+    streams_output: bool,
+    layout_bytes: usize,
+    arena_capacity_bytes: usize,
+};
+
+const resource_alignment = blk: {
+    var result: usize = @alignOf(Resources);
+    for ([_]usize{
+        @alignOf(wal.PageSlot),
+        @alignOf(u32),
+        @alignOf(wal.PageMapEntry),
+        @alignOf(ltx.LZ4CompressionWorkspace),
+        @alignOf(ltx.PageIndexEntry),
+        @alignOf(ltx.FileInfo),
+        @alignOf(replica.CompactionJobInput),
+        @alignOf(ltx.CompactionInput),
+    }) |candidate| {
+        if (candidate > result) result = candidate;
+    }
+    break :blk result;
+};
+
+const LayoutSizer = struct {
+    offset_bytes: usize = 0,
+
+    fn reserve_bytes(
+        self: *LayoutSizer,
+        count_bytes: usize,
+    ) ResourceBindError!void {
+        self.offset_bytes = try resource_add(self.offset_bytes, count_bytes);
+    }
+
+    fn reserve_aligned(
+        self: *LayoutSizer,
+        count_bytes: usize,
+        alignment_bytes: usize,
+    ) ResourceBindError!void {
+        std.debug.assert(std.math.isPowerOfTwo(alignment_bytes));
+        const mask = alignment_bytes - 1;
+        const misalignment = self.offset_bytes & mask;
+        const padding = if (misalignment == 0)
+            0
+        else
+            alignment_bytes - misalignment;
+        self.offset_bytes = try resource_add(self.offset_bytes, padding);
+        self.offset_bytes = try resource_add(self.offset_bytes, count_bytes);
+    }
+
+    fn reserve_slice(
+        self: *LayoutSizer,
+        comptime T: type,
+        count: usize,
+    ) ResourceBindError!void {
+        const count_bytes = try resource_mul(count, @sizeOf(T));
+        try self.reserve_aligned(count_bytes, @alignOf(T));
+    }
+};
+
+const BoundControls = struct {
+    level_listings: []ltx.FileInfo,
+    restore_plan: []ltx.FileInfo,
+    retention_plan: []ltx.FileInfo,
+    job_inputs: []replica.CompactionJobInput,
+    compaction_inputs: []ltx.CompactionInput,
+};
+
+const BoundRestore = struct {
+    read_workspace: []u8,
+    page_workspace: []u8,
+    compressed_workspace: []u8,
+    index_workspace: []ltx.PageIndexEntry,
+};
+
+const BoundCompaction = struct {
+    output_storage: []u8,
+    output_compressed_workspace: []u8,
+    output_compression_workspace: *ltx.LZ4CompressionWorkspace,
+    output_index_workspace: []ltx.PageIndexEntry,
+};
+
+fn plan_resources(
+    config: Config,
+    client: object.Client,
+) ResourceBindError!ResourcePlan {
+    const capacities = try calculate_capacities(config);
+    const input_count = capacities.max_compaction_inputs;
+    const banks = InputBankCapacities{
+        .read_bytes = try resource_mul(input_count, capacities.read_workspace_bytes),
+        .page_bytes = try resource_mul(input_count, capacities.max_page_bytes),
+        .compressed_bytes = try resource_mul(
+            input_count,
+            capacities.max_compressed_bytes,
+        ),
+        .index_entries = try resource_mul(input_count, capacities.max_index_entries),
+    };
+    const streams_output = client.supports_write_sessions();
+    const layout_bytes = try resource_layout_bytes(
+        capacities,
+        banks,
+        streams_output,
+    );
+    return .{
+        .capacities = capacities,
+        .input_banks = banks,
+        .streams_output = streams_output,
+        .layout_bytes = layout_bytes,
+        .arena_capacity_bytes = try resource_add(
+            resource_alignment - 1,
+            layout_bytes,
+        ),
+    };
+}
+
+fn resource_layout_bytes(
+    capacities: Capacities,
+    banks: InputBankCapacities,
+    streams_output: bool,
+) ResourceBindError!usize {
+    var sizer = LayoutSizer{};
+    try sizer.reserve_aligned(@sizeOf(Resources), resource_alignment);
+    try size_capture_layout(&sizer, capacities, streams_output);
+    try size_control_layout(&sizer, capacities);
+    try size_restore_layout(&sizer, capacities);
+    try size_compaction_layout(&sizer, capacities, banks, streams_output);
+    return sizer.offset_bytes;
+}
+
+fn size_capture_layout(
+    sizer: *LayoutSizer,
+    capacities: Capacities,
+    streams_output: bool,
+) ResourceBindError!void {
+    try sizer.reserve_bytes(capacities.max_wal_bytes);
+    try sizer.reserve_slice(wal.PageSlot, capacities.max_wal_pages);
+    try sizer.reserve_slice(u32, capacities.max_wal_pages);
+    try sizer.reserve_bytes(capacities.map_seen_bytes);
+    try sizer.reserve_slice(wal.PageMapEntry, capacities.max_wal_pages);
+    if (!streams_output) try sizer.reserve_bytes(capacities.max_output_bytes);
+    try sizer.reserve_bytes(capacities.max_page_bytes);
+    try sizer.reserve_bytes(capacities.max_compressed_bytes);
+    try sizer.reserve_slice(ltx.LZ4CompressionWorkspace, 1);
+    try sizer.reserve_slice(ltx.PageIndexEntry, capacities.max_index_entries);
+}
+
+fn size_control_layout(
+    sizer: *LayoutSizer,
+    capacities: Capacities,
+) ResourceBindError!void {
+    try sizer.reserve_slice(ltx.FileInfo, capacities.listing_entries);
+    try sizer.reserve_slice(ltx.FileInfo, capacities.max_restore_files);
+    try sizer.reserve_slice(ltx.FileInfo, capacities.max_files_per_level);
+    try sizer.reserve_slice(
+        replica.CompactionJobInput,
+        capacities.max_compaction_inputs,
+    );
+    try sizer.reserve_slice(
+        ltx.CompactionInput,
+        capacities.max_compaction_inputs,
+    );
+}
+
+fn size_restore_layout(
+    sizer: *LayoutSizer,
+    capacities: Capacities,
+) ResourceBindError!void {
+    try sizer.reserve_bytes(capacities.read_workspace_bytes);
+    try sizer.reserve_bytes(capacities.max_page_bytes);
+    try sizer.reserve_bytes(capacities.max_compressed_bytes);
+    try sizer.reserve_slice(ltx.PageIndexEntry, capacities.max_index_entries);
+}
+
+fn size_compaction_layout(
+    sizer: *LayoutSizer,
+    capacities: Capacities,
+    banks: InputBankCapacities,
+    streams_output: bool,
+) ResourceBindError!void {
+    try sizer.reserve_bytes(banks.read_bytes);
+    try sizer.reserve_bytes(banks.page_bytes);
+    try sizer.reserve_bytes(banks.compressed_bytes);
+    try sizer.reserve_slice(ltx.PageIndexEntry, banks.index_entries);
+    if (!streams_output) try sizer.reserve_bytes(capacities.max_output_bytes);
+    try sizer.reserve_bytes(capacities.max_compressed_bytes);
+    try sizer.reserve_slice(ltx.LZ4CompressionWorkspace, 1);
+    try sizer.reserve_slice(ltx.PageIndexEntry, capacities.max_index_entries);
+}
+
+fn bind_resources(
+    plan: ResourcePlan,
+    arena: []u8,
+) ResourceBindError!*Resources {
+    if (arena.len < plan.arena_capacity_bytes) {
+        return error.ArenaCapacityExceeded;
+    }
+    var cursor = resource_model.ArenaCursor.init(arena);
+    const descriptor_bytes = try arena_bind_aligned_bytes(
+        &cursor,
+        @sizeOf(Resources),
+        resource_alignment,
+    );
+    const resources: *Resources = @ptrCast(@alignCast(descriptor_bytes.ptr));
+    const empty = arena[0..0];
+    const capture_workspaces = try bind_capture(
+        &cursor,
+        plan.capacities,
+        plan.streams_output,
+        empty,
+    );
+    const controls = try bind_controls(&cursor, plan.capacities);
+    const restore = try bind_restore(&cursor, plan.capacities);
+    const compaction = try bind_compaction(
+        &cursor,
+        plan,
+        controls.job_inputs,
+        empty,
+    );
+    const descriptor_address = @intFromPtr(resources);
+    const arena_address = @intFromPtr(arena.ptr);
+    const padding_bytes = descriptor_address - arena_address;
+    std.debug.assert(cursor.consumed_bytes() == padding_bytes + plan.layout_bytes);
+    resources.* = make_resources(capture_workspaces, controls, restore, compaction);
+    return resources;
+}
+
+fn bind_capture(
+    cursor: *resource_model.ArenaCursor,
+    capacities: Capacities,
+    streams_output: bool,
+    empty: []u8,
+) ResourceBindError!capture.Workspaces {
+    const wal_storage = try arena_bind_bytes(cursor, capacities.max_wal_bytes);
+    const map_slots = try arena_bind_slice(
+        cursor,
+        wal.PageSlot,
+        capacities.max_wal_pages,
+    );
+    const map_pending = try arena_bind_slice(cursor, u32, capacities.max_wal_pages);
+    const map_seen = try arena_bind_bytes(cursor, capacities.map_seen_bytes);
+    const map_entries = try arena_bind_slice(
+        cursor,
+        wal.PageMapEntry,
+        capacities.max_wal_pages,
+    );
+    const output = if (streams_output)
+        empty
+    else
+        try arena_bind_bytes(cursor, capacities.max_output_bytes);
+    const page = try arena_bind_bytes(cursor, capacities.max_page_bytes);
+    const compressed = try arena_bind_bytes(cursor, capacities.max_compressed_bytes);
+    const compression = try arena_bind_slice(cursor, ltx.LZ4CompressionWorkspace, 1);
+    const index = try arena_bind_slice(
+        cursor,
+        ltx.PageIndexEntry,
+        capacities.max_index_entries,
+    );
+    return .{
+        .wal_storage = wal_storage,
+        .map_slots = map_slots,
+        .map_pending = map_pending,
+        .map_seen = map_seen,
+        .map_entries = map_entries,
+        .output_storage = output,
+        .page_workspace = page,
+        .compressed_workspace = compressed,
+        .compression_workspace = &compression[0],
+        .index_workspace = index,
+    };
+}
+
+fn bind_controls(
+    cursor: *resource_model.ArenaCursor,
+    capacities: Capacities,
+) ResourceBindError!BoundControls {
+    return .{
+        .level_listings = try arena_bind_slice(
+            cursor,
+            ltx.FileInfo,
+            capacities.listing_entries,
+        ),
+        .restore_plan = try arena_bind_slice(
+            cursor,
+            ltx.FileInfo,
+            capacities.max_restore_files,
+        ),
+        .retention_plan = try arena_bind_slice(
+            cursor,
+            ltx.FileInfo,
+            capacities.max_files_per_level,
+        ),
+        .job_inputs = try arena_bind_slice(
+            cursor,
+            replica.CompactionJobInput,
+            capacities.max_compaction_inputs,
+        ),
+        .compaction_inputs = try arena_bind_slice(
+            cursor,
+            ltx.CompactionInput,
+            capacities.max_compaction_inputs,
+        ),
+    };
+}
+
+fn bind_restore(
+    cursor: *resource_model.ArenaCursor,
+    capacities: Capacities,
+) ResourceBindError!BoundRestore {
+    return .{
+        .read_workspace = try arena_bind_bytes(
+            cursor,
+            capacities.read_workspace_bytes,
+        ),
+        .page_workspace = try arena_bind_bytes(cursor, capacities.max_page_bytes),
+        .compressed_workspace = try arena_bind_bytes(
+            cursor,
+            capacities.max_compressed_bytes,
+        ),
+        .index_workspace = try arena_bind_slice(
+            cursor,
+            ltx.PageIndexEntry,
+            capacities.max_index_entries,
+        ),
+    };
+}
+
+fn bind_compaction(
+    cursor: *resource_model.ArenaCursor,
+    plan: ResourcePlan,
+    job_inputs: []replica.CompactionJobInput,
+    empty: []u8,
+) ResourceBindError!BoundCompaction {
+    const read_bank = try arena_bind_bytes(cursor, plan.input_banks.read_bytes);
+    const page_bank = try arena_bind_bytes(cursor, plan.input_banks.page_bytes);
+    const compressed_bank = try arena_bind_bytes(
+        cursor,
+        plan.input_banks.compressed_bytes,
+    );
+    const index_bank = try arena_bind_slice(
+        cursor,
+        ltx.PageIndexEntry,
+        plan.input_banks.index_entries,
+    );
+    const output = if (plan.streams_output)
+        empty
+    else
+        try arena_bind_bytes(cursor, plan.capacities.max_output_bytes);
+    const output_compressed = try arena_bind_bytes(
+        cursor,
+        plan.capacities.max_compressed_bytes,
+    );
+    const output_compression = try arena_bind_slice(
+        cursor,
+        ltx.LZ4CompressionWorkspace,
+        1,
+    );
+    const output_index = try arena_bind_slice(
+        cursor,
+        ltx.PageIndexEntry,
+        plan.capacities.max_index_entries,
+    );
+    populate_job_inputs(
+        job_inputs,
+        plan.capacities,
+        read_bank,
+        page_bank,
+        compressed_bank,
+        index_bank,
+    );
+    return .{
+        .output_storage = output,
+        .output_compressed_workspace = output_compressed,
+        .output_compression_workspace = &output_compression[0],
+        .output_index_workspace = output_index,
+    };
+}
+
+fn populate_job_inputs(
+    job_inputs: []replica.CompactionJobInput,
+    capacities: Capacities,
+    read_bank: []u8,
+    page_bank: []u8,
+    compressed_bank: []u8,
+    index_bank: []ltx.PageIndexEntry,
+) void {
+    var read_offset: usize = 0;
+    var page_offset: usize = 0;
+    var compressed_offset: usize = 0;
+    var index_offset: usize = 0;
+    for (job_inputs) |*input| {
+        input.* = .{
+            .read_workspace = read_bank[read_offset..][0..capacities.read_workspace_bytes],
+            .page_workspace = page_bank[page_offset..][0..capacities.max_page_bytes],
+            .compressed_workspace = compressed_bank[compressed_offset..][0..capacities.max_compressed_bytes],
+            .index_workspace = index_bank[index_offset..][0..capacities.max_index_entries],
+        };
+        read_offset += capacities.read_workspace_bytes;
+        page_offset += capacities.max_page_bytes;
+        compressed_offset += capacities.max_compressed_bytes;
+        index_offset += capacities.max_index_entries;
+    }
+    std.debug.assert(read_offset == read_bank.len);
+    std.debug.assert(page_offset == page_bank.len);
+    std.debug.assert(compressed_offset == compressed_bank.len);
+    std.debug.assert(index_offset == index_bank.len);
+}
+
+fn make_resources(
+    capture_workspaces: capture.Workspaces,
+    controls: BoundControls,
+    restore: BoundRestore,
+    compaction: BoundCompaction,
+) Resources {
+    return .{
+        .capture = capture_workspaces,
+        .level_listings = controls.level_listings,
+        .restore_plan = controls.restore_plan,
+        .retention_plan = controls.retention_plan,
+        .restore_read_workspace = restore.read_workspace,
+        .restore_page_workspace = restore.page_workspace,
+        .restore_compressed_workspace = restore.compressed_workspace,
+        .restore_index_workspace = restore.index_workspace,
+        .compaction_job_inputs = controls.job_inputs,
+        .compaction_inputs = controls.compaction_inputs,
+        .compaction_output_storage = compaction.output_storage,
+        .compaction_output_compressed_workspace = compaction.output_compressed_workspace,
+        .compaction_output_compression_workspace = compaction.output_compression_workspace,
+        .compaction_output_index_workspace = compaction.output_index_workspace,
+    };
+}
+
+fn arena_bind_bytes(
+    cursor: *resource_model.ArenaCursor,
+    count_bytes: usize,
+) ResourceBindError![]u8 {
+    return cursor.bind_bytes(count_bytes) catch |err| switch (err) {
+        error.ResourceBudgetOverflow => return error.ResourceBudgetOverflow,
+        error.ArenaCapacityExceeded => return error.ArenaCapacityExceeded,
+        else => unreachable,
+    };
+}
+
+fn arena_bind_aligned_bytes(
+    cursor: *resource_model.ArenaCursor,
+    count_bytes: usize,
+    alignment_bytes: usize,
+) ResourceBindError![]u8 {
+    return cursor.bind_aligned_bytes(count_bytes, alignment_bytes) catch |err| switch (err) {
+        error.ResourceBudgetOverflow => return error.ResourceBudgetOverflow,
+        error.ArenaCapacityExceeded => return error.ArenaCapacityExceeded,
+        else => unreachable,
+    };
+}
+
+fn arena_bind_slice(
+    cursor: *resource_model.ArenaCursor,
+    comptime T: type,
+    count: usize,
+) ResourceBindError![]T {
+    return cursor.bind_slice(T, count) catch |err| switch (err) {
+        error.ResourceBudgetOverflow => return error.ResourceBudgetOverflow,
+        error.ArenaCapacityExceeded => return error.ArenaCapacityExceeded,
+        else => unreachable,
+    };
+}
 
 /// One synchronous, single-owner controller. Do not copy it after `init`.
 pub const Controller = struct {
@@ -669,25 +1169,6 @@ pub const Controller = struct {
 
 fn validate_configuration(options: Options) Error!Capacities {
     if (options.database_name.len == 0) return error.InvalidConfiguration;
-    options.config.codec_limits.validate() catch return error.InvalidConfiguration;
-    options.config.wal_limits.validate() catch return error.InvalidConfiguration;
-    options.config.apply_limits.validate() catch return error.InvalidConfiguration;
-    options.config.compaction_limits.validate() catch return error.InvalidConfiguration;
-    options.config.levels.validate() catch return error.InvalidConfiguration;
-    _ = resource_model.encoder_workspace_bytes(options.config.codec_limits) catch
-        return error.InvalidConfiguration;
-    if (options.config.max_files_per_level == 0 or
-        options.config.max_restore_files == 0 or
-        options.config.max_compaction_input_bytes == 0 or
-        options.config.read_workspace_bytes == 0 or
-        options.config.read_workspace_bytes >
-            options.config.codec_limits.max_input_bytes or
-        options.config.codec_limits.max_output_bytes >
-            options.config.codec_limits.max_input_bytes or
-        options.config.max_restore_files < options.config.compaction_limits.max_inputs)
-    {
-        return error.InvalidConfiguration;
-    }
     return calculate_capacities(options.config) catch return error.InvalidConfiguration;
 }
 
@@ -713,24 +1194,27 @@ fn reject_restore_sidecars(options: Options) Error!void {
     }
 }
 
-fn calculate_capacities(config: Config) !Capacities {
-    const max_output: usize = try cast_usize(config.codec_limits.max_output_bytes);
-    const read_workspace: usize = try cast_usize(config.read_workspace_bytes);
-    const max_page: usize = try cast_usize(config.codec_limits.max_page_size);
-    const max_compressed: usize = try cast_usize(
+fn calculate_capacities(config: Config) ResourceBindError!Capacities {
+    try validate_resource_configuration(config);
+    const max_output: usize = try resource_cast(config.codec_limits.max_output_bytes);
+    const read_workspace: usize = try resource_cast(config.read_workspace_bytes);
+    const max_page: usize = try resource_cast(config.codec_limits.max_page_size);
+    const max_compressed: usize = try resource_cast(
         config.codec_limits.max_compressed_page_size,
     );
-    const max_index: usize = try cast_usize(config.codec_limits.max_page_index_entries);
-    const max_wal_pages: usize = try cast_usize(config.wal_limits.max_pages);
-    const frame_bytes = try add_usize(
+    const max_index: usize = try resource_cast(
+        config.codec_limits.max_page_index_entries,
+    );
+    const max_wal_pages: usize = try resource_cast(config.wal_limits.max_pages);
+    const frame_bytes = try resource_add(
         wal.frame_header_size_bytes,
-        try cast_usize(config.wal_limits.max_page_size),
+        try resource_cast(config.wal_limits.max_page_size),
     );
-    const max_wal = try add_usize(
+    const max_wal = try resource_add(
         wal.header_size_bytes,
-        try mul_usize(try cast_usize(config.wal_limits.max_frames), frame_bytes),
+        try resource_mul(try resource_cast(config.wal_limits.max_frames), frame_bytes),
     );
-    const files: usize = try cast_usize(config.max_files_per_level);
+    const files: usize = try resource_cast(config.max_files_per_level);
     return .{
         .max_output_bytes = max_output,
         .read_workspace_bytes = read_workspace,
@@ -739,11 +1223,38 @@ fn calculate_capacities(config: Config) !Capacities {
         .max_index_entries = max_index,
         .max_wal_bytes = max_wal,
         .max_wal_pages = max_wal_pages,
+        .map_seen_bytes = (try resource_add(max_wal_pages, 7)) / 8,
         .max_files_per_level = files,
-        .max_restore_files = try cast_usize(config.max_restore_files),
-        .max_compaction_inputs = try cast_usize(config.compaction_limits.max_inputs),
-        .listing_entries = try mul_usize(level_count, files),
+        .max_restore_files = try resource_cast(config.max_restore_files),
+        .max_compaction_inputs = try resource_cast(
+            config.compaction_limits.max_inputs,
+        ),
+        .listing_entries = try resource_mul(level_count, files),
     };
+}
+
+fn validate_resource_configuration(config: Config) ResourceBindError!void {
+    config.codec_limits.validate() catch return error.InvalidConfiguration;
+    config.wal_limits.validate() catch return error.InvalidConfiguration;
+    config.apply_limits.validate() catch return error.InvalidConfiguration;
+    config.compaction_limits.validate() catch return error.InvalidConfiguration;
+    config.levels.validate() catch return error.InvalidConfiguration;
+    _ = resource_model.encoder_workspace_bytes(config.codec_limits) catch |err| {
+        return switch (err) {
+            error.ResourceBudgetOverflow => error.ResourceBudgetOverflow,
+            else => error.InvalidConfiguration,
+        };
+    };
+    if (config.max_files_per_level == 0 or
+        config.max_restore_files == 0 or
+        config.max_compaction_input_bytes == 0 or
+        config.read_workspace_bytes == 0 or
+        config.read_workspace_bytes > config.codec_limits.max_input_bytes or
+        config.codec_limits.max_output_bytes > config.codec_limits.max_input_bytes or
+        config.max_restore_files < config.compaction_limits.max_inputs)
+    {
+        return error.InvalidConfiguration;
+    }
 }
 
 fn validate_resources(
@@ -797,11 +1308,10 @@ fn validate_capture_resources(
     streams_output: bool,
 ) Error!void {
     const resources = all_resources.capture;
-    const bitmap_bytes = try add_usize(capacities.max_wal_pages, 7) / 8;
     if (resources.wal_storage.len < capacities.max_wal_bytes or
         resources.map_slots.len < capacities.max_wal_pages or
         resources.map_pending.len < capacities.max_wal_pages or
-        resources.map_seen.len < bitmap_bytes or
+        resources.map_seen.len < capacities.map_seen_bytes or
         resources.map_entries.len < capacities.max_wal_pages or
         (!streams_output and resources.output_storage.len < capacities.max_output_bytes) or
         resources.page_workspace.len < capacities.max_page_bytes or
@@ -1054,14 +1564,14 @@ fn slices_overlap(left: []const u8, right: []const u8) bool {
     return left_start < right_end and right_start < left_end;
 }
 
-fn cast_usize(value: anytype) !usize {
-    return std.math.cast(usize, value) orelse error.InvalidConfiguration;
+fn resource_cast(value: anytype) ResourceBindError!usize {
+    return std.math.cast(usize, value) orelse error.ResourceBudgetOverflow;
 }
 
-fn add_usize(left: usize, right: usize) !usize {
-    return std.math.add(usize, left, right) catch error.InvalidConfiguration;
+fn resource_add(left: usize, right: usize) ResourceBindError!usize {
+    return std.math.add(usize, left, right) catch error.ResourceBudgetOverflow;
 }
 
-fn mul_usize(left: usize, right: usize) !usize {
-    return std.math.mul(usize, left, right) catch error.InvalidConfiguration;
+fn resource_mul(left: usize, right: usize) ResourceBindError!usize {
+    return std.math.mul(usize, left, right) catch error.ResourceBudgetOverflow;
 }

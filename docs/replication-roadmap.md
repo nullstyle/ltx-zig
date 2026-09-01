@@ -3,10 +3,12 @@
 This roadmap records the completed extension of `ltx-zig` from an LTX codec
 toolkit into bounded SQLite-to-object-store replication building blocks,
 informed by the pinned `denoland/celld` LTX crate and exposed as an embeddable
-library rather than a daemon. The M1–M8 stack is shipped: the original
+library rather than a daemon. The M1–M9 stack is shipped: the original
 foundations, a public checked resource binder, transactional object writes,
 bounded object reads, a synchronous per-database controller, and deterministic
-qualification of interrupted maintenance and multipart publication.
+qualification of interrupted maintenance and multipart publication. The
+controller's descriptor and complete workspace set can now be derived and
+bound from one fixed caller-owned arena.
 
 The consumer built above this library — for example, a stateful actor system
 giving each actor its own SQLite database — owns which databases exist, when
@@ -45,7 +47,7 @@ Out of scope (consumer):
 | `ltx_object`, `ltx_s3` (M3/M6/M7) | `client/*` | The object-client contract and filesystem backend plus S3-compatible path-style and virtual-host SigV4, bounded paginated `ListObjectsV2`, exact ranged reads with bounded sequential reader windows, idempotent per-object deletes, conditional create/replace, TLS, bounded retry, `litestream-timestamp` metadata, and transactional writer sessions that publish through filesystem staging or automatic single/multipart upload. |
 | `ltx_replica` (M4) | `replica.rs`, `replica_compactor.rs`, `compaction_level.rs` | Restore planning and generic staged-apply execution, the level ladder (L0/L1/L2/L3 plus snapshot level 9), bounded level compaction over the existing `Compactor`, and retention planning. |
 | `ltx_resources` (M6) | — | Checked public codec, apply, WAL, and wire capacity formulas plus an alignment-aware fixed-arena binder. |
-| `ltx_replication` (M6) | `replica.rs`, `db.rs` | One synchronous controller for empty, verified-local, or restore-latest startup; capture and trusted position; all-level restore; caller-selected adjacent-level compaction; and publish-before-delete retention. Scheduling, fencing, and acknowledgement stay outside. |
+| `ltx_replication` (M6/M9) | `replica.rs`, `db.rs` | One synchronous controller for empty, verified-local, or restore-latest startup; complete fixed-arena resource derivation and binding; capture and trusted position; all-level restore; caller-selected adjacent-level compaction; and publish-before-delete retention. Scheduling, fencing, and acknowledgement stay outside. |
 | core additions (M4) | `lib.rs` | `FileInfo`, filename formatting and parsing, `TXID` text parsing, and level-directory naming for both the decimal filesystem layout and the four-hex object-store layout. |
 
 The `ltx` core and the `ltx_sqlite` store are unchanged by this roadmap. The
@@ -96,6 +98,7 @@ and `resource-check` verifies them.
 | M6 — orchestration and bounded publication ✅ | Public resource formulas and fixed-arena binding; exact object sizes; generic identity-checked restore; transactional filesystem and S3 writer sessions; direct capture/compaction publication; and the `ltx_replication.Controller`. | Hermetic session and planner tests, live SQLite controller lifecycle, zero-output-buffer capture, automatic MinIO single/multipart publication, scale qualification, consumer wiring, and release gates. |
 | M7 — bounded object reads ✅ | Exact range reads in the object contract; an allocation-free sequential `ObjectReader` poisoned by range failures; filesystem positional reads; signed S3 single-range GETs with exact `Content-Range` validation; and restore/compaction input windows sized independently of the accepted object limit. | Backend conformance and malformed-range tests, MinIO range qualification, tiny-window restore and interleaved compaction, controller capacity and alias checks, scale qualification, and release gates. |
 | M8 — deterministic interruption hardening ✅ | Restart-safe controller retention reconciliation that re-verifies the covering upper-level restore plan before source or covered-snapshot deletion; precise S3 transactional publication uncertainty as `PublicationIndeterminate`; and fixed, deterministic fault checkpoints at the existing object and HTTP seams rather than a new production fault API. | Hermetic controller restart tests cover interruption before and during source and older-snapshot cleanup and require an exact restored image; scripted S3 tests cover single PUT, multipart initiation, part upload, completion acknowledgement loss, abort failure, and cleanup retry, with the MinIO gate retaining real-protocol coverage. |
+| M9 — complete controller arena ✅ | `Resources.arena_capacity_bytes` derives the complete checked budget for a configuration and client capability; `Resources.bind` places the descriptor and all controller workspaces in one caller-owned arena while preserving manual construction. Transactional adapters omit whole-object fallback storage. | Exact-capacity and one-byte-short arenas, hostile starting alignment, overflow and invalid configuration, transactional and whole-object client paths, manual-resource compatibility, the simplified consumer example, and the existing controller lifecycle gates. |
 
 Normal tests stay network-free. The dedicated S3/MinIO gate and
 Litestream-binary interoperability gate are implemented and run in hosted CI;
@@ -103,8 +106,8 @@ their external tools remain outside the hermetic unit-test step.
 
 ## Candidate next increment
 
-No post-M8 feature sprint is committed. The next high-value increment is a
-controller-level fixed-arena binder that derives and binds one complete
-`Resources` value. It should preserve the individually checked formulas and
-explicit lifetime/alias rules while removing error-prone manual slicing from
-the common controller setup path.
+No post-M9 feature sprint is committed. A modest next increment is bounded,
+allocation-free controller diagnostics: counters and last-operation status a
+host can poll without adding logging callbacks, scheduling policy, or an API
+freeze. This stays within the existing observability scope while keeping
+deployment policy in the consumer.

@@ -3,8 +3,8 @@
 //! This example exercises the high-level replication controller against the
 //! local filesystem: a live SQLite database is captured into a
 //! Litestream-layout object tree, then restored to a fresh path and verified.
-//! The host supplies SQLite writes, scheduling timestamps, fixed workspaces,
-//! the object adapter, and the filesystem apply backend.
+//! The host supplies SQLite writes, scheduling timestamps, initialization-time
+//! workspace storage, the object adapter, and the filesystem apply backend.
 //!
 //! Run with: `mise exec -- zig build example-replicate-once`.
 //! The example executable links the host system SQLite; the library modules
@@ -29,9 +29,6 @@ const max_files_per_level = 8;
 const max_restore_files = 8;
 const max_compaction_inputs = 1;
 const read_workspace_bytes: u32 = 64 * 1024;
-const level_count = @as(usize, ltx.snapshot_level) + 1;
-const max_wal_bytes = ltx_wal.header_size_bytes +
-    max_frames * (ltx_wal.frame_header_size_bytes + max_page_bytes);
 const checkpoint_threshold_bytes: u64 = ltx_wal.header_size_bytes +
     2 * (ltx_wal.frame_header_size_bytes + max_page_bytes);
 
@@ -124,7 +121,18 @@ pub fn main() !void {
 
     var store = try ltx_object.FileClient.init(dir, io, "replica");
     const client = store.client();
-    var resources = controller_storage.bind();
+    const resource_capacity_bytes =
+        try ltx_replication.Resources.arena_capacity_bytes(
+            controller_config,
+            client,
+        );
+    const resource_arena = try allocator.alloc(u8, resource_capacity_bytes);
+    defer allocator.free(resource_arena);
+    const resources = try ltx_replication.Resources.bind(
+        controller_config,
+        client,
+        resource_arena,
+    );
     var controller = try ltx_replication.Controller.init(.{
         .dir = dir,
         .io = io,
@@ -132,7 +140,7 @@ pub fn main() !void {
         .client = client,
         .config = controller_config,
         .startup = .require_empty,
-    }, &resources);
+    }, resources);
     defer controller.finish();
 
     // The host application writes SQLite; the controller owns capture.
@@ -281,74 +289,3 @@ fn verify_restored_rows(
         return error.SQLiteVerificationFailure;
     }
 }
-
-const ControllerStorage = struct {
-    wal_storage: [max_wal_bytes]u8 = undefined,
-    map_slots: [max_pages]ltx_wal.PageSlot = undefined,
-    map_pending: [max_pages]u32 = undefined,
-    map_seen: [(max_pages + 7) / 8]u8 = undefined,
-    map_entries: [max_pages]ltx_wal.PageMapEntry = undefined,
-    empty_output: [0]u8 = .{},
-    capture_page: [max_page_bytes]u8 = undefined,
-    capture_compressed: [max_compressed_bytes]u8 = undefined,
-    capture_compression: ltx.LZ4CompressionWorkspace = undefined,
-    capture_index: [max_pages]ltx.PageIndexEntry = undefined,
-    level_listings: [level_count * max_files_per_level]ltx.FileInfo = undefined,
-    restore_plan: [max_restore_files]ltx.FileInfo = undefined,
-    retention_plan: [max_files_per_level]ltx.FileInfo = undefined,
-    restore_read_workspace: [read_workspace_bytes]u8 = undefined,
-    restore_page: [max_page_bytes]u8 = undefined,
-    restore_compressed: [max_compressed_bytes]u8 = undefined,
-    restore_index: [max_pages]ltx.PageIndexEntry = undefined,
-    compaction_job_inputs: [max_compaction_inputs]ltx_replica.CompactionJobInput = undefined,
-    compaction_inputs: [max_compaction_inputs]ltx.CompactionInput = undefined,
-    compaction_input_read_workspaces: [max_compaction_inputs][read_workspace_bytes]u8 = undefined,
-    compaction_input_pages: [max_compaction_inputs][max_page_bytes]u8 = undefined,
-    compaction_input_compressed: [max_compaction_inputs][max_compressed_bytes]u8 = undefined,
-    compaction_input_indexes: [max_compaction_inputs][max_pages]ltx.PageIndexEntry = undefined,
-    compaction_output_compressed: [max_compressed_bytes]u8 = undefined,
-    compaction_output_compression: ltx.LZ4CompressionWorkspace = undefined,
-    compaction_output_index: [max_pages]ltx.PageIndexEntry = undefined,
-
-    fn bind(self: *ControllerStorage) ltx_replication.Resources {
-        for (&self.compaction_job_inputs, 0..) |*input, index| {
-            input.* = .{
-                .read_workspace = &self.compaction_input_read_workspaces[index],
-                .page_workspace = &self.compaction_input_pages[index],
-                .compressed_workspace = &self.compaction_input_compressed[index],
-                .index_workspace = &self.compaction_input_indexes[index],
-            };
-        }
-        return .{
-            .capture = .{
-                .wal_storage = &self.wal_storage,
-                .map_slots = &self.map_slots,
-                .map_pending = &self.map_pending,
-                .map_seen = &self.map_seen,
-                .map_entries = &self.map_entries,
-                // FileClient publishes through a transactional write session,
-                // so capture does not need a whole-object output buffer.
-                .output_storage = &self.empty_output,
-                .page_workspace = &self.capture_page,
-                .compressed_workspace = &self.capture_compressed,
-                .compression_workspace = &self.capture_compression,
-                .index_workspace = &self.capture_index,
-            },
-            .level_listings = &self.level_listings,
-            .restore_plan = &self.restore_plan,
-            .retention_plan = &self.retention_plan,
-            .restore_read_workspace = &self.restore_read_workspace,
-            .restore_page_workspace = &self.restore_page,
-            .restore_compressed_workspace = &self.restore_compressed,
-            .restore_index_workspace = &self.restore_index,
-            .compaction_job_inputs = &self.compaction_job_inputs,
-            .compaction_inputs = &self.compaction_inputs,
-            .compaction_output_storage = &self.empty_output,
-            .compaction_output_compressed_workspace = &self.compaction_output_compressed,
-            .compaction_output_compression_workspace = &self.compaction_output_compression,
-            .compaction_output_index_workspace = &self.compaction_output_index,
-        };
-    }
-};
-
-var controller_storage: ControllerStorage = .{};

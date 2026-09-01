@@ -45,6 +45,11 @@ version is zero, the Zig source API is intentionally unstable.
   multipart publication, including publication-before-cleanup restart,
   partial source deletion, completion acknowledgement loss, abort failure, and
   cleanup retry.
+- `ltx_replication.Resources.arena_capacity_bytes` and `Resources.bind`, which
+  derive and bind a complete controller resource set from one caller-owned
+  fixed arena with checked capacity, alignment, and arithmetic. Transactional
+  clients omit the two whole-object fallback buffers; manual `Resources`
+  construction remains supported.
 
 ### Changed
 
@@ -75,6 +80,9 @@ version is zero, the Zig source API is intentionally unstable.
   before reconciling retained lower-level sources and covered older snapshots
   after interrupted maintenance, without requiring the compacted output to be
   republished.
+- The `replicate-once` consumer template now obtains its complete controller
+  resource arena during host initialization instead of manually declaring and
+  wiring every workspace.
 
 ### Fixed
 
