@@ -75,10 +75,10 @@ encoded bytes and digests, decoded images, compacted semantics, and
 callback/event/page counts. Neither it nor any other CI gate compares elapsed
 time or throughput.
 
-Use the official Litestream v0.5.16 archive for the host and verify its
+Use the official Litestream v0.5.17 archive for the host and verify its
 SHA-256 against the values recorded in [`upstream.md`](upstream.md) before the
 `litestream-interop` command. The harness also rejects every reported version
-other than exactly `0.5.16`. It uses only a temporary local file replica and
+other than exactly `0.5.17`. It uses only a temporary local file replica and
 does not contact a configured remote replica.
 
 For capture-throughput or restore-path changes, also run the bounded scale

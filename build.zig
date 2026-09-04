@@ -1061,7 +1061,7 @@ pub fn build(b: *std.Build) void {
     run_litestream_interop.addArg(b.option(
         []const u8,
         "litestream",
-        "Path to the exact Litestream v0.5.16 binary",
+        "Path to the exact Litestream v0.5.17 binary",
     ) orelse "litestream");
     run_litestream_interop.addFileArg(generated_litestream_compaction);
     run_litestream_interop.addFileArg(b.path(
@@ -1082,7 +1082,7 @@ pub fn build(b: *std.Build) void {
     ]);
     const litestream_interop_step = b.step(
         "litestream-interop",
-        "Restore Zig-compacted real captures with Litestream v0.5.16",
+        "Restore Zig-compacted real captures with Litestream v0.5.17",
     );
     litestream_interop_step.dependOn(&run_litestream_interop.step);
 

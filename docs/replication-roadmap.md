@@ -64,7 +64,7 @@ store remains the read-only-serving option; restore-to-path needs only
   concurrency across databases.
 - **Current flagged blocks only.** All new output uses the canonical current
   v3 representation. This is a greenfield writer: writer and reader are this
-  library, with Litestream v0.5.16 retained as the emergency restore oracle.
+  library, with Litestream v0.5.17 retained as the emergency restore oracle.
 - **Byte-compatible object layout.** Object keys and metadata follow the
   pinned Celld and Litestream layouts exactly, so external tools keep working
   and the `litestream-interop` gate can cover full replica trees.

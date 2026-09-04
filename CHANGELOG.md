@@ -95,6 +95,13 @@ version is zero, the Zig source API is intentionally unstable.
   successful range into every later refill. Filesystem reads compare canonical
   opened-file metadata before and after each positional read; S3 reads capture
   the first response ETag and sign later range requests with `If-Match`.
+- The Litestream interoperability oracle moved from v0.5.16 to the
+  checksum-pinned v0.5.17 release, whose upstream changes are restore-path
+  maintenance (v3 WAL-segment restores above 4 GiB, safe WAL-offset ordering,
+  throttle retries, and a WAL-reset corruption fix). The harness version
+  check, hosted CI archive pin, and recorded SHA-256 values follow; the
+  mixed-level restores and the forced no-checksum rejection of checked
+  matrix output were requalified unchanged against the new binary.
 
 ### Fixed
 

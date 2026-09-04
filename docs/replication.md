@@ -36,7 +36,7 @@ explicit limits, workspaces, and timestamps. Consult
 - Captured L0 files use the no-checksum Litestream profile; the object
   layout, level names, filenames, and `litestream-timestamp` metadata match
   Litestream's on-disk and object-store layouts so external tooling
-  (including the Litestream v0.5.16 reader qualified in
+  (including the Litestream v0.5.17 reader qualified in
   [`upstream.md`](upstream.md)) interoperates.
 - Filesystem and S3 producers stream encoded output into private transactional
   staging. `finish` is the requested object publication boundary; encoding or
@@ -237,7 +237,7 @@ names the lower-level files fully absorbed by a durable higher level.
   conditional-write, retry, multipart, and supported virtual-host coverage
   against isolated pinned local MinIO instances with real SigV4.
 - `mise exec -- zig build litestream-interop -Dlitestream=<path>` — the
-  pinned Litestream v0.5.16 binary restores Zig-compacted fixtures and a
+  pinned Litestream v0.5.17 binary restores Zig-compacted fixtures and a
   live `ltx_capture` tree to byte-identical images.
 - `mise exec -- zig build example-replicate-once` — the runnable consumer
   template covering the whole lifecycle.

@@ -21,6 +21,8 @@ exact revisions:
   `016c368704e63db0088b9b61e2e96c0019f11832`
 - [`benbjohnson/litestream` v0.5.16](https://github.com/benbjohnson/litestream/tree/6d61ef5d007756d62e473daee4c760ac395a55c6):
   `6d61ef5d007756d62e473daee4c760ac395a55c6`
+- [`benbjohnson/litestream` v0.5.17 (current restore oracle)](https://github.com/benbjohnson/litestream/tree/ccd326c175b583b5e82893a6078f06dcef5fba3f):
+  `ccd326c175b583b5e82893a6078f06dcef5fba3f`
 - [`pierrec/lz4` v4.1.23](https://github.com/pierrec/lz4/tree/cd9d7a4f66405a92f4881933816b828b0f7d5fe2):
   `cd9d7a4f66405a92f4881933816b828b0f7d5fe2`
 - [SQLite 3.53.4 source mirror](https://github.com/sqlite/sqlite/tree/b09c88c14082339b66c7b7158d609a771e64ca69):
@@ -157,6 +159,21 @@ For Litestream v0.5.16: the release archive manifest, `go.mod`,
 `cmd/litestream/restore.go`, `replica.go` restore planning and decode path, and
 the pinned `superfly/ltx v0.5.2` reader were checked. The shipped binary is the
 deployment oracle; it is not rebuilt with the repository's older Go pin.
+
+For Litestream v0.5.17 (tag `ccd326c175b583b5e82893a6078f06dcef5fba3f`,
+released 2026-08-31): the release notes and published archive manifest were
+checked, and every platform archive SHA-256 recorded below was verified
+against the published `checksums.txt`. Its release notes describe
+restore-path maintenance over v0.5.16 — v3 WAL-segment restores above 4 GiB,
+safe WAL-offset ordering, retries through provider throttling, an explicit
+truncated-page-index error, S3 signing and multipart-default fixes, and a
+dependency update removing a WAL-reset corruption exposure. No LTX wire
+behavior changed for the trees this project produces: the requalified binary
+restored the real captured tree, the mixed-level deployment tree, and the
+matrix's maximum-page output to the same byte-exact images, and the forced
+no-checksum rejection of the checked-growth matrix output reproduced
+unchanged. v0.5.16 remains a qualified historical reader; v0.5.17 is the
+active gate and emergency-restore oracle.
 
 For raw-block compression: the current Go oracle pins
 `github.com/pierrec/lz4/v4 v4.1.23` with module content hash
@@ -361,13 +378,13 @@ the current flagged page representation, and decodes the exact TX4 image hash
 A fourth scenario covers the producer side end to end: the tool builds a
 real database through `ltx_capture` (a snapshot, an incremental, a
 session-initiated passive checkpoint, and a post-checkpoint incremental),
-checkpoints the live database, and requires Litestream v0.5.16 to restore
+checkpoints the live database, and requires Litestream v0.5.17 to restore
 the captured tree to a file byte-identical (SHA-256) to the live image that
 also answers queries read-only with the captured rows.
 
 The deployment gate places that Zig file at L1 for TX1–TX4 and retains the
 unaltered legacy TX5 and TX6 objects at L0. The checksum-verified official
-[Litestream v0.5.16 release](https://github.com/benbjohnson/litestream/releases/tag/v0.5.16)
+[Litestream v0.5.17 release](https://github.com/benbjohnson/litestream/releases/tag/v0.5.17)
 must restore both the TX4 boundary and the final TX6 image. Their SHA-256 values
 are respectively the TX4 hash above and
 `ee705e74c9788b64f5dc63b9c3dc028ae05aae34f240bad1362d9436c65150e0`;
@@ -375,13 +392,13 @@ the final database must also pass full SQLite integrity and contain the exact
 eight captured rows. The official archive SHA-256 values used by release and
 CI qualification are:
 
-- Linux x86_64: `9e29112380a942e4a62ee07773684396cb8b308dc4d67e130bef41f75e937f0a`
-- Linux arm64: `678022e4103145302598e35d37f8718392d42e153feeb1e2d4a64dd0cd3aaf10`
-- macOS x86_64: `eb554b93c9e2833351b017707e9ba5ac97ffd91d07e8b8b836b3ca7661399c36`
-- macOS arm64: `3e64028ff3522caca7a5ab67244e0373b25f3db68b6e25cac0056bf71c30c337`
+- Linux x86_64: `cfb371176d164437ae869f8351cfde49bd1804ae71c61923f75c9cba9c9c006d`
+- Linux arm64: `f8ca4a050095c1efbda2c4365172e61bf9d955ea0d9ac42f448b52e51819baa5`
+- macOS x86_64: `891875af09db152e93a4b31a8a79f538ce7ce702c132803cfe0a831e7cb1b7db`
+- macOS arm64: `e211f68ff7658d19f193f2914417afdf8f89a053ff8f263e5d6b3b1d3bbc7b08`
 
 The published `checksums.txt` itself has SHA-256
-`074cd89d41b46561c8c087d2728842dad32356c4192171c2488d3eff03a9f317`.
+`f5c30b11a19ef14fc64581be19aa50ee81dcc7f53eb429737c151630f5129d6f`.
 The Linux x86_64 archive is fetched and checked in hosted Linux CI and the
 pinned `act` rehearsal. Normal tests remain hermetic; they apply the identical
 Zig L1 plus legacy L0 sequence through `StagedApplier` and pin the TX4, TX5,
@@ -597,7 +614,7 @@ same 736-byte canonical v3 object as an independently constructed current-Go
 It also migrates the valid SQLite fixture to a 233-byte current v3 object
 (SHA-256
 `18cd3220519ab8c75cd6f44b8d96dc71bf8e21335c3ad4f5462adc71b53a8e4c`)
-and checks the decoded database hash with current Go. Litestream v0.5.16 is not
+and checks the decoded database hash with current Go. Litestream v0.5.17 is not
 used for this checksummed object because its restore path forces no-checksum
 mode while retaining the nonzero post-apply checksum; weakening the migration
 would violate the wire contract. The pinned Celld corpus contains no v2
@@ -699,11 +716,11 @@ The pinned Go verifier separately constructs the current source files, reads
 the committed legacy fixture where applicable, and byte-matches all 12 Zig
 source files before running `ltx.NewCompactor` over those bytes. Each complete
 Zig output must be byte-identical to Go before Go decodes and checks its
-database SHA-256. The checksum-verified Litestream v0.5.16 binary
+database SHA-256. The checksum-verified Litestream v0.5.17 binary
 also restores `no-checksum-max-page-shrink-65536` as a standalone L1 object
 and reproduces its exact hash. The same harness requires a bounded rejection
 for `checked-grow-512`: Litestream forces no-checksum compaction while retaining
-that checksummed file's nonzero post checksum. This is a Litestream v0.5.16
+that checksummed file's nonzero post checksum. This is a Litestream v0.5.17
 mode-conversion limitation, not a Zig/Go output mismatch. Both payloads are
 deterministic byte patterns rather than SQLite-generated pages, so these probes
 qualify LTX deployment reading, not SQLite database validity.
@@ -713,7 +730,7 @@ synthetic and real-capture compaction checks from the build graph. For
 compaction, the exact pinned Go module independently reconstructs or reads the
 inputs, runs `ltx.NewCompactor`, byte-compares the full output with Zig, and
 decodes it for semantic checks, including the five-case matrix. `mise exec -- zig build litestream-interop
--Dlitestream=/absolute/path/to/litestream` adds the real v0.5.16 deployment
+-Dlitestream=/absolute/path/to/litestream` adds the real v0.5.17 deployment
 reader over the mixed-level tree and selected matrix probes described above.
 The Go module uses the
 checksum-locked pseudo-version resolving exactly to the recorded commit;

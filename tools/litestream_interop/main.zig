@@ -36,7 +36,7 @@ const sqlite_open_readonly: c_int = 0x0000_0001;
 const sqlite_open_uri: c_int = 0x0000_0040;
 const sqlite_open_fullmutex: c_int = 0x0001_0000;
 
-const required_litestream_version = "0.5.16\n";
+const required_litestream_version = "0.5.17\n";
 const child_output_limit_bytes: usize = 64 * 1024;
 const diagnostic_output_limit_bytes: usize = 4096;
 const sqlite_message_limit_bytes: usize = 1024;
@@ -192,7 +192,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [192]u8 = undefined;
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     try stdout_writer.interface.writeAll(
-        "Litestream 0.5.16 restored real and max-page compactions; checked-input rejection reproduced\n",
+        "Litestream 0.5.17 restored real and max-page compactions; checked-input rejection reproduced\n",
     );
     try stdout_writer.interface.flush();
 }

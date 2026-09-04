@@ -176,14 +176,14 @@ Litestream capture. It byte-matches the Zig output, requires current flagged
 raw-LZ4 pages, and decodes the exact known TX4 SQLite image. For the deployment
 boundary, `mise exec -- zig build litestream-interop
 -Dlitestream=/absolute/path/to/litestream` requires a binary reporting exactly
-v0.5.16. Release qualification and CI use the checksum-pinned official archive.
+v0.5.17. Release qualification and CI use the checksum-pinned official archive.
 The harness builds a forced replica plan containing the Zig TX1–TX4 L1 object
 and the legacy-frame TX5/TX6 L0 tail, restores at TX4 and TX6, and checks both
 database hashes plus final SQLite integrity and rows. Hosted Linux CI extracts
 and runs the archive only after verifying its pinned SHA-256. The harness also
 restores the matrix's no-checksum maximum-page output as a standalone L1 object
 and requires its exact image hash. Its checked-growth probe is a bounded
-expected rejection: Litestream v0.5.16 forces Go compaction to no-checksum mode
+expected rejection: Litestream v0.5.17 forces Go compaction to no-checksum mode
 but retains the input's nonzero post-apply checksum, producing an invalid
 combination. The Zig output remains byte-identical to the pinned Go compactor
 in its checksummed mode. These matrix payloads are synthetic byte-pattern

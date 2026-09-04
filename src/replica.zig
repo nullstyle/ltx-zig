@@ -34,7 +34,7 @@ pub const CompactionLevel = struct {
     interval_ms: u64,
 };
 
-/// The canonical Litestream v0.5.16 ladder: L0 immediate, then 30 seconds,
+/// The canonical Litestream v0.5.17 ladder: L0 immediate, then 30 seconds,
 /// 5 minutes, and 1 hour.
 pub const default_levels = [4]CompactionLevel{
     .{ .level = 0, .interval_ms = 0 },
@@ -1106,7 +1106,7 @@ fn verify_identity(verified: ltx.VerifiedLTX, expected: ltx.FileIdentity) Error!
 
 const testing = std.testing;
 
-test "default ladder matches litestream v0.5.16 and validates ordering" {
+test "default ladder matches litestream v0.5.17 and validates ordering" {
     const ladder = CompactionLevels{ .levels = &default_levels };
     try ladder.validate();
     try testing.expectEqual(@as(u8, 3), ladder.max_level());
