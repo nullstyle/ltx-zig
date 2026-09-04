@@ -431,8 +431,9 @@ test "fast encoder matches pinned Celld and pierrec vectors" {
     const encoded_repeated = try encode(&repeated, &compressed, &compression_workspace);
     try std.testing.expectEqualSlices(u8, &expected_repeated, encoded_repeated);
 
-    const periodic = "abcd" ** 256;
-    const encoded_periodic = try encode(periodic, &compressed, &compression_workspace);
+    var periodic: [1024]u8 = undefined;
+    for (&periodic, 0..) |*byte, i| byte.* = "abcd"[i % 4];
+    const encoded_periodic = try encode(&periodic, &compressed, &compression_workspace);
     try std.testing.expectEqualSlices(u8, &expected_periodic, encoded_periodic);
 }
 
@@ -446,14 +447,16 @@ test "fast encoder matches the pinned match-find boundary vectors" {
     var compression_workspace: CompressionWorkspace = .{};
     var compressed: [compress_bound(15)]u8 = undefined;
 
+    const fourteen: [14]u8 = @splat('a');
     const encoded_fourteen = try encode(
-        "a" ** 14,
+        &fourteen,
         &compressed,
         &compression_workspace,
     );
     try std.testing.expectEqualSlices(u8, &expected_fourteen, encoded_fourteen);
+    const fifteen: [15]u8 = @splat('a');
     const encoded_fifteen = try encode(
-        "a" ** 15,
+        &fifteen,
         &compressed,
         &compression_workspace,
     );

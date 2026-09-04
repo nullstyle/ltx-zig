@@ -8,7 +8,7 @@ pub fn build(b: *std.Build) void {
         std.builtin.OptimizeMode,
         "bench-optimize",
         "Optimization mode for benchmark executables",
-    ) orelse .ReleaseFast;
+    ) orelse .fast;
 
     const ltx = b.addModule("ltx", .{
         .root_source_file = b.path("src/ltx.zig"),
@@ -586,20 +586,20 @@ pub fn build(b: *std.Build) void {
 
     const fmt = b.addFmt(.{
         .paths = &.{
-            "build.zig",
-            "build.zig.zon",
-            "src",
-            "tests",
-            "examples",
-            "benchmarks",
-            "tools/fixturegen",
-            "tools/compaction_fixturegen",
-            "tools/v2_migration_fixturegen",
-            "tools/litestream_compaction_fixturegen",
-            "tools/litestream_interop",
-            "tools/source_archive_smoke",
-            "tools/valid_chain_fixturegen",
-            "tools/release_check",
+            b.path("build.zig"),
+            b.path("build.zig.zon"),
+            b.path("src"),
+            b.path("tests"),
+            b.path("examples"),
+            b.path("benchmarks"),
+            b.path("tools/fixturegen"),
+            b.path("tools/compaction_fixturegen"),
+            b.path("tools/v2_migration_fixturegen"),
+            b.path("tools/litestream_compaction_fixturegen"),
+            b.path("tools/litestream_interop"),
+            b.path("tools/source_archive_smoke"),
+            b.path("tools/valid_chain_fixturegen"),
+            b.path("tools/release_check"),
         },
         .check = true,
     });
@@ -1131,7 +1131,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_core_benchmark = b.addRunArtifact(core_benchmark_executable);
-    if (b.args) |args| run_core_benchmark.addArgs(args);
+    run_core_benchmark.addPassthruArgs();
     const benchmark_step = b.step("bench", "Benchmark representative core LTX operations");
     benchmark_step.dependOn(&run_core_benchmark.step);
     const core_benchmark_step = b.step("bench-core", "Alias for the core LTX benchmark");

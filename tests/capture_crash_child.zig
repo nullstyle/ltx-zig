@@ -84,11 +84,7 @@ pub fn main(init: std.process.Init) !void {
         var statement_buffer: [128]u8 = undefined;
         var row: u64 = 0;
         while (row < 8) : (row += 1) {
-            const statement = try std.fmt.bufPrintZ(
-                &statement_buffer,
-                "INSERT INTO kv VALUES ({d}, 'b{d}r{d}')",
-                .{ batch * 8 + row + 1, batch, row },
-            );
+            const statement = try std.mem.printSentinel(&statement_buffer, "INSERT INTO kv VALUES ({d}, 'b{d}r{d}')", .{ batch * 8 + row + 1, batch, row }, 0);
             try session.exec(statement);
         }
         _ = try session.sync(&workspaces, @intCast(1000 + batch));

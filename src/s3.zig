@@ -969,14 +969,14 @@ pub const S3Client = struct {
                 }
                 return err;
             };
-            const retryable = @intFromEnum(outcome.status) >= 500 or
+            const retryable = @backingInt(outcome.status) >= 500 or
                 outcome.status == .too_many_requests;
             if (retryable) {
                 if (options.publication == .indeterminate_after_send) {
                     return outcome;
                 }
                 if (retry_delay(policy, attempt, .{
-                    .status = @intFromEnum(outcome.status),
+                    .status = @backingInt(outcome.status),
                 }, method, options.conditional)) |delay| {
                     try policy.sleep_ms(delay);
                     continue;
@@ -1837,14 +1837,14 @@ fn post_send_failure(options: S3Client.RequestOptions) ConditionalWriteError {
 }
 
 fn conditional_status_failure(status: std.http.Status) ConditionalWriteError {
-    if (@intFromEnum(status) >= 500 or status == .too_many_requests) {
+    if (@backingInt(status) >= 500 or status == .too_many_requests) {
         return error.PublicationIndeterminate;
     }
     return error.StorageFailure;
 }
 
 fn publication_status_failure(status: std.http.Status) Error {
-    if (@intFromEnum(status) >= 500 or status == .too_many_requests) {
+    if (@backingInt(status) >= 500 or status == .too_many_requests) {
         return error.PublicationIndeterminate;
     }
     return error.StorageFailure;

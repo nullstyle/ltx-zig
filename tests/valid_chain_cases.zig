@@ -368,7 +368,7 @@ fn make_header(
     txid: u64,
     pre: ltx.Checksum,
 ) ltx.Header {
-    const metadata_base = @as(u64, @intFromEnum(kind) + 1) * 1000 + txid * 10;
+    const metadata_base = @as(u64, @backingInt(kind) + 1) * 1000 + txid * 10;
     return .{
         .flags = if (spec.no_checksum) ltx.header_flag_no_checksum else 0,
         .page_size = spec.page_size,
@@ -386,7 +386,7 @@ fn make_header(
 }
 
 fn timestamp_ms(kind: CaseKind, txid: u64) i64 {
-    return @as(i64, @intFromEnum(kind) + 1) * 100_000 + @as(i64, @intCast(txid));
+    return @as(i64, @backingInt(kind) + 1) * 100_000 + @as(i64, @intCast(txid));
 }
 
 fn database_checksum(database: []const u8, page_size_u32: u32) !ltx.Checksum {

@@ -124,7 +124,7 @@ const TemporaryDirectory = struct {
             var name: [name_bytes]u8 = undefined;
             @memcpy(name[0..prefix.len], prefix);
             _ = std.base64.url_safe.Encoder.encode(name[prefix.len..], &random_bytes);
-            parent.createDir(io, &name, @enumFromInt(0o700)) catch |err| switch (err) {
+            parent.createDir(io, &name, @fromBackingInt(@intCast(0o700))) catch |err| switch (err) {
                 error.PathAlreadyExists => continue,
                 else => return err,
             };

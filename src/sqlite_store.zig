@@ -291,7 +291,7 @@ const Manifest = struct {
             .big,
         );
         if (self.current) |current| {
-            bytes[manifest_slot_offset] = @intFromEnum(current.slot);
+            bytes[manifest_slot_offset] = @backingInt(current.slot);
             std.mem.writeInt(
                 u64,
                 bytes[manifest_generation_offset..manifest_txid_offset],
@@ -325,7 +325,7 @@ const Manifest = struct {
         } else {
             bytes[manifest_slot_offset] = manifest_empty_slot_tag;
         }
-        const digest = std.hash.crc.Crc64GoIso.hash(bytes[0..manifest_digest_offset]);
+        const digest = std.hash.crc.@"CRC-64/GO-ISO".hash(bytes[0..manifest_digest_offset]);
         std.mem.writeInt(u64, bytes[manifest_digest_offset..manifest_size], digest, .big);
         return bytes;
     }
@@ -352,7 +352,7 @@ const Manifest = struct {
             bytes[manifest_reserved_b_offset..manifest_database_size_offset],
             0,
         )) return error.ManifestCorrupt;
-        const expected_digest = std.hash.crc.Crc64GoIso.hash(bytes[0..manifest_digest_offset]);
+        const expected_digest = std.hash.crc.@"CRC-64/GO-ISO".hash(bytes[0..manifest_digest_offset]);
         if (std.mem.readInt(
             u64,
             bytes[manifest_digest_offset..manifest_size],
@@ -431,7 +431,7 @@ test "manifest wire encoding is canonical and rejects reserved bytes" {
 
     var noncanonical = canonical;
     noncanonical[manifest_reserved_a_offset] = 1;
-    const digest = std.hash.crc.Crc64GoIso.hash(noncanonical[0..manifest_digest_offset]);
+    const digest = std.hash.crc.@"CRC-64/GO-ISO".hash(noncanonical[0..manifest_digest_offset]);
     std.mem.writeInt(
         u64,
         noncanonical[manifest_digest_offset..manifest_size],
@@ -454,7 +454,7 @@ test "manifest wire encoding has one canonical empty state" {
 
     var noncanonical = canonical;
     noncanonical[manifest_generation_offset] = 1;
-    const digest = std.hash.crc.Crc64GoIso.hash(noncanonical[0..manifest_digest_offset]);
+    const digest = std.hash.crc.@"CRC-64/GO-ISO".hash(noncanonical[0..manifest_digest_offset]);
     std.mem.writeInt(
         u64,
         noncanonical[manifest_digest_offset..manifest_size],
@@ -1247,7 +1247,7 @@ pub const Store = struct {
     ) Error!ltx.Checksum {
         var page_number_bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &page_number_bytes, page_number, .big);
-        var crc = std.hash.crc.Crc64GoIso.init();
+        var crc = std.hash.crc.@"CRC-64/GO-ISO".init();
         crc.update(&page_number_bytes);
         const chunk_bytes: u64 = @intCast(self.copy_workspace.len);
         const budget = @as(u64, page_size) / chunk_bytes +

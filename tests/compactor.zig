@@ -557,7 +557,7 @@ test "v2 aggregate page limit uses the four-byte page header" {
 }
 
 test "compactor rejects an unknown per-input format version" {
-    const unknown: ltx.FormatVersion = @enumFromInt(4);
+    const unknown: ltx.FormatVersion = @fromBackingInt(@intCast(4));
     var input_workspace: InputWorkspace = undefined;
     var inputs = [_]ltx.CompactionInput{
         input_workspace.input_versioned(unknown, current_snapshot_fixture),

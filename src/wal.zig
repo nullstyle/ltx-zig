@@ -684,12 +684,11 @@ const test_limits = Limits{
 };
 
 const TestWorkspaces = struct {
-    slots: [test_limits.max_pages]PageSlot = [_]PageSlot{.{}} ** test_limits.max_pages,
-    pending: [test_limits.max_pages]u32 = [_]u32{0} ** test_limits.max_pages,
-    seen: [(test_limits.max_pages + 7) / 8]u8 = [_]u8{0} ** ((test_limits.max_pages + 7) / 8),
+    slots: [test_limits.max_pages]PageSlot = @splat(.{}),
+    pending: [test_limits.max_pages]u32 = @splat(0),
+    seen: [(test_limits.max_pages + 7) / 8]u8 = @splat(0),
     entries: [test_limits.max_pages]PageMapEntry =
-        [_]PageMapEntry{.{ .page_number = 0, .frame_offset_bytes = 0 }} **
-        test_limits.max_pages,
+        @splat(.{ .page_number = 0, .frame_offset_bytes = 0 }),
 
     fn workspace(self: *TestWorkspaces) PageMapWorkspace {
         return .{
@@ -718,8 +717,8 @@ test "wal checksum matches the Go bad-version header vector" {
 
 test "header validation rejects each malformed shape" {
     try std.testing.expectError(error.TruncatedHeader, init_reader(&.{}));
-    try std.testing.expectError(error.TruncatedHeader, init_reader(&[_]u8{0} ** 10));
-    try std.testing.expectError(error.InvalidMagic, init_reader(&[_]u8{0} ** 32));
+    try std.testing.expectError(error.TruncatedHeader, init_reader(&@as([10]u8, @splat(0))));
+    try std.testing.expectError(error.InvalidMagic, init_reader(&@as([32]u8, @splat(0))));
     const bad_checksum = [32]u8{
         0x37, 0x7f, 0x06, 0x83, 0x00, 0x00, 0x00, 0x00, //
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //

@@ -1114,11 +1114,7 @@ fn publish_row(
     row: u32,
 ) !void {
     var statement_storage: [96]u8 = undefined;
-    const statement = try std.fmt.bufPrintZ(
-        &statement_storage,
-        "INSERT INTO kv VALUES ({d}, 'value-{d}')",
-        .{ row, row },
-    );
+    const statement = try std.mem.printSentinel(&statement_storage, "INSERT INTO kv VALUES ({d}, 'value-{d}')", .{ row, row }, 0);
     try exec_sql(temporary.dir, std.testing.io, "app.db", statement);
     const result = try controller.sync(1000 * @as(i64, row));
     try std.testing.expectEqual(@as(u64, row), result.published.position.txid.value);

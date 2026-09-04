@@ -60,17 +60,17 @@ const wal_limits = ltx_wal.Limits{
 
 const TestWorkspaces = struct {
     wal_storage: [1 << 20]u8 = undefined,
-    map_slots: [64]ltx_wal.PageSlot = [_]ltx_wal.PageSlot{.{}} ** 64,
-    map_pending: [64]u32 = [_]u32{0} ** 64,
-    map_seen: [8]u8 = [_]u8{0} ** 8,
+    map_slots: [64]ltx_wal.PageSlot = @splat(.{}),
+    map_pending: [64]u32 = @splat(0),
+    map_seen: [8]u8 = @splat(0),
     map_entries: [64]ltx_wal.PageMapEntry =
-        [_]ltx_wal.PageMapEntry{.{ .page_number = 0, .frame_offset_bytes = 0 }} ** 64,
+        @splat(.{ .page_number = 0, .frame_offset_bytes = 0 }),
     output_storage: [1 << 20]u8 = undefined,
     page_workspace: [4096]u8 = undefined,
     compressed_workspace: [4200]u8 = undefined,
     compression_workspace: ltx.LZ4CompressionWorkspace = undefined,
     index_workspace: [64]ltx.PageIndexEntry =
-        [_]ltx.PageIndexEntry{.{ .page_number = 0, .frame_offset_bytes = 0, .frame_size_bytes = 0 }} ** 64,
+        @splat(.{ .page_number = 0, .frame_offset_bytes = 0, .frame_size_bytes = 0 }),
 
     fn workspaces(self: *TestWorkspaces) ltx_capture.Workspaces {
         return .{
@@ -1050,11 +1050,7 @@ test "checkpoint threshold bounds wal growth across syncs" {
     try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
     var value: i64 = 0;
     while (value < 6) : (value += 1) {
-        const sql = try std.fmt.bufPrintZ(
-            &sql_buffer,
-            "INSERT INTO kv VALUES ({d}, 'v{d}')",
-            .{ value + 1, value + 1 },
-        );
+        const sql = try std.mem.printSentinel(&sql_buffer, "INSERT INTO kv VALUES ({d}, 'v{d}')", .{ value + 1, value + 1 }, 0);
         try session.exec(sql);
         _ = try session.sync(&capture_workspaces, 1000 + value);
     }
@@ -1088,11 +1084,7 @@ test "mid-WAL resume captures every incremental on one continuing segment" {
     try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
     var value: i64 = 0;
     while (value < 4) : (value += 1) {
-        const statement = try std.fmt.bufPrintZ(
-            &sql_buffer,
-            "INSERT INTO kv VALUES ({d}, 'v{d}')",
-            .{ value + 1, value + 1 },
-        );
+        const statement = try std.mem.printSentinel(&sql_buffer, "INSERT INTO kv VALUES ({d}, 'v{d}')", .{ value + 1, value + 1 }, 0);
         try session.exec(statement);
         _ = try session.sync(&capture_workspaces, 1000 + value);
         try std.testing.expectEqual(
@@ -1213,11 +1205,7 @@ test "frame-count checkpoint tier bounds WAL length" {
     var batch: u64 = 0;
     var checkpointed = false;
     while (batch < 4 and !checkpointed) : (batch += 1) {
-        const statement = try std.fmt.bufPrintZ(
-            &sql_buffer,
-            "INSERT INTO kv VALUES ({d}, 'v{d}')",
-            .{ batch + 2, batch + 2 },
-        );
+        const statement = try std.mem.printSentinel(&sql_buffer, "INSERT INTO kv VALUES ({d}, 'v{d}')", .{ batch + 2, batch + 2 }, 0);
         try session.exec(statement);
         _ = try session.sync(&capture_workspaces, @intCast(2000 + batch));
         checkpointed = session.segment_restarted;

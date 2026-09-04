@@ -27,15 +27,11 @@ const fixture_limits = wal.Limits{
 };
 
 const TestWorkspaces = struct {
-    slots: [fixture_limits.max_pages]wal.PageSlot =
-        [_]wal.PageSlot{.{}} ** fixture_limits.max_pages,
-    pending: [fixture_limits.max_pages]u32 =
-        [_]u32{0} ** fixture_limits.max_pages,
-    seen: [(fixture_limits.max_pages + 7) / 8]u8 =
-        [_]u8{0} ** ((fixture_limits.max_pages + 7) / 8),
+    slots: [fixture_limits.max_pages]wal.PageSlot = @splat(.{}),
+    pending: [fixture_limits.max_pages]u32 = @splat(0),
+    seen: [(fixture_limits.max_pages + 7) / 8]u8 = @splat(0),
     entries: [fixture_limits.max_pages]wal.PageMapEntry =
-        [_]wal.PageMapEntry{.{ .page_number = 0, .frame_offset_bytes = 0 }} **
-        fixture_limits.max_pages,
+        @splat(.{ .page_number = 0, .frame_offset_bytes = 0 }),
 
     fn workspace(self: *TestWorkspaces) wal.PageMapWorkspace {
         return .{
@@ -132,7 +128,7 @@ test "malformed headers report each pinned cause" {
     );
     try std.testing.expectError(
         error.InvalidMagic,
-        wal.Reader.init(fixture_limits, &[_]u8{0} ** 32),
+        wal.Reader.init(fixture_limits, &@as([32]u8, @splat(0))),
     );
     const bad_checksum = [32]u8{
         0x37, 0x7f, 0x06, 0x83, 0x00, 0x00, 0x00, 0x00, //
@@ -291,8 +287,7 @@ fn check_reference_map(bytes: []const u8) !void {
     const page_size = std.mem.readInt(u32, bytes[8..12], .big);
     const step: u64 = wal.frame_header_size_bytes + page_size;
 
-    var pages: [fixture_limits.max_pages]RefPage =
-        [_]RefPage{.{}} ** fixture_limits.max_pages;
+    var pages: [fixture_limits.max_pages]RefPage = @splat(.{});
     var commit_pages: u32 = 0;
     var end_offset_bytes: u64 = 0;
 

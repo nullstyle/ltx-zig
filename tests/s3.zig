@@ -907,7 +907,7 @@ fn expect_scripted_refill_error(
     var second: [3]u8 = @splat(0xcc);
     try std.testing.expectError(error.InputFailure, reader.read(&second));
     try std.testing.expectEqual(expected_error, source.failure().?);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xcc} ** 3), &second);
+    try std.testing.expectEqualSlices(u8, &@as([3]u8, @splat(0xcc)), &second);
     try server_task.await(std.testing.io);
 }
 
@@ -986,12 +986,12 @@ test "scripted S3 object reader poisons without exposing failed range bytes" {
     server.deinit(std.testing.io);
     server_open = false;
     try std.testing.expectEqual(error.ObjectChanged, source.failure().?);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xcc} ** 3), output[3..]);
+    try std.testing.expectEqualSlices(u8, &@as([3]u8, @splat(0xcc)), output[3..]);
     try std.testing.expectEqualStrings("def", &workspace);
 
     var late: [3]u8 = @splat(0x5a);
     try std.testing.expectError(error.InputFailure, reader.read(&late));
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x5a} ** 3), &late);
+    try std.testing.expectEqualSlices(u8, &@as([3]u8, @splat(0x5a)), &late);
     try std.testing.expectEqual(error.ObjectChanged, source.failure().?);
     try std.testing.expectError(error.InputFailure, reader.at_end());
 }
@@ -1148,7 +1148,7 @@ test "object reader rejects equal-size S3 replacement between refills" {
     var second: [3]u8 = @splat(0xcc);
     try std.testing.expectError(error.InputFailure, reader.read(&second));
     try std.testing.expectEqual(error.ObjectChanged, source.failure().?);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xcc} ** 3), &second);
+    try std.testing.expectEqualSlices(u8, &@as([3]u8, @splat(0xcc)), &second);
 }
 
 test "s3 backend passes the conformance suite and a plan round trip" {
@@ -1178,8 +1178,8 @@ test "s3 backend passes the conformance suite and a plan round trip" {
 
     // Plan round trip: a checksummed snapshot plus a contiguous incremental,
     // planned from real S3 listings and read back byte-identically.
-    const page_one = [_]u8{0xa5} ** 512;
-    const page_two = [_]u8{0x5a} ** 512;
+    const page_one = @as([512]u8, @splat(0xa5));
+    const page_two = @as([512]u8, @splat(0x5a));
     var snapshot_storage: [4096]u8 = undefined;
     var snapshot_sink = ltx.SliceWriter.init(&snapshot_storage);
     const snapshot_checksum = try encode_transition(

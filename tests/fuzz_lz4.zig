@@ -15,9 +15,9 @@ const lz4_guard_bytes: usize = 16;
 const first_lz4_poison: u8 = 0xa5;
 const second_lz4_poison: u8 = 0x5a;
 
-const lz4_fourteen = "\xe0" ++ ("a" ** 14);
-const lz4_fifteen = "\x10a\x01\x00\xa0" ++ ("a" ** 10);
-const lz4_extension_storm = "\xf0" ++ ("\xff" ** 32);
+const lz4_fourteen = "\xe0" ++ "aaaaaaaaaaaaaa";
+const lz4_fifteen = "\x10a\x01\x00\xa0" ++ "aaaaaaaaaa";
+const lz4_extension_storm = "\xf0" ++ "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff";
 const lz4_seed_empty_output = indexed_slice_seed(0, "\x00");
 const lz4_seed_one_literal = indexed_slice_seed(1, "\x10a");
 const lz4_seed_three_literals = indexed_slice_seed(2, "\x30abc");
@@ -105,14 +105,19 @@ const max_compressor_input_bytes: u32 = 4096;
 const max_fast_output_bytes: usize = lz4_block.compress_bound(max_compressor_input_bytes);
 const max_literal_output_bytes: usize = lz4_block.literal_bound(max_compressor_input_bytes);
 const compressor_zero_page: [512]u8 = @splat(0);
-const compressor_periodic_page = "abcd" ** 256;
+const compressor_periodic_page = periodic: {
+    @setEvalBranchQuota(4096);
+    var buf: [1024]u8 = undefined;
+    for (&buf, 0..) |*byte, i| byte.* = "abcd"[i % 4];
+    break :periodic buf;
+};
 const compressor_mixed_page = make_mixed_page();
 const compressor_seed_empty = slice_seed("");
 const compressor_seed_one = slice_seed("a");
-const compressor_seed_fourteen = slice_seed("a" ** 14);
-const compressor_seed_fifteen = slice_seed("a" ** 15);
+const compressor_seed_fourteen = slice_seed("aaaaaaaaaaaaaa");
+const compressor_seed_fifteen = slice_seed("aaaaaaaaaaaaaaa");
 const compressor_seed_zero_page = slice_seed(&compressor_zero_page);
-const compressor_seed_periodic_page = slice_seed(compressor_periodic_page);
+const compressor_seed_periodic_page = slice_seed(&compressor_periodic_page);
 const compressor_seed_mixed_page = slice_seed(&compressor_mixed_page);
 const compressor_corpus = [_][]const u8{
     &compressor_seed_empty,

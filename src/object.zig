@@ -688,7 +688,7 @@ fn file_generation(stat: std.Io.File.Stat) Error!ReadGeneration {
     std.mem.writeInt(u64, bytes[16..24], stat.size, .big);
     std.mem.writeInt(i96, bytes[24..36], stat.mtime.nanoseconds, .big);
     std.mem.writeInt(i96, bytes[36..48], stat.ctime.nanoseconds, .big);
-    bytes[48] = @intCast(@intFromEnum(stat.kind));
+    bytes[48] = @intCast(@backingInt(stat.kind));
     return ReadGeneration.init(&bytes);
 }
 

@@ -1,7 +1,7 @@
 const std = @import("std");
 const format = @import("format.zig");
 
-const CRC64ISO = std.hash.crc.Crc64GoIso;
+const CRC64ISO = std.hash.crc.@"CRC-64/GO-ISO";
 
 pub const FileHasher = struct {
     crc: CRC64ISO = CRC64ISO.init(),

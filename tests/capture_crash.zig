@@ -155,11 +155,7 @@ fn restore_latest(dir: std.Io.Dir, database_name: []const u8) !ltx.Position {
 
 fn expect_rows(database_name: []const u8, expected: u64) !void {
     var uri_buffer: [std.fs.max_path_bytes + 64]u8 = undefined;
-    const uri = try std.fmt.bufPrintZ(
-        &uri_buffer,
-        "file:.zig-cache/capture-crash/{s}?mode=ro&immutable=1",
-        .{database_name},
-    );
+    const uri = try std.mem.printSentinel(&uri_buffer, "file:.zig-cache/capture-crash/{s}?mode=ro&immutable=1", .{database_name}, 0);
     var database: ?*anyopaque = null;
     if (c.sqlite3_open_v2(uri.ptr, &database, c.open_readonly | c.open_uri, null) != c.ok) {
         return error.OpenFailure;

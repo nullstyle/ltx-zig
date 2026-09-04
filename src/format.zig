@@ -481,7 +481,7 @@ test "format versions keep v2 input distinct from canonical v3 output" {
     );
     try FormatVersion.v3.validate_for_encoding();
 
-    const unknown: FormatVersion = @enumFromInt(1);
+    const unknown: FormatVersion = @fromBackingInt(@intCast(1));
     try std.testing.expectError(error.UnsupportedFormatVersion, unknown.validate());
     try std.testing.expectError(
         error.UnsupportedFormatVersion,

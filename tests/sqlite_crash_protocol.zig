@@ -39,7 +39,7 @@ pub const publication_cases = [_]struct {
 };
 
 comptime {
-    const point_count = std.meta.fields(sqlite.FaultPoint).len;
+    const point_count = @typeInfo(sqlite.FaultPoint).@"enum".field_names.len;
     var seen: [point_count]bool = @splat(false);
     for (baseline_points) |point| mark_covered(&seen, point);
     for (handoff_points) |point| mark_covered(&seen, point);
@@ -50,7 +50,7 @@ comptime {
 }
 
 fn mark_covered(seen: []bool, point: sqlite.FaultPoint) void {
-    const index = @intFromEnum(point);
+    const index = @backingInt(point);
     if (seen[index]) @compileError("duplicate SQLite crash fault point");
     seen[index] = true;
 }

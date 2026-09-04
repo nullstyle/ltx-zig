@@ -4,7 +4,7 @@ const ltx = @import("ltx");
 test "supported and unsupported versions remain explicit" {
     try ltx.FormatVersion.v2.validate();
     try ltx.FormatVersion.v3.validate();
-    const unknown: ltx.FormatVersion = @enumFromInt(4);
+    const unknown: ltx.FormatVersion = @fromBackingInt(@intCast(4));
     try std.testing.expectError(error.UnsupportedFormatVersion, unknown.validate());
 }
 
@@ -21,7 +21,7 @@ const limits = ltx.Limits{
 };
 
 test "decoder and encoder initialization keep version roles explicit" {
-    const unknown: ltx.FormatVersion = @enumFromInt(4);
+    const unknown: ltx.FormatVersion = @fromBackingInt(@intCast(4));
     var input: [1]u8 = undefined;
     var source = ltx.SliceReader.init(&input);
     var page_workspace: [65_536]u8 = undefined;

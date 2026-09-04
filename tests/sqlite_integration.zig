@@ -715,7 +715,7 @@ fn expect_real_crash_recovery(
         &access_workspace,
         dir,
         image,
-        @intFromEnum(state) + 1,
+        @backingInt(state) + 1,
         if (state == .b) .b else .a,
         state,
     );
@@ -854,7 +854,7 @@ fn expect_chain_generation(
 ) !void {
     try std.testing.expectEqual(generation, current.generation);
     try std.testing.expectEqual(slot, current.slot);
-    try std.testing.expectEqual(@as(u64, @intFromEnum(state) + 1), current.position.txid.value);
+    try std.testing.expectEqual(@as(u64, @backingInt(state) + 1), current.position.txid.value);
     try std.testing.expectEqual(image.checksum, current.position.post_apply_checksum);
     try std.testing.expectEqual(page_size, current.page_size);
     try std.testing.expectEqual(@as(u64, image.length_bytes), current.database_size_bytes);

@@ -235,7 +235,7 @@ fn overwrite_manifest_generation(dir: std.Io.Dir, generation: u64) !void {
     defer file.close(std.testing.io);
     try read_exact(file, &bytes, 0);
     std.mem.writeInt(u64, bytes[generation_offset..][0..8], generation, .big);
-    const digest = std.hash.crc.Crc64GoIso.hash(bytes[0..digest_offset]);
+    const digest = std.hash.crc.@"CRC-64/GO-ISO".hash(bytes[0..digest_offset]);
     std.mem.writeInt(u64, bytes[digest_offset..][0..8], digest, .big);
     try file.writePositionalAll(std.testing.io, &bytes, 0);
     try file.sync(std.testing.io);
@@ -274,7 +274,7 @@ const returned_fault_cases = [_]struct {
 };
 
 comptime {
-    const point_count = std.meta.fields(sqlite.FaultPoint).len;
+    const point_count = @typeInfo(sqlite.FaultPoint).@"enum".field_names.len;
     var seen: [point_count]bool = @splat(false);
     for (returned_fault_cases) |case| {
         mark_returned_fault_covered(&seen, case.point);
@@ -285,7 +285,7 @@ comptime {
 }
 
 fn mark_returned_fault_covered(seen: []bool, point: sqlite.FaultPoint) void {
-    const index = @intFromEnum(point);
+    const index = @backingInt(point);
     if (seen[index]) @compileError("duplicate SQLite returned fault point");
     seen[index] = true;
 }
