@@ -7,6 +7,8 @@ version is zero, the Zig source API is intentionally unstable.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-04
+
 ### Added
 
 - `ltx_s3`: replace-if-generation lease renewal (`object_etag` plus

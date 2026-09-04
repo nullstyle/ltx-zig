@@ -19,7 +19,7 @@ authority.
 5. Validate the intended tag, including its leading `v`:
 
    ```sh
-   mise exec -- zig build release-check -Drelease-tag=v0.3.0
+   mise exec -- zig build release-check -Drelease-tag=v0.4.0
    ```
 
 Without `-Drelease-tag`, the release checker accepts the matching `TBD` heading
@@ -116,7 +116,7 @@ tagging.
 
 ## Tag and publish
 
-1. Confirm `git status --short` is empty, the `0.3.0` changelog heading contains
+1. Confirm `git status --short` is empty, the `0.4.0` changelog heading contains
    the real release date rather than `TBD`, and the hosted commit is green.
 2. Create an annotated `v${package_version}` tag on that exact commit.
 3. Push the tag and require the tag-triggered release check and full CI matrix

@@ -95,7 +95,7 @@ version selection, the pinned oracles, and the interoperability suites.
 For a tagged release, add the package to a consumer's `build.zig.zon` with:
 
 ```sh
-zig fetch --save=ltx_zig https://github.com/nullstyle/ltx-zig/archive/refs/tags/v0.3.0.tar.gz
+zig fetch --save=ltx_zig https://github.com/nullstyle/ltx-zig/archive/refs/tags/v0.4.0.tar.gz
 ```
 
 Then expose whichever of the nine public modules the consumer needs. This
