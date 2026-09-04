@@ -109,9 +109,37 @@ Normal tests stay network-free. The dedicated S3/MinIO gate and
 Litestream-binary interoperability gate are implemented and run in hosted CI;
 their external tools remain outside the hermetic unit-test step.
 
-## Candidate next increment
+## Next increment
 
-No post-M11 feature sprint is committed. The next increment should be chosen
-after the generation-bound read contract has completed its full local CI,
-MinIO, scale, and source-archive qualification; the pre-1.0 API remains free
-to change as deployment evidence accumulates.
+The generation-bound read contract completed its full qualification — the
+complete local gate list, the MinIO S3 gate, the pinned Go interop, Litestream
+v0.5.17 interop, the 64 MiB scale run, the canonical source-archive smoke, and
+hosted CI on both lanes plus the five-target portability matrix — and the
+M6–M11 controller arc shipped in v0.4.0. Every library item the coordinated
+consumer's design asked for has landed: conditional create and
+replace-if-generation writes, TLS with custom CAs, automatic multipart
+publication, byte/age/frame-count checkpoint tiers, caller-injected retry,
+and the bounded generation-bound readers.
+
+The next increment is therefore consumer-driven, not library-first:
+
+1. **Deployment evidence from the consumer build-out.** The consumer's phased
+   plan — actor turn loop, lease and fencing over conditional writes,
+   restore-on-activation, migration handoff, and kill-at-boundary failure
+   drills — exercises the controller from outside. Each phase ends with this
+   repository's gate suite; API friction found there becomes focused,
+   evidence-backed change rather than speculative surface growth.
+2. **Diagnostics and scale baselines from live use.** Record observed
+   `Controller.diagnostics()` counter shapes and maintenance timings in
+   [`replication.md`](replication.md) beside the scale series once real
+   workloads exist, so regressions have a consumer-anchored reference.
+3. **Explicit 1.0 criteria.** With the module set complete and one consumer in
+   production, define stabilization criteria — the frozen public module set,
+   documented invariants, and the authoritative gate list — in
+   [`api.md`](api.md). Until then the pre-1.0 API remains free to change as
+   deployment evidence accumulates.
+
+Explicitly not next, per the scope boundary above: LTX v1 decoding,
+fixed-path replacement beneath open SQLite connections, multi-writer capture
+hardening, and library-side scheduling, workspace pooling, lease policy,
+acknowledgement policy, or telemetry export.

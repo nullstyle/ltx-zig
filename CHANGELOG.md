@@ -7,6 +7,13 @@ version is zero, the Zig source API is intentionally unstable.
 
 ## [Unreleased]
 
+### Changed
+
+- The replication roadmap records the completed M6–M11 qualification, the
+  v0.4.0 release, and the consumer-driven next increment: deployment
+  evidence from the consumer build-out, diagnostics and scale baselines
+  from live use, and explicit 1.0 criteria in `docs/api.md`.
+
 ## [0.4.0] - 2026-09-04
 
 ### Added
