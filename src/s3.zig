@@ -47,6 +47,11 @@ pub const InitError = Error || error{InvalidConfiguration};
 /// 64 KiB response workspace for every Contents field and page envelope.
 pub const max_list_keys_per_page: u32 = 8;
 
+/// A listing page that says it is truncated but carries no continuation
+/// token ends the walk; the level is listed again from its start at most
+/// this many times before the listing fails.
+pub const max_listing_restarts: u32 = 2;
+
 /// Why a request is being considered for retry.
 pub const RetryCause = union(enum) {
     /// The transport failed before a complete response arrived.
@@ -170,6 +175,16 @@ const amz_date_bytes = 16;
 const sha256_hex_bytes = 64;
 const empty_payload_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+/// Room for the percent-encoded path of one object: S3 keys stop at 1,024
+/// bytes, and each byte encodes to at most three.
+const path_workspace_bytes = 4096;
+/// Room for one listing query: a continuation token (an opaque string the
+/// store makes from the last key, MinIO's base64 of it with a suffix) and
+/// the prefix twice, all percent-encoded.
+const query_workspace_bytes = 8192;
+/// Room for a decoded continuation token built from a 1,024-byte key.
+const token_workspace_bytes = 2048;
+
 /// The S3 object client. Stateful and single-owner: keep it at a stable
 /// address while the derived `Client` is in use. `send_workspace` is the
 /// mutable staging region for outgoing object bytes, sized for the largest
@@ -180,9 +195,10 @@ pub const S3Client = struct {
     config: Config,
     http: std.http.Client,
     send_workspace: []u8,
-    path_workspace: [1024]u8 = undefined,
-    query_workspace: [1024]u8 = undefined,
-    canonical_workspace: [4096]u8 = undefined,
+    path_workspace: [path_workspace_bytes]u8 = undefined,
+    query_workspace: [query_workspace_bytes]u8 = undefined,
+    /// The canonical request holds the path and the query.
+    canonical_workspace: [16 * 1024]u8 = undefined,
     string_to_sign_workspace: [512]u8 = undefined,
     authorization_workspace: [512]u8 = undefined,
     redirect_buffer: [1024]u8 = undefined,
@@ -190,7 +206,7 @@ pub const S3Client = struct {
     xml_workspace: [64 * 1024]u8 = undefined,
     key_slices: [max_list_keys_per_page][]const u8 = undefined,
     size_values: [max_list_keys_per_page]u64 = undefined,
-    token_workspace: [256]u8 = undefined,
+    token_workspace: [token_workspace_bytes]u8 = undefined,
     etag_workspace: [object.max_read_generation_bytes]u8 = undefined,
     multipart: ?MultipartState = null,
     multipart_owner: ?MultipartOwner = null,
@@ -265,7 +281,10 @@ pub const S3Client = struct {
         }
     }
 
-    /// Builds the raw object key for one level and identity.
+    /// Builds the object path for one level and identity: the key with its
+    /// prefix URI-encoded (slashes kept), as the request line and the
+    /// canonical request both carry it. The level and file names need no
+    /// encoding.
     fn key_path(
         self: *S3Client,
         level: u8,
@@ -274,7 +293,7 @@ pub const S3Client = struct {
         if (level > ltx.max_level) return error.InvalidLevel;
         var offset: usize = 0;
         try append_key_part(&self.path_workspace, &offset, "/");
-        try append_key_part(&self.path_workspace, &offset, self.config.prefix);
+        try append_encoded(&self.path_workspace, &offset, self.config.prefix, true);
         if (self.config.prefix.len > 0) {
             try append_key_part(&self.path_workspace, &offset, "/");
         }
@@ -299,6 +318,25 @@ pub const S3Client = struct {
         destination: []ltx.FileInfo,
     ) Error![]const ltx.FileInfo {
         const self: *S3Client = @ptrCast(@alignCast(context));
+        var restarts: u32 = 0;
+        while (restarts <= max_listing_restarts) : (restarts += 1) {
+            if (try self.list_walk(level, seek, destination)) |listed| {
+                std.sort.pdq(ltx.FileInfo, listed, {}, file_info_before);
+                return listed;
+            }
+        }
+        return error.StorageFailure;
+    }
+
+    /// One walk of a level's pages from the start. Null when a page said it
+    /// was truncated but carried no continuation token: the store lost its
+    /// place, and only a new walk can find the rest.
+    fn list_walk(
+        self: *S3Client,
+        level: u8,
+        seek: ltx.TXID,
+        destination: []ltx.FileInfo,
+    ) Error!?[]ltx.FileInfo {
         var count: usize = 0;
         var continuation: ?[]const u8 = null;
         var page_count: u32 = 0;
@@ -336,13 +374,11 @@ pub const S3Client = struct {
                 count += 1;
             }
             if (!page.truncated) break;
-            continuation = page.next_token orelse return error.StorageFailure;
+            continuation = page.next_token orelse return null;
         } else {
             return error.ListingPageLimitExceeded;
         }
-        const listed = destination[0..count];
-        std.sort.pdq(ltx.FileInfo, listed, {}, file_info_before);
-        return listed;
+        return destination[0..count];
     }
 
     fn read_range(
@@ -1039,7 +1075,7 @@ pub const S3Client = struct {
         else
             null;
 
-        var path_buffer: [1024]u8 = undefined;
+        var path_buffer: [path_workspace_bytes]u8 = undefined;
         var host_buffer: [256]u8 = undefined;
         const host_header = if (self.config.virtual_host)
             std.fmt.bufPrint(&host_buffer, "{s}.{s}", .{
@@ -1409,14 +1445,13 @@ pub const S3Client = struct {
             false
         else
             return error.StorageFailure;
+        // A truncated page without a token is returned as such: `list`
+        // walks the level again.
         var next_token: ?[]const u8 = null;
         if (truncated) {
-            const encoded = xml_text(
-                xml,
-                "<NextContinuationToken>",
-                "</NextContinuationToken>",
-            ) orelse return error.StorageFailure;
-            next_token = try decode_xml_text(encoded, &self.token_workspace);
+            if (xml_text(xml, "<NextContinuationToken>", "</NextContinuationToken>")) |encoded| {
+                next_token = try decode_xml_text(encoded, &self.token_workspace);
+            }
         }
         return .{
             .keys = self.key_slices[0..count],
@@ -1973,6 +2008,47 @@ test "list parsing binds every key to its exact stored size" {
     try std.testing.expectError(
         error.StorageFailure,
         client.parse_list_page("<ListBucketResult></ListBucketResult>"),
+    );
+    // A truncated page may lose its token; `list` walks the level again.
+    const lost = try client.parse_list_page(
+        "<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>",
+    );
+    try std.testing.expect(lost.truncated and lost.next_token == null);
+}
+
+test "list parsing keeps a continuation token made from a 1,024-byte key" {
+    const FixedClock = struct {
+        fn now_ms(_: *anyopaque) u64 {
+            return 0;
+        }
+    };
+    var clock_context: u8 = 0;
+    var send_workspace: [1]u8 = undefined;
+    var client = try S3Client.init(std.testing.allocator, std.testing.io, .{
+        .host = "127.0.0.1",
+        .port = 9000,
+        .bucket = "test",
+        .access_key = "key",
+        .secret_key = "secret",
+        .clock = .{ .context = &clock_context, .now_ms_fn = FixedClock.now_ms },
+    }, &send_workspace);
+    defer client.deinit();
+    // MinIO's token is the base64 of the last key and a suffix of up to
+    // 40 bytes: 1,420 bytes for a 1,024-byte key.
+    var page: [token_workspace_bytes + 128]u8 = undefined;
+    const open = "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>";
+    const close = "</NextContinuationToken></ListBucketResult>";
+    @memcpy(page[0..open.len], open);
+    @memset(page[open.len..][0..1420], 'Q');
+    @memcpy(page[open.len + 1420 ..][0..close.len], close);
+    const kept = try client.parse_list_page(page[0 .. open.len + 1420 + close.len]);
+    try std.testing.expectEqual(@as(usize, 1420), kept.next_token.?.len);
+    // A token past the workspace fails the page.
+    @memset(page[open.len..][0 .. token_workspace_bytes + 1], 'Q');
+    @memcpy(page[open.len + token_workspace_bytes + 1 ..][0..close.len], close);
+    try std.testing.expectError(
+        error.StorageFailure,
+        client.parse_list_page(page[0 .. open.len + token_workspace_bytes + 1 + close.len]),
     );
 }
 

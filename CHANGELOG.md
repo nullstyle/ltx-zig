@@ -42,6 +42,18 @@ version is zero, the Zig source API is intentionally unstable.
   unless `journal_size_limit` shrinks it (the stock default is -1), so each
   published control row started another checkpoint and another control
   row. The tier now counts the committed bytes of the current segment.
+- `ltx_s3` listings no longer fail on the second page under a prefix over
+  about 85 bytes. MinIO's continuation token is the base64 of the last key
+  plus a suffix, and the client kept 256 bytes for it (and 1 KiB for the
+  query that carries it and the prefix twice). The token, query, path and
+  canonical-request workspaces now hold keys up to S3's 1,024 bytes,
+  percent-encoded.
+- `ltx_s3` object paths percent-encode the key prefix. A prefix with a
+  character outside the unreserved set (a space, `+`, `=`) was sent and
+  signed raw, so the store refused the request or its signature.
+- An `ltx_s3` listing page that says it is truncated but carries no
+  continuation token no longer fails the listing at once: the level is
+  listed again from its start, at most `max_listing_restarts` (2) times.
 
 ### Changed
 

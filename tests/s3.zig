@@ -667,6 +667,226 @@ test "scripted write session poisons and retains failed multipart cleanup" {
     try server_task.await(std.testing.io);
 }
 
+/// One page a scripted listing server answers: the continuation token the
+/// request must carry (decoded; null on a walk's first page), `key_count`
+/// level-0 keys from `first_txid` on, and the page's truncation flag and
+/// token (null leaves the token out).
+const ScriptedListPage = struct {
+    expected_token: ?[]const u8,
+    first_txid: u64,
+    key_count: u32,
+    truncated: bool,
+    next_token: ?[]const u8,
+};
+
+/// Decodes a query value's `%XX` escapes into `out`.
+fn percent_decode(text: []const u8, out: []u8) ![]const u8 {
+    var in: usize = 0;
+    var len: usize = 0;
+    while (in < text.len) : (len += 1) {
+        if (len == out.len) return error.TestUnexpectedResult;
+        if (text[in] != '%') {
+            out[len] = text[in];
+            in += 1;
+            continue;
+        }
+        if (in + 3 > text.len) return error.TestUnexpectedResult;
+        out[len] = try std.fmt.parseInt(u8, text[in + 1 .. in + 3], 16);
+        in += 3;
+    }
+    return out[0..len];
+}
+
+/// The decoded value of query parameter `name`, or null.
+fn query_value(target: []const u8, name: []const u8, out: []u8) !?[]const u8 {
+    const query_at = std.mem.indexOfScalar(u8, target, '?') orelse return null;
+    var pairs = std.mem.splitScalar(u8, target[query_at + 1 ..], '&');
+    while (pairs.next()) |pair| {
+        const equals = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (!std.mem.eql(u8, pair[0..equals], name)) continue;
+        return try percent_decode(pair[equals + 1 ..], out);
+    }
+    return null;
+}
+
+fn serve_scripted_list_pages(
+    server: *std.Io.net.Server,
+    prefix: []const u8,
+    pages: []const ScriptedListPage,
+) !void {
+    for (pages) |page| {
+        var stream = try server.accept(std.testing.io);
+        defer stream.close(std.testing.io);
+        var read_buffer: [16 * 1024]u8 = undefined;
+        var write_buffer: [4096]u8 = undefined;
+        var stream_reader = stream.reader(std.testing.io, &read_buffer);
+        var stream_writer = stream.writer(std.testing.io, &write_buffer);
+        var http_server = std.http.Server.init(
+            &stream_reader.interface,
+            &stream_writer.interface,
+        );
+        var request = try http_server.receiveHead();
+        const target = request.head.target;
+        var token_buffer: [4096]u8 = undefined;
+        const token = try query_value(target, "continuation-token", &token_buffer);
+        var prefix_buffer: [4096]u8 = undefined;
+        const listed_prefix = (try query_value(target, "prefix", &prefix_buffer)) orelse "";
+        var expected_prefix_buffer: [4096]u8 = undefined;
+        const expected_prefix = try std.fmt.bufPrint(&expected_prefix_buffer, "{s}/0000/", .{prefix});
+        const valid_request = request.head.method == .GET and
+            std.mem.startsWith(u8, target, "/scripted-list/?") and
+            std.mem.eql(u8, listed_prefix, expected_prefix) and
+            if (page.expected_token) |expected|
+                token != null and std.mem.eql(u8, token.?, expected)
+            else
+                token == null;
+
+        var body_buffer: [16 * 1024]u8 = undefined;
+        var body: std.Io.Writer = .fixed(&body_buffer);
+        try body.print("<ListBucketResult><IsTruncated>{s}</IsTruncated>", .{
+            if (page.truncated) "true" else "false",
+        });
+        var index: u32 = 0;
+        while (index < page.key_count) : (index += 1) {
+            var name: [ltx.file_name_bytes]u8 = undefined;
+            const txid = ltx.TXID.init(page.first_txid + index);
+            _ = ltx.format_file_name(txid, txid, &name);
+            try body.print("<Contents><Key>{s}{s}</Key><Size>7</Size></Contents>", .{ expected_prefix, &name });
+        }
+        if (page.next_token) |next| {
+            try body.print("<NextContinuationToken>{s}</NextContinuationToken>", .{next});
+        }
+        try body.writeAll("</ListBucketResult>");
+        try request.respond(body.buffered(), .{ .status = .ok, .keep_alive = false });
+        if (!valid_request) return error.TestUnexpectedResult;
+    }
+}
+
+/// A client of the scripted listing server under `prefix`.
+fn init_scripted_list_s3(port: u16, prefix: []const u8, send_workspace: []u8) !ltx_s3.S3Client {
+    return ltx_s3.S3Client.init(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .host = "127.0.0.1",
+            .port = port,
+            .bucket = "scripted-list",
+            .access_key = "test-access",
+            .secret_key = "test-secret",
+            .prefix = prefix,
+            .clock = .{
+                .context = &plain_clock_context,
+                .now_ms_fn = TestClock.now_ms,
+            },
+        },
+        send_workspace,
+    );
+}
+
+/// A prefix of `length` bytes with a slash every 200 (a store's path
+/// segments stop at 255 bytes) and a space, a plus and an equals sign,
+/// which a query must percent-encode.
+fn fill_long_prefix(out: []u8) []const u8 {
+    const pattern = "ab c+d=ef";
+    for (out, 0..) |*byte, index| {
+        byte.* = if ((index + 1) % 200 == 0) '/' else pattern[index % pattern.len];
+    }
+    return out;
+}
+
+/// A continuation token of `length` bytes in the base64 alphabet, which a
+/// query must percent-encode (`+`, `/` and `=`).
+fn fill_token(out: []u8) []const u8 {
+    const alphabet = "AZaz09+/";
+    for (out, 0..) |*byte, index| byte.* = alphabet[index % alphabet.len];
+    out[out.len - 1] = '=';
+    return out;
+}
+
+test "scripted listing pages past 16 keys under a 900-byte prefix" {
+    var prefix_storage: [900]u8 = undefined;
+    const prefix = fill_long_prefix(&prefix_storage);
+    var short_storage: [272]u8 = undefined;
+    const short_token = fill_token(&short_storage);
+    var long_storage: [1400]u8 = undefined;
+    const long_token = fill_token(&long_storage);
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const pages = [_]ScriptedListPage{
+        .{ .expected_token = null, .first_txid = 1, .key_count = 8, .truncated = true, .next_token = short_token },
+        .{ .expected_token = short_token, .first_txid = 9, .key_count = 8, .truncated = true, .next_token = long_token },
+        .{ .expected_token = long_token, .first_txid = 17, .key_count = 4, .truncated = false, .next_token = null },
+    };
+    var server_task = std.testing.io.async(
+        serve_scripted_list_pages,
+        .{ &server, prefix, &pages },
+    );
+    defer _ = server_task.cancel(std.testing.io) catch {};
+
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try init_scripted_list_s3(server.socket.address.getPort(), prefix, &send_workspace);
+    defer s3.deinit();
+    var infos: [24]ltx.FileInfo = undefined;
+    const listed = try s3.client().list(0, ltx.TXID.init(0), &infos);
+    try server_task.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 20), listed.len);
+    for (listed, 1..) |info, txid| {
+        try std.testing.expectEqual(@as(u64, txid), info.min_txid.value);
+    }
+}
+
+test "scripted listing page truncated without a token is listed again from the start" {
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    // The first walk's page has no token: the second walk starts over,
+    // and the first walk's keys are not counted twice.
+    const pages = [_]ScriptedListPage{
+        .{ .expected_token = null, .first_txid = 1, .key_count = 8, .truncated = true, .next_token = null },
+        .{ .expected_token = null, .first_txid = 1, .key_count = 8, .truncated = true, .next_token = "next+page=" },
+        .{ .expected_token = "next+page=", .first_txid = 9, .key_count = 4, .truncated = false, .next_token = null },
+    };
+    var server_task = std.testing.io.async(
+        serve_scripted_list_pages,
+        .{ &server, "relist", &pages },
+    );
+    defer _ = server_task.cancel(std.testing.io) catch {};
+
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try init_scripted_list_s3(server.socket.address.getPort(), "relist", &send_workspace);
+    defer s3.deinit();
+    var infos: [16]ltx.FileInfo = undefined;
+    const listed = try s3.client().list(0, ltx.TXID.init(0), &infos);
+    try server_task.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 12), listed.len);
+    try std.testing.expectEqual(@as(u64, 12), listed[11].min_txid.value);
+}
+
+test "scripted listing fails after its walks keep losing their token" {
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const lost: ScriptedListPage = .{ .expected_token = null, .first_txid = 1, .key_count = 2, .truncated = true, .next_token = null };
+    const pages: [ltx_s3.max_listing_restarts + 1]ScriptedListPage = @splat(lost);
+    var server_task = std.testing.io.async(
+        serve_scripted_list_pages,
+        .{ &server, "relist", &pages },
+    );
+    defer _ = server_task.cancel(std.testing.io) catch {};
+
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try init_scripted_list_s3(server.socket.address.getPort(), "relist", &send_workspace);
+    defer s3.deinit();
+    var infos: [16]ltx.FileInfo = undefined;
+    try std.testing.expectError(
+        error.StorageFailure,
+        s3.client().list(0, ltx.TXID.init(0), &infos),
+    );
+    // Every walk was tried, and no fourth.
+    try server_task.await(std.testing.io);
+}
+
 const generation_one = "\"generation-one\"";
 const generation_two = "\"generation-two\"";
 
@@ -1045,6 +1265,63 @@ test "listing stops at the configured remote page budget" {
         @as(usize, 2),
         (try client.list(0, ltx.TXID.init(0), &infos)).len,
     );
+}
+
+test "objects under a long prefix that needs encoding write, list past 16 keys, read and delete" {
+    // MinIO's continuation tokens are the base64 of the last key and a
+    // suffix: about 900 bytes under this prefix, where the token workspace
+    // once held 256, and the query that carries one and the prefix twice
+    // passes 1,024. The prefix's space, plus and equals sign must be
+    // encoded alike in the path, the query and the signature. (MinIO on
+    // macOS refuses a key whose file path under its data directory passes
+    // 1,024 bytes, so a longer prefix fails there.)
+    var prefix_storage: [590]u8 = undefined;
+    const prefix = fill_long_prefix(&prefix_storage);
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try ltx_s3.S3Client.init(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .host = minio_host,
+            .port = minio_port,
+            .bucket = "ltx-gate",
+            .access_key = minio_root_user,
+            .secret_key = minio_root_password,
+            .prefix = prefix,
+            .clock = .{
+                .context = &plain_clock_context,
+                .now_ms_fn = TestClock.now_ms,
+            },
+        },
+        &send_workspace,
+    );
+    defer s3.deinit();
+    try s3.ensure_bucket();
+    const client = s3.client();
+    var infos: [24]ltx.FileInfo = undefined;
+    for (try client.list(0, ltx.TXID.init(0), &infos)) |stale| {
+        try client.delete(&.{stale});
+    }
+    var txid: u64 = 1;
+    while (txid <= 20) : (txid += 1) {
+        const identity: ltx.FileIdentity = .{ .min_txid = .init(txid), .max_txid = .init(txid) };
+        try client.write(0, identity, @intCast(txid), "encoded");
+    }
+    defer {
+        var cleanup: [24]ltx.FileInfo = undefined;
+        if (client.list(0, ltx.TXID.init(0), &cleanup)) |listed| {
+            for (listed) |info| client.delete(&.{info}) catch {};
+        } else |_| {}
+    }
+    const listed = try client.list(0, ltx.TXID.init(0), &infos);
+    try std.testing.expectEqual(@as(usize, 20), listed.len);
+    for (listed, 1..) |info, expected| {
+        try std.testing.expectEqual(@as(u64, expected), info.min_txid.value);
+    }
+    var storage: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("encoded", try client.read_all(listed[19], &storage));
+    try client.delete(listed);
+    try std.testing.expectEqual(@as(usize, 0), (try client.list(0, ltx.TXID.init(0), &infos)).len);
 }
 
 test "range and whole reads honor the listed object size" {
