@@ -1061,6 +1061,86 @@ test "scripted transport failure drops the pool before the retry" {
     try std.testing.expect(!probe.seen[1].reused);
 }
 
+/// Answers one HEAD 404 on a connection kept alive, then resets it (a close
+/// with a zero linger): a store that dropped the connection, whose next
+/// request fails while it is sent.
+fn answer_then_reset(server: *std.Io.net.Server) anyerror!void {
+    var stream = try server.accept(std.testing.io);
+    defer stream.close(std.testing.io);
+    var read_buffer: [8192]u8 = undefined;
+    var write_buffer: [4096]u8 = undefined;
+    var stream_reader = stream.reader(std.testing.io, &read_buffer);
+    var stream_writer = stream.writer(std.testing.io, &write_buffer);
+    var http_server = std.http.Server.init(&stream_reader.interface, &stream_writer.interface);
+    var request = try http_server.receiveHead();
+    if (request.head.method != .HEAD) return error.TestUnexpectedResult;
+    try request.respond("", .{ .status = .not_found, .keep_alive = true });
+    const linger: std.c.linger = .{ .onoff = 1, .linger = 0 };
+    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&linger));
+}
+
+test "scripted transport failure that is not retried leaves no pooled connection" {
+    // A request that failed on its connection was sent into a dead one: a
+    // failure while sending left that connection in the pool, and the
+    // next request, of another operation, took it and failed the same way.
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const port = server.socket.address.getPort();
+    var probe: ObserverProbe = .{};
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try ltx_s3.S3Client.init(std.testing.allocator, std.testing.io, .{
+        .host = "127.0.0.1",
+        .port = port,
+        .bucket = "scripted-dead",
+        .access_key = "test-access",
+        .secret_key = "test-secret",
+        .clock = .{ .context = &plain_clock_context, .now_ms_fn = TestClock.now_ms },
+        .observer = probe.observer(),
+    }, &send_workspace);
+    defer s3.deinit();
+    const identity: ltx.FileIdentity = .{ .min_txid = .init(1), .max_txid = .init(1) };
+
+    // The store answers a HEAD, then resets the kept connection. A claim
+    // (a conditional PUT, never sent again after it was sent) fails while
+    // it is sent on it.
+    var reset_task = std.testing.io.async(answer_then_reset, .{&server});
+    defer _ = reset_task.cancel(std.testing.io) catch {};
+    try std.testing.expectError(error.ObjectNotFound, s3.object_etag(0, identity));
+    try reset_task.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 1), s3.http.connection_pool.free_len);
+    try std.testing.expectError(error.PublicationIndeterminate, s3.put_if_absent(0, identity, 1, "claim"));
+    try std.testing.expectEqual(ltx_s3.Stage.send, probe.seen[1].stage);
+    try std.testing.expect(probe.seen[1].reused);
+    try std.testing.expect(!probe.seen[1].will_retry);
+    try std.testing.expectEqual(@as(usize, 0), s3.http.connection_pool.free_len);
+
+    // Two pooled connections the store closed: a request that fails on the
+    // first, and is not sent again, leaves the second unused too.
+    var closing_task = std.testing.io.async(close_two_connections, .{&server});
+    defer _ = closing_task.cancel(std.testing.io) catch {};
+    const host = try std.Io.net.HostName.init("127.0.0.1");
+    const first = try s3.http.connect(host, port, .plain);
+    const second = try s3.http.connect(host, port, .plain);
+    s3.http.connection_pool.release(first, std.testing.io);
+    s3.http.connection_pool.release(second, std.testing.io);
+    try closing_task.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 2), s3.http.connection_pool.free_len);
+    try std.testing.expectError(error.StorageFailure, s3.object_etag(0, identity));
+    try std.testing.expect(probe.seen[2].reused);
+    try std.testing.expectEqual(@as(usize, 0), s3.http.connection_pool.free_len);
+
+    // The next request opens a connection of its own, and is answered.
+    const script = [_]Scripted{not_found_answer};
+    var connections: [1]u32 = @splat(0);
+    var server_task = std.testing.io.async(serve_script, .{ &server, &script, &connections });
+    defer _ = server_task.cancel(std.testing.io) catch {};
+    try std.testing.expectError(error.ObjectNotFound, s3.object_etag(0, identity));
+    try server_task.await(std.testing.io);
+    try std.testing.expect(!probe.seen[3].reused);
+    try std.testing.expectEqual(@as(usize, 4), probe.ended);
+}
+
 fn error_answer(status: std.http.Status, comptime code: []const u8) Scripted {
     return .{ .answer = .{ .status = status, .body = "<Error><Code>" ++ code ++ "</Code><Message>scripted</Message></Error>" } };
 }

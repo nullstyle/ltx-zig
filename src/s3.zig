@@ -1095,8 +1095,8 @@ pub const S3Client = struct {
     /// Signs and performs one request, retrying under the policy what may
     /// pass (`judge_attempt`): each attempt is shown to the observer, a
     /// pooled connection idle past `Config.max_idle_reuse_ms` is closed
-    /// before an attempt, and every pooled connection is closed after a
-    /// transport failure that is retried. The response body, when
+    /// before an attempt, and every pooled connection is closed after any
+    /// transport failure, retried or not. The response body, when
     /// requested, is read fully into `body_destination` before the
     /// connection returns to the pool, so the returned bytes stay valid
     /// afterwards. A request that is a publication ends
@@ -1137,9 +1137,11 @@ pub const S3Client = struct {
             state.note(ending);
             const delay = if (ending.retryable) self.retry_delay(attempt, ending.cause) else null;
             self.end_attempt(&begun.attempt, &trace, ending.reported(failure), first_ms, delay != null);
-            const pause_ms = delay orelse return state.finish(result);
-            // A store that restarted stales every pooled connection.
+            // A store that restarted stales every pooled connection, and a
+            // request that failed while it was sent leaves its dead one in
+            // the pool: the next request, retried or not, opens a new one.
             if (ending.transport) self.drop_pooled_connections();
+            const pause_ms = delay orelse return state.finish(result);
             self.config.retry.?.sleep_ms(pause_ms) catch |err| return state.fail(err);
         }
     }
