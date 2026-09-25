@@ -117,8 +117,8 @@ pub const Attempt = struct {
     attempt: u32,
     /// The pool had an open connection, which the attempt takes.
     reused: bool,
-    /// Since this client's previous attempt ended, on `Config.clock`; 0
-    /// for its first.
+    /// Since this client's previous attempt ended, on `Config.steady_clock`;
+    /// 0 for its first.
     idle_ms: u64,
 };
 
@@ -136,7 +136,7 @@ pub const AttemptEnd = struct {
     /// The transport's own error under `failure` (a refused connect, a
     /// connection closed before the answer), when there is one.
     cause: ?anyerror,
-    /// Since the request's first attempt began, on `Config.clock`.
+    /// Since the request's first attempt began, on `Config.steady_clock`.
     elapsed_ms: u64,
     /// The client sends the request again after the policy's pause.
     will_retry: bool,
@@ -165,7 +165,8 @@ pub const Conditional = union(enum) {
     match_etag: []const u8,
 };
 
-/// Injected wall clock returning Unix milliseconds.
+/// Injected clock returning milliseconds: Unix time for `Config.clock`,
+/// any origin for `Config.steady_clock`.
 pub const Clock = struct {
     context: *anyopaque,
     now_ms_fn: *const fn (context: *anyopaque) u64,
@@ -199,6 +200,12 @@ pub const Config = struct {
     /// Key prefix under the bucket; may be empty.
     prefix: []const u8 = "",
     clock: Clock,
+    /// A clock that never steps back, for the time between attempts: how
+    /// long the client sat idle (`max_idle_reuse_ms`, `Attempt.idle_ms`)
+    /// and how long a request's attempts took (`AttemptEnd.elapsed_ms`).
+    /// Any origin; `clock` when null. The wall clock can step back (NTP, an
+    /// operator), and on it an idle connection looks fresher than it is.
+    steady_clock: ?Clock = null,
     /// Maximum keys requested per listing page. Must be in
     /// `1...max_list_keys_per_page` so every response stays within the fixed
     /// XML workspace under the S3 key-size limit.
@@ -210,9 +217,10 @@ pub const Config = struct {
     /// retryable statuses on idempotent requests.
     retry: ?RetryPolicy = null,
     /// Close the pooled connections before an attempt when the client's
-    /// previous attempt ended longer ago than this, on `clock`: a store or
-    /// a proxy closes an idle connection (MinIO after 30 s) without the
-    /// client knowing, and a request sent into it fails. 0 keeps them.
+    /// previous attempt ended longer ago than this, on `steady_clock`: a
+    /// store or a proxy closes an idle connection (MinIO after 30 s)
+    /// without the client knowing, and a request sent into it fails. 0
+    /// keeps them.
     max_idle_reuse_ms: u64 = 0,
     /// Optional observer of every request attempt.
     observer: ?Observer = null,
@@ -299,8 +307,8 @@ pub const S3Client = struct {
     multipart: ?MultipartState = null,
     multipart_owner: ?MultipartOwner = null,
     write_session: ?StreamingWriteState = null,
-    /// When this client's last request attempt ended, on `Config.clock`;
-    /// null before its first.
+    /// When this client's last request attempt ended, on
+    /// `Config.steady_clock`; null before its first.
     last_attempt_end_ms: ?u64 = null,
     /// Why the last request's answer, read whole, did not parse (a static
     /// string); empty when it did, or the request failed otherwise. Reset
@@ -1131,7 +1139,7 @@ pub const S3Client = struct {
             const begun = self.begin_attempt(method, key, query, attempt);
             if (attempt == 1) first_ms = begun.start_ms;
             var trace: AttemptTrace = .{};
-            const result = self.perform_once(method, key, query, options, begun.start_ms, &trace);
+            const result = self.perform_once(method, key, query, options, begun.sign_ms, &trace);
             const failure: ?ConditionalWriteError = if (result) |_| null else |err| err;
             const ending = judge_attempt(method, options, failure, trace);
             state.note(ending);
@@ -1163,10 +1171,11 @@ pub const S3Client = struct {
         pool.resize(self.io, size) catch {};
     }
 
-    /// One attempt about to start, as the observer sees it, and its start
-    /// on `Config.clock`. The pooled connections are closed first when the
-    /// client sat idle past `Config.max_idle_reuse_ms`; an open pooled
-    /// connection is the one the attempt takes.
+    /// One attempt about to start, as the observer sees it, its start on
+    /// the steady clock, and the wall-clock time it is signed at. The pooled
+    /// connections are closed first when the client sat idle past
+    /// `Config.max_idle_reuse_ms`; an open pooled connection is the one the
+    /// attempt takes.
     fn begin_attempt(
         self: *S3Client,
         method: std.http.Method,
@@ -1174,7 +1183,7 @@ pub const S3Client = struct {
         query: []const u8,
         attempt: u32,
     ) Begun {
-        const now_ms = self.config.clock.now_ms();
+        const now_ms = self.steady_now_ms();
         if (self.last_attempt_end_ms) |end_ms| {
             const limit_ms = self.config.max_idle_reuse_ms;
             if (limit_ms != 0 and now_ms -| end_ms > limit_ms) self.drop_pooled_connections();
@@ -1189,6 +1198,7 @@ pub const S3Client = struct {
                 .idle_ms = if (self.last_attempt_end_ms) |end_ms| now_ms -| end_ms else 0,
             },
             .start_ms = now_ms,
+            .sign_ms = self.config.clock.now_ms(),
         };
         if (self.config.observer) |observer| observer.begin_fn(observer.context, &begun.attempt);
         return begun;
@@ -1203,7 +1213,7 @@ pub const S3Client = struct {
         first_ms: u64,
         will_retry: bool,
     ) void {
-        const end_ms = self.config.clock.now_ms();
+        const end_ms = self.steady_now_ms();
         self.last_attempt_end_ms = end_ms;
         const observer = self.config.observer orelse return;
         const end: AttemptEnd = .{
@@ -1219,9 +1229,18 @@ pub const S3Client = struct {
         observer.end_fn(observer.context, &end);
     }
 
+    /// Now on the clock that measures the time between attempts.
+    fn steady_now_ms(self: *const S3Client) u64 {
+        const steady = self.config.steady_clock orelse self.config.clock;
+        return steady.now_ms();
+    }
+
     const Begun = struct {
         attempt: Attempt,
+        /// On the steady clock.
         start_ms: u64,
+        /// On `Config.clock`.
+        sign_ms: u64,
     };
 
     /// How far one attempt got, for its observer and its retry decision.

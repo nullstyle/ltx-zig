@@ -1005,6 +1005,53 @@ test "scripted idle pooled connections are dropped before reuse" {
     try std.testing.expectEqual(@as(u64, 2000), probe.seen[2].idle_ms);
 }
 
+test "scripted idle time is measured on the steady clock, not the wall clock" {
+    // The wall clock signs; it can step back (NTP, an operator), and a
+    // connection idle past the limit then looked fresh and was sent on.
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const script: [3]Scripted = @splat(not_found_answer);
+    var connections: [2]u32 = @splat(0);
+    var server_task = std.testing.io.async(serve_script, .{ &server, &script, &connections });
+    defer _ = server_task.cancel(std.testing.io) catch {};
+
+    const now = std.Io.Timestamp.now(std.testing.io, .real);
+    var wall = MutableClock{ .value_ms = @intCast(@divTrunc(now.nanoseconds, std.time.ns_per_ms)) };
+    var steady = MutableClock{ .value_ms = 1000 };
+    var probe: ObserverProbe = .{};
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try ltx_s3.S3Client.init(std.testing.allocator, std.testing.io, .{
+        .host = "127.0.0.1",
+        .port = server.socket.address.getPort(),
+        .bucket = "scripted-steady",
+        .access_key = "test-access",
+        .secret_key = "test-secret",
+        .clock = .{ .context = &wall, .now_ms_fn = MutableClock.now_ms },
+        .steady_clock = .{ .context = &steady, .now_ms_fn = MutableClock.now_ms },
+        .max_idle_reuse_ms = 1000,
+        .observer = probe.observer(),
+    }, &send_workspace);
+    defer s3.deinit();
+    const identity: ltx.FileIdentity = .{ .min_txid = .init(1), .max_txid = .init(1) };
+    // A HEAD leaves its connection in the pool. 500 ms later, with the wall
+    // clock stepped forward 5 s, the next one reuses it; 2 s after that,
+    // with the wall clock stepped back 3 s, the next one opens another.
+    try std.testing.expectError(error.ObjectNotFound, s3.object_etag(0, identity));
+    steady.value_ms += 500;
+    wall.value_ms += 5000;
+    try std.testing.expectError(error.ObjectNotFound, s3.object_etag(0, identity));
+    steady.value_ms += 2000;
+    wall.value_ms -= 3000;
+    try std.testing.expectError(error.ObjectNotFound, s3.object_etag(0, identity));
+    try server_task.await(std.testing.io);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 1 }, &connections);
+    try std.testing.expect(probe.seen[1].reused);
+    try std.testing.expectEqual(@as(u64, 500), probe.seen[1].idle_ms);
+    try std.testing.expect(!probe.seen[2].reused);
+    try std.testing.expectEqual(@as(u64, 2000), probe.seen[2].idle_ms);
+}
+
 /// Accepts two connections and closes them: a store that restarted.
 fn close_two_connections(server: *std.Io.net.Server) anyerror!void {
     var first = try server.accept(std.testing.io);
