@@ -667,6 +667,248 @@ test "scripted write session poisons and retains failed multipart cleanup" {
     try server_task.await(std.testing.io);
 }
 
+/// What an observer saw of one attempt.
+const ObservedAttempt = struct {
+    method: std.http.Method = .GET,
+    attempt: u32 = 0,
+    reused: bool = false,
+    /// `stage_fn` calls while the attempt ran.
+    stage_calls: u32 = 0,
+    stage: ltx_s3.Stage = .connect,
+    status: u16 = 0,
+    s3_code: [64]u8 = undefined,
+    s3_code_len: usize = 0,
+    failure: ?ltx_s3.ConditionalWriteError = null,
+    cause: ?anyerror = null,
+    elapsed_ms: u64 = 0,
+    will_retry: bool = false,
+
+    fn code(self: *const ObservedAttempt) []const u8 {
+        return self.s3_code[0..self.s3_code_len];
+    }
+};
+
+/// An observer that keeps every attempt it sees.
+const ObserverProbe = struct {
+    seen: [8]ObservedAttempt = @splat(.{}),
+    began: usize = 0,
+    ended: usize = 0,
+
+    fn observer(self: *ObserverProbe) ltx_s3.Observer {
+        return .{ .context = self, .begin_fn = begin, .stage_fn = stage, .end_fn = end };
+    }
+
+    fn begin(context: *anyopaque, attempt: *const ltx_s3.Attempt) void {
+        const self: *ObserverProbe = @ptrCast(@alignCast(context));
+        self.seen[self.began] = .{ .method = attempt.method, .attempt = attempt.attempt, .reused = attempt.reused };
+        self.began += 1;
+    }
+
+    fn stage(context: *anyopaque, _: ltx_s3.Stage) void {
+        const self: *ObserverProbe = @ptrCast(@alignCast(context));
+        self.seen[self.began - 1].stage_calls += 1;
+    }
+
+    fn end(context: *anyopaque, info: *const ltx_s3.AttemptEnd) void {
+        const self: *ObserverProbe = @ptrCast(@alignCast(context));
+        const entry = &self.seen[self.ended];
+        entry.stage = info.stage;
+        entry.status = info.status;
+        @memcpy(entry.s3_code[0..info.s3_code.len], info.s3_code);
+        entry.s3_code_len = info.s3_code.len;
+        entry.failure = info.failure;
+        entry.cause = info.cause;
+        entry.elapsed_ms = info.elapsed_ms;
+        entry.will_retry = info.will_retry;
+        self.ended += 1;
+    }
+};
+
+/// A PUT answered 400 IncompleteBody on a connection the server keeps
+/// open, and then a request that must come on a new connection: the
+/// client closed the first one (MinIO closes a connection after a PUT's
+/// error answer without saying so).
+fn serve_put_error_then_head(server: *std.Io.net.Server) anyerror!void {
+    {
+        var stream = try server.accept(std.testing.io);
+        defer stream.close(std.testing.io);
+        var read_buffer: [8192]u8 = undefined;
+        var write_buffer: [4096]u8 = undefined;
+        var body_buffer: [4096]u8 = undefined;
+        var stream_reader = stream.reader(std.testing.io, &read_buffer);
+        var stream_writer = stream.writer(std.testing.io, &write_buffer);
+        var http_server = std.http.Server.init(&stream_reader.interface, &stream_writer.interface);
+        var request = try http_server.receiveHead();
+        if (request.head.method != .PUT) return error.TestUnexpectedResult;
+        const body_reader = try request.readerExpectContinue(&body_buffer);
+        _ = try body_reader.discardRemaining();
+        try request.respond(
+            "<?xml version=\"1.0\"?><Error><Code>IncompleteBody</Code><Message>You did not provide the number of bytes specified by the Content-Length HTTP header.</Message></Error>",
+            .{ .status = .bad_request, .keep_alive = true },
+        );
+        if (http_server.receiveHead()) |_| return error.TestUnexpectedResult else |_| {}
+    }
+    var stream = try server.accept(std.testing.io);
+    defer stream.close(std.testing.io);
+    var read_buffer: [8192]u8 = undefined;
+    var write_buffer: [4096]u8 = undefined;
+    var stream_reader = stream.reader(std.testing.io, &read_buffer);
+    var stream_writer = stream.writer(std.testing.io, &write_buffer);
+    var http_server = std.http.Server.init(&stream_reader.interface, &stream_writer.interface);
+    var request = try http_server.receiveHead();
+    if (request.head.method != .HEAD) return error.TestUnexpectedResult;
+    try request.respond("", .{ .status = .not_found, .keep_alive = false });
+}
+
+test "scripted error answers report their S3 code and close a PUT's connection" {
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    var server_task = std.testing.io.async(serve_put_error_then_head, .{&server});
+    defer _ = server_task.cancel(std.testing.io) catch {};
+
+    var probe: ObserverProbe = .{};
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try ltx_s3.S3Client.init(std.testing.allocator, std.testing.io, .{
+        .host = "127.0.0.1",
+        .port = server.socket.address.getPort(),
+        .bucket = "scripted-code",
+        .access_key = "test-access",
+        .secret_key = "test-secret",
+        .clock = .{ .context = &plain_clock_context, .now_ms_fn = TestClock.now_ms },
+        .observer = probe.observer(),
+    }, &send_workspace);
+    defer s3.deinit();
+    const identity: ltx.FileIdentity = .{ .min_txid = .init(5), .max_txid = .init(5) };
+    try std.testing.expectError(error.StorageFailure, s3.client().write(0, identity, 1, "payload"));
+    try std.testing.expectEqual(@as(usize, 0), s3.http.connection_pool.free_len);
+    try std.testing.expectError(error.ObjectNotFound, s3.object_etag(0, identity));
+    try server_task.await(std.testing.io);
+
+    try std.testing.expectEqual(@as(usize, 2), probe.ended);
+    const put = probe.seen[0];
+    try std.testing.expectEqual(std.http.Method.PUT, put.method);
+    try std.testing.expectEqual(ltx_s3.Stage.status, put.stage);
+    try std.testing.expectEqual(@as(u16, 400), put.status);
+    try std.testing.expectEqualStrings("IncompleteBody", put.code());
+    try std.testing.expectEqual(@as(?ltx_s3.ConditionalWriteError, null), put.failure);
+    const head = probe.seen[1];
+    try std.testing.expectEqual(std.http.Method.HEAD, head.method);
+    try std.testing.expect(!head.reused);
+    try std.testing.expectEqual(@as(u16, 404), head.status);
+    try std.testing.expectEqualStrings("", head.code());
+}
+
+/// A retry policy whose first pause opens the listener the first attempt
+/// found closed, and starts the scripted server on it.
+const Relisten = struct {
+    port: u16,
+    server: std.Io.net.Server = undefined,
+    task: ?std.Io.Future(anyerror!void) = null,
+
+    fn next(_: *anyopaque, _: u32, _: ltx_s3.RetryCause) ?u64 {
+        return 1;
+    }
+
+    fn sleep(context: *anyopaque, _: u64) ltx_s3.Error!void {
+        const self: *Relisten = @ptrCast(@alignCast(context));
+        if (self.task != null) return;
+        var address = std.Io.net.IpAddress.parseIp4("127.0.0.1", self.port) catch return error.StorageFailure;
+        self.server = address.listen(std.testing.io, .{ .reuse_address = true }) catch return error.StorageFailure;
+        self.task = std.testing.io.async(serve_stage_script, .{&self.server});
+    }
+};
+
+/// The first connection closes after the request without an answer, the
+/// second is answered 503 SlowDown, the third 206.
+fn serve_stage_script(server: *std.Io.net.Server) anyerror!void {
+    var index: u32 = 0;
+    while (index < 3) : (index += 1) {
+        var stream = try server.accept(std.testing.io);
+        defer stream.close(std.testing.io);
+        var read_buffer: [8192]u8 = undefined;
+        var write_buffer: [4096]u8 = undefined;
+        var stream_reader = stream.reader(std.testing.io, &read_buffer);
+        var stream_writer = stream.writer(std.testing.io, &write_buffer);
+        var http_server = std.http.Server.init(&stream_reader.interface, &stream_writer.interface);
+        var request = try http_server.receiveHead();
+        switch (index) {
+            0 => {},
+            1 => try request.respond(
+                "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>",
+                .{ .status = .service_unavailable, .keep_alive = false },
+            ),
+            else => try request.respond("abc", .{
+                .status = .partial_content,
+                .keep_alive = false,
+                .extra_headers = &valid_range_headers,
+            }),
+        }
+    }
+}
+
+test "scripted observer sees every attempt's stage" {
+    // The first connect is refused: the port's listener is closed.
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var probe_server = try address.listen(std.testing.io, .{});
+    var relisten: Relisten = .{ .port = probe_server.socket.address.getPort() };
+    probe_server.deinit(std.testing.io);
+    defer if (relisten.task) |*task| {
+        _ = task.cancel(std.testing.io) catch {};
+        relisten.server.deinit(std.testing.io);
+    };
+
+    var probe: ObserverProbe = .{};
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try ltx_s3.S3Client.init(std.testing.allocator, std.testing.io, .{
+        .host = "127.0.0.1",
+        .port = relisten.port,
+        .bucket = "scripted-stage",
+        .access_key = "test-access",
+        .secret_key = "test-secret",
+        .clock = .{ .context = &plain_clock_context, .now_ms_fn = TestClock.now_ms },
+        .retry = .{
+            .context = &relisten,
+            .next_delay_ms_fn = Relisten.next,
+            .sleep_ms_fn = Relisten.sleep,
+            .max_attempts = 5,
+        },
+        .observer = probe.observer(),
+    }, &send_workspace);
+    defer s3.deinit();
+    var destination: [3]u8 = undefined;
+    _ = try s3.client().read_range(
+        object_info(.{ .min_txid = .init(1), .max_txid = .init(1) }, 6),
+        0,
+        &destination,
+    );
+    try std.testing.expectEqualStrings("abc", &destination);
+    try relisten.task.?.await(std.testing.io);
+
+    try std.testing.expectEqual(@as(usize, 4), probe.ended);
+    const expected_stages = [_]ltx_s3.Stage{ .connect, .receive_head, .status, .status };
+    const expected_statuses = [_]u16{ 0, 0, 503, 206 };
+    for (probe.seen[0..4], 0..) |seen, index| {
+        try std.testing.expectEqual(@as(u32, @intCast(index + 1)), seen.attempt);
+        try std.testing.expectEqual(expected_stages[index], seen.stage);
+        try std.testing.expectEqual(expected_statuses[index], seen.status);
+        try std.testing.expectEqual(index < 3, seen.will_retry);
+        try std.testing.expect(!seen.reused);
+    }
+    try std.testing.expectEqual(error.StorageFailure, probe.seen[0].failure.?);
+    try std.testing.expect(probe.seen[0].cause != null);
+    try std.testing.expectEqual(@as(u32, 0), probe.seen[0].stage_calls);
+    try std.testing.expectEqual(error.StorageFailure, probe.seen[1].failure.?);
+    try std.testing.expect(probe.seen[1].cause != null);
+    // Send, then the wait for the head.
+    try std.testing.expectEqual(@as(u32, 2), probe.seen[1].stage_calls);
+    try std.testing.expectEqualStrings("SlowDown", probe.seen[2].code());
+    try std.testing.expectEqual(@as(?ltx_s3.ConditionalWriteError, null), probe.seen[2].failure);
+    // Send, head, headers, status, the body, and status again.
+    try std.testing.expectEqual(@as(u32, 6), probe.seen[3].stage_calls);
+    try std.testing.expect(probe.seen[3].elapsed_ms >= probe.seen[0].elapsed_ms);
+}
+
 /// One page a scripted listing server answers: the continuation token the
 /// request must carry (decoded; null on a walk's first page), `key_count`
 /// level-0 keys from `first_txid` on, and the page's truncation flag and
@@ -882,6 +1124,10 @@ test "scripted listing fails after its walks keep losing their token" {
     try std.testing.expectError(
         error.StorageFailure,
         s3.client().list(0, ltx.TXID.init(0), &infos),
+    );
+    try std.testing.expectEqualStrings(
+        "a truncated listing page without a continuation token",
+        s3.last_parse_failure,
     );
     // Every walk was tried, and no fourth.
     try server_task.await(std.testing.io);

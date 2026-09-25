@@ -44,7 +44,11 @@ relax those byte-level compatibility or safety requirements.
   client with path-style or virtual-host SigV4, TLS, bounded retry, paginated
   listings, ETag/`If-Match`-bound range reads, conditional writes, and
   automatic single-or-multipart transactional upload. Its pooled HTTP
-  connections use the allocator supplied at initialization. Fenced and
+  connections use the allocator supplied at initialization. An optional
+  `Observer` sees each request attempt begin, move through its `Stage`s,
+  and end (status, the error answer's `<Code>`, the transport's cause,
+  whether it is retried), so a host can say which request failed and
+  where, or name one that has waited too long. Fenced and
   transactional publication report remote
   post-send uncertainty as `PublicationIndeterminate`; reconcile the exact
   object identity before durable progress advances.

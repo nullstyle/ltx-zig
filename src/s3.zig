@@ -82,6 +82,77 @@ pub const RetryPolicy = struct {
     }
 };
 
+/// How far one request attempt got.
+pub const Stage = enum {
+    /// Taking a pooled connection or opening one: nothing was sent.
+    connect,
+    /// Sending the request's head and body.
+    send,
+    /// Waiting for the answer's head.
+    receive_head,
+    /// Taking the answer's `ETag` and `Content-Range` headers.
+    headers,
+    /// An answer arrived, whatever its status; its body, when read, was
+    /// read whole.
+    status,
+    /// Reading the answer's body.
+    read_body,
+    /// The answer arrived whole but did not parse (`S3Client.
+    /// last_parse_failure` says how). No attempt ends here: the parse
+    /// comes after the request, so only a host that reports the failure
+    /// names this stage.
+    parse,
+};
+
+/// One request attempt as it begins. Slices are valid only during the call.
+pub const Attempt = struct {
+    method: std.http.Method,
+    /// The object path, percent-encoded and starting with `/`; `/` for a
+    /// bucket or a listing.
+    key: []const u8,
+    /// The query, percent-encoded; empty when there is none.
+    query: []const u8,
+    /// From 1.
+    attempt: u32,
+    /// The pool had an open connection, which the attempt takes.
+    reused: bool,
+    /// Since this client's previous attempt ended, on `Config.clock`; 0
+    /// for its first.
+    idle_ms: u64,
+};
+
+/// One request attempt as it ends. Slices are valid only during the call.
+pub const AttemptEnd = struct {
+    attempt: *const Attempt,
+    /// The stage that failed, or `status` once an answer arrived.
+    stage: Stage,
+    /// The answer's status; 0 when none arrived.
+    status: u16,
+    /// The `<Code>` of an error answer's body; empty when none was read.
+    s3_code: []const u8,
+    /// The error the attempt failed with; null when an answer arrived.
+    failure: ?ConditionalWriteError,
+    /// The transport's own error under `failure` (a refused connect, a
+    /// connection closed before the answer), when there is one.
+    cause: ?anyerror,
+    /// Since the request's first attempt began, on `Config.clock`.
+    elapsed_ms: u64,
+    /// The client sends the request again after the policy's pause.
+    will_retry: bool,
+};
+
+/// Caller-injected view of every request attempt: a host logs, counts or
+/// watches requests with it. `begin_fn` runs before an attempt connects,
+/// `stage_fn` (optional) as it moves on to each later stage, and `end_fn`
+/// before the retry pause, if any. The callbacks run on the thread that
+/// makes the request, and must not call the client.
+pub const Observer = struct {
+    context: *anyopaque,
+    begin_fn: *const fn (context: *anyopaque, attempt: *const Attempt) void,
+    stage_fn: ?*const fn (context: *anyopaque, stage: Stage) void = null,
+    end_fn: *const fn (context: *anyopaque, end: *const AttemptEnd) void,
+};
+
 /// The conditional header applied to a request. All conditional headers are
 /// signed, so the same variant feeds the canonical request.
 pub const Conditional = union(enum) {
@@ -137,6 +208,8 @@ pub const Config = struct {
     /// Optional retry policy for transient transport failures and
     /// retryable statuses on idempotent requests.
     retry: ?RetryPolicy = null,
+    /// Optional observer of every request attempt.
+    observer: ?Observer = null,
 };
 
 /// One in-flight multipart upload. A client tracks a single upload at a
@@ -184,6 +257,13 @@ const path_workspace_bytes = 4096;
 const query_workspace_bytes = 8192;
 /// Room for a decoded continuation token built from a 1,024-byte key.
 const token_workspace_bytes = 2048;
+/// S3 error codes are short CamelCase words (`SlowDown`,
+/// `XMinioServerNotInitialized`); a longer one is not kept.
+const max_s3_code_bytes = 64;
+/// An error answer's body is read for its code only up to this length,
+/// and not at all when it declares more than `max_error_body_bytes`.
+const error_body_read_bytes = 1024;
+const max_error_body_bytes = 4096;
 
 /// The S3 object client. Stateful and single-owner: keep it at a stable
 /// address while the derived `Client` is in use. `send_workspace` is the
@@ -208,9 +288,18 @@ pub const S3Client = struct {
     size_values: [max_list_keys_per_page]u64 = undefined,
     token_workspace: [token_workspace_bytes]u8 = undefined,
     etag_workspace: [object.max_read_generation_bytes]u8 = undefined,
+    /// The `<Code>` of the last error answer, valid until the next request.
+    s3_code_workspace: [max_s3_code_bytes]u8 = undefined,
     multipart: ?MultipartState = null,
     multipart_owner: ?MultipartOwner = null,
     write_session: ?StreamingWriteState = null,
+    /// When this client's last request attempt ended, on `Config.clock`;
+    /// null before its first.
+    last_attempt_end_ms: ?u64 = null,
+    /// Why the last request's answer, read whole, did not parse (a static
+    /// string); empty when it did, or the request failed otherwise. Reset
+    /// by every request.
+    last_parse_failure: []const u8 = "",
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -325,6 +414,7 @@ pub const S3Client = struct {
                 return listed;
             }
         }
+        self.last_parse_failure = "a truncated listing page without a continuation token";
         return error.StorageFailure;
     }
 
@@ -359,7 +449,12 @@ pub const S3Client = struct {
                 .body_destination = &self.xml_workspace,
             });
             if (outcome.status != .ok) return error.StorageFailure;
-            const page = try self.parse_list_page(outcome.bytes);
+            const page = self.parse_list_page(outcome.bytes) catch |err| {
+                if (self.last_parse_failure.len == 0) {
+                    self.last_parse_failure = "a listing page that does not parse";
+                }
+                return err;
+            };
             for (page.keys, page.sizes) |key, size_bytes| {
                 const name = basename(key) orelse continue;
                 const identity = ltx.parse_file_name(name) catch continue;
@@ -418,19 +513,24 @@ pub const S3Client = struct {
         if (outcome.status == .precondition_failed) return error.ObjectChanged;
         if (outcome.status == .range_not_satisfiable) return error.ObjectChanged;
         if (outcome.status != .partial_content) return error.StorageFailure;
-        const content_range = outcome.content_range orelse
+        const content_range = outcome.content_range orelse {
+            self.last_parse_failure = "a ranged answer without a Content-Range";
             return error.StorageFailure;
+        };
         if (content_range.total_bytes != info.size_bytes) {
             return error.ObjectChanged;
         }
         if (content_range.start_bytes != offset_bytes or
             content_range.end_bytes != end_bytes)
         {
+            self.last_parse_failure = "a ranged answer for another range";
             return error.StorageFailure;
         }
-        return object.ReadGeneration.init(
-            outcome.etag orelse return error.StorageFailure,
-        );
+        const etag = outcome.etag orelse {
+            self.last_parse_failure = "a ranged answer without an ETag";
+            return error.StorageFailure;
+        };
+        return object.ReadGeneration.init(etag);
     }
 
     fn write(
@@ -640,14 +740,16 @@ pub const S3Client = struct {
         );
         if (outcome.status != .ok) return error.StorageFailure;
         var state = MultipartState{ .level = level, .identity = identity };
-        const id_start = std.mem.indexOf(u8, outcome.bytes, "<UploadId>") orelse
+        const upload_id = xml_text(outcome.bytes, "<UploadId>", "</UploadId>") orelse {
+            self.last_parse_failure = "an initiation answer without an UploadId";
             return error.StorageFailure;
-        const value_start = id_start + "<UploadId>".len;
-        const value_end = std.mem.indexOfPos(u8, outcome.bytes, value_start, "</UploadId>") orelse
+        };
+        if (upload_id.len > state.upload_id.len) {
+            self.last_parse_failure = "an UploadId over 192 bytes";
             return error.StorageFailure;
-        if (value_end - value_start > state.upload_id.len) return error.StorageFailure;
-        @memcpy(state.upload_id[0 .. value_end - value_start], outcome.bytes[value_start..value_end]);
-        state.upload_id_bytes = value_end - value_start;
+        }
+        @memcpy(state.upload_id[0..upload_id.len], upload_id);
+        state.upload_id_bytes = upload_id.len;
         self.multipart = state;
         self.multipart_owner = owner;
     }
@@ -772,8 +874,10 @@ pub const S3Client = struct {
         if (outcome.status != .ok) {
             return publication_status_failure(outcome.status);
         }
-        validate_complete_multipart_response(outcome.bytes) catch
+        validate_complete_multipart_response(outcome.bytes) catch {
+            self.last_parse_failure = "a completion answer that is not a CompleteMultipartUploadResult";
             return error.PublicationIndeterminate;
+        };
         self.multipart = null;
         self.multipart_owner = null;
     }
@@ -862,7 +966,10 @@ pub const S3Client = struct {
         const outcome = try self.perform(.HEAD, key, "", .{});
         if (outcome.status == .not_found) return error.ObjectNotFound;
         if (outcome.status != .ok) return error.StorageFailure;
-        return outcome.etag orelse error.StorageFailure;
+        return outcome.etag orelse {
+            self.last_parse_failure = "an answer without an ETag";
+            return error.StorageFailure;
+        };
     }
 
     /// Writes one object only when its stored ETag equals `expected_etag`
@@ -981,45 +1088,7 @@ pub const S3Client = struct {
                 std.debug.assert(options.publication == .definite);
             },
         }
-        const policy = self.config.retry orelse
-            return self.perform_once(method, key, query, options);
-        var attempt: u32 = 1;
-        while (true) : (attempt += 1) {
-            const outcome = self.perform_once(
-                method,
-                key,
-                query,
-                options,
-            ) catch |err| {
-                if (err == error.PublicationIndeterminate) return err;
-                if (err != error.StorageFailure) return err;
-                if (retry_delay(
-                    policy,
-                    attempt,
-                    .transport,
-                    method,
-                    options.conditional,
-                )) |delay| {
-                    try policy.sleep_ms(delay);
-                    continue;
-                }
-                return err;
-            };
-            const retryable = @backingInt(outcome.status) >= 500 or
-                outcome.status == .too_many_requests;
-            if (retryable) {
-                if (options.publication == .indeterminate_after_send) {
-                    return outcome;
-                }
-                if (retry_delay(policy, attempt, .{
-                    .status = @backingInt(outcome.status),
-                }, method, options.conditional)) |delay| {
-                    try policy.sleep_ms(delay);
-                    continue;
-                }
-            }
-            return outcome;
-        }
+        return self.perform_attempts(method, key, query, options, true);
     }
 
     /// Executes a fenced PUT exactly once. Once sending starts, any transport
@@ -1040,18 +1109,138 @@ pub const S3Client = struct {
         std.debug.assert(options.byte_range == null);
         var publication_options = options;
         publication_options.publication = .indeterminate_after_send;
-        return self.perform_once(method, key, query, publication_options);
+        return self.perform_attempts(method, key, query, publication_options, false);
     }
 
-    /// Signs and performs exactly one request attempt.
+    /// The attempts of one request, each shown to the observer: again
+    /// after a pause while `retry_after` allows (never when `may_retry` is
+    /// false).
+    fn perform_attempts(
+        self: *S3Client,
+        method: std.http.Method,
+        key: []const u8,
+        query: []const u8,
+        options: RequestOptions,
+        may_retry: bool,
+    ) ConditionalWriteError!Outcome {
+        self.last_parse_failure = "";
+        var first_ms: u64 = 0;
+        var attempt: u32 = 1;
+        while (true) : (attempt += 1) {
+            const begun = self.begin_attempt(method, key, query, attempt);
+            if (attempt == 1) first_ms = begun.start_ms;
+            var trace: AttemptTrace = .{};
+            const result = self.perform_once(method, key, query, options, begun.start_ms, &trace);
+            const delay = if (may_retry) self.retry_after(attempt, method, options, result) else null;
+            self.end_attempt(&begun.attempt, &trace, result, first_ms, delay != null);
+            if (delay) |pause_ms| {
+                try self.config.retry.?.sleep_ms(pause_ms);
+                continue;
+            }
+            return result;
+        }
+    }
+
+    /// The pause before the next attempt, or null to end the request with
+    /// this attempt's result: a transport failure, or a 5xx or 429 answer
+    /// to a request that is not a publication, under the policy.
+    fn retry_after(
+        self: *const S3Client,
+        attempt: u32,
+        method: std.http.Method,
+        options: RequestOptions,
+        result: ConditionalWriteError!Outcome,
+    ) ?u64 {
+        const policy = self.config.retry orelse return null;
+        const outcome = result catch |err| {
+            if (err != error.StorageFailure) return null;
+            return retry_delay(policy, attempt, .transport, method, options.conditional);
+        };
+        const retryable = @backingInt(outcome.status) >= 500 or
+            outcome.status == .too_many_requests;
+        if (!retryable or options.publication == .indeterminate_after_send) return null;
+        return retry_delay(policy, attempt, .{
+            .status = @backingInt(outcome.status),
+        }, method, options.conditional);
+    }
+
+    /// One attempt about to start, as the observer sees it, and its start
+    /// on `Config.clock`. An open pooled connection is the one it takes.
+    fn begin_attempt(
+        self: *S3Client,
+        method: std.http.Method,
+        key: []const u8,
+        query: []const u8,
+        attempt: u32,
+    ) Begun {
+        const now_ms = self.config.clock.now_ms();
+        const begun: Begun = .{
+            .attempt = .{
+                .method = method,
+                .key = key,
+                .query = query,
+                .attempt = attempt,
+                .reused = self.http.connection_pool.free_len > 0,
+                .idle_ms = if (self.last_attempt_end_ms) |end_ms| now_ms -| end_ms else 0,
+            },
+            .start_ms = now_ms,
+        };
+        if (self.config.observer) |observer| observer.begin_fn(observer.context, &begun.attempt);
+        return begun;
+    }
+
+    /// Note when an attempt ended, and show the observer how.
+    fn end_attempt(
+        self: *S3Client,
+        attempt: *const Attempt,
+        trace: *const AttemptTrace,
+        result: ConditionalWriteError!Outcome,
+        first_ms: u64,
+        will_retry: bool,
+    ) void {
+        const end_ms = self.config.clock.now_ms();
+        self.last_attempt_end_ms = end_ms;
+        const observer = self.config.observer orelse return;
+        const end: AttemptEnd = .{
+            .attempt = attempt,
+            .stage = trace.stage,
+            .status = trace.status,
+            .s3_code = trace.s3_code,
+            .failure = if (result) |_| null else |err| err,
+            .cause = trace.cause,
+            .elapsed_ms = end_ms -| first_ms,
+            .will_retry = will_retry,
+        };
+        observer.end_fn(observer.context, &end);
+    }
+
+    const Begun = struct {
+        attempt: Attempt,
+        start_ms: u64,
+    };
+
+    /// How far one attempt got, for its observer and its retry decision.
+    const AttemptTrace = struct {
+        stage: Stage = .connect,
+        /// The answer's status; 0 until one arrives.
+        status: u16 = 0,
+        /// The code of an error answer's body.
+        s3_code: []const u8 = "",
+        /// The transport's own error under a failure.
+        cause: ?anyerror = null,
+    };
+
+    /// Signs and performs exactly one request attempt, signed at `now_ms`,
+    /// and leaves in `trace` how far it got.
     fn perform_once(
         self: *S3Client,
         method: std.http.Method,
         key: []const u8,
         query: []const u8,
         options: RequestOptions,
+        now_ms: u64,
+        trace: *AttemptTrace,
     ) ConditionalWriteError!Outcome {
-        const now_ms = self.config.clock.now_ms();
         var amz_date: [amz_date_bytes]u8 = undefined;
         try format_amz_date(now_ms, &amz_date);
         // Keep certificate validation and request signing on the same injected
@@ -1164,25 +1353,46 @@ pub const S3Client = struct {
                 .accept_encoding = .omit,
             },
             .extra_headers = extra_headers[0..extra_count],
-        }) catch return error.StorageFailure;
+        }) catch |err| {
+            trace.cause = err;
+            return error.StorageFailure;
+        };
         defer request.deinit();
 
-        if (options.payload) |body| {
-            request.sendBodyComplete(body) catch
-                return post_send_failure(options);
-        } else if (method.requestHasBody()) {
+        self.enter_stage(trace, .send);
+        const sent = if (options.payload) |body|
+            request.sendBodyComplete(body)
+        else if (method.requestHasBody())
             // PUT without a payload still carries a zero-length body.
-            const empty = self.send_workspace[0..0];
-            request.sendBodyComplete(empty) catch
-                return post_send_failure(options);
-        } else {
-            request.sendBodiless() catch
-                return post_send_failure(options);
-        }
-        var response = request.receiveHead(&self.redirect_buffer) catch
+            request.sendBodyComplete(self.send_workspace[0..0])
+        else
+            request.sendBodiless();
+        sent catch |err| {
+            trace.cause = transport_cause(&request, err);
             return post_send_failure(options);
+        };
+        self.enter_stage(trace, .receive_head);
+        var response = request.receiveHead(&self.redirect_buffer) catch |err| {
+            trace.cause = transport_cause(&request, err);
+            return post_send_failure(options);
+        };
+        return self.take_answer(&request, &response, method, options, trace);
+    }
+
+    /// The rest of one attempt once an answer's head arrived: its headers,
+    /// the code of an error answer, and a body the caller asked for.
+    fn take_answer(
+        self: *S3Client,
+        request: *std.http.Client.Request,
+        response: *std.http.Client.Response,
+        method: std.http.Method,
+        options: RequestOptions,
+        trace: *AttemptTrace,
+    ) ConditionalWriteError!Outcome {
         const status = response.head.status;
-        mark_bodyless_response_complete(&request, method, status);
+        trace.status = @backingInt(status);
+        self.enter_stage(trace, .headers);
+        mark_bodyless_response_complete(request, method, status);
         var etag: ?[]const u8 = null;
         var content_range: ?ContentRange = null;
         var header_iterator = response.head.iterateHeaders();
@@ -1204,18 +1414,25 @@ pub const S3Client = struct {
         }
         const readable_status = status == .ok or
             (options.byte_range != null and status == .partial_content);
-        if (!readable_status) return .{
-            .status = status,
-            .etag = etag,
-            .content_range = content_range,
-        };
+        self.enter_stage(trace, .status);
+        if (!readable_status) {
+            trace.s3_code = self.read_error_code(request, response, method);
+            return .{
+                .status = status,
+                .etag = etag,
+                .content_range = content_range,
+            };
+        }
         const destination = options.body_destination orelse return .{
             .status = status,
             .etag = etag,
             .content_range = content_range,
         };
+        self.enter_stage(trace, .read_body);
         const reader = response.reader(&self.transfer_buffer);
         const bytes = read_bounded_response_body(reader, destination) catch |err| {
+            trace.cause = request.reader.body_err orelse
+                transport_cause(request, error.ReadFailed);
             if (options.publication == .indeterminate_after_send) {
                 return error.PublicationIndeterminate;
             }
@@ -1227,12 +1444,50 @@ pub const S3Client = struct {
         if (options.byte_range != null and bytes.len != destination.len) {
             return error.StorageFailure;
         }
+        self.enter_stage(trace, .status);
         return .{
             .status = status,
             .bytes = bytes,
             .etag = etag,
             .content_range = content_range,
         };
+    }
+
+    /// The `<Code>` of an error answer's body, kept in `s3_code_workspace`
+    /// until the next request; empty when none was read. A HEAD's answer
+    /// has no body, and a GET's 404 is the usual answer for a missing
+    /// object, so neither is read. A request that sent a body never
+    /// reuses its connection after an error answer: MinIO closes one after
+    /// a PUT's 412 without saying so, and the next request sent on it fails.
+    fn read_error_code(
+        self: *S3Client,
+        request: *std.http.Client.Request,
+        response: *std.http.Client.Response,
+        method: std.http.Method,
+    ) []const u8 {
+        const status = response.head.status;
+        if (@backingInt(status) < 400 or method == .HEAD) return "";
+        if (method.requestHasBody()) request.connection.?.closing = true;
+        if (status == .not_found and method == .GET) return "";
+        if (response.head.content_length) |length| {
+            if (length > max_error_body_bytes) return "";
+        }
+        var body: [error_body_read_bytes]u8 = undefined;
+        const reader = response.reader(&self.transfer_buffer);
+        const length = reader.readSliceShort(&body) catch return "";
+        const code = xml_text(body[0..length], "<Code>", "</Code>") orelse return "";
+        if (code.len == 0 or code.len > self.s3_code_workspace.len) return "";
+        for (code) |byte| if (!std.ascii.isAlphanumeric(byte)) return "";
+        @memcpy(self.s3_code_workspace[0..code.len], code);
+        return self.s3_code_workspace[0..code.len];
+    }
+
+    /// Record how far an attempt got, and tell the observer.
+    fn enter_stage(self: *S3Client, trace: *AttemptTrace, stage: Stage) void {
+        trace.stage = stage;
+        const observer = self.config.observer orelse return;
+        const stage_fn = observer.stage_fn orelse return;
+        stage_fn(observer.context, stage);
     }
 
     /// Produces the SigV4 authorization header value in
@@ -1450,7 +1705,10 @@ pub const S3Client = struct {
         var next_token: ?[]const u8 = null;
         if (truncated) {
             if (xml_text(xml, "<NextContinuationToken>", "</NextContinuationToken>")) |encoded| {
-                next_token = try decode_xml_text(encoded, &self.token_workspace);
+                next_token = decode_xml_text(encoded, &self.token_workspace) catch |err| {
+                    self.last_parse_failure = "a continuation token over 2048 bytes or with an unknown XML entity";
+                    return err;
+                };
             }
         }
         return .{
@@ -1862,6 +2120,19 @@ fn retry_delay(
     }
     if (!method_retryable(method)) return null;
     return policy.next_delay_ms_fn(policy.context, attempt, cause);
+}
+
+/// The transport's own error under `err`: the socket's error when a read
+/// or a write of the connection failed.
+fn transport_cause(request: *const std.http.Client.Request, err: anyerror) anyerror {
+    const connection = request.connection orelse return err;
+    if (err == error.ReadFailed) {
+        if (connection.stream_reader.err) |socket_err| return socket_err;
+    }
+    if (err == error.WriteFailed) {
+        if (connection.stream_writer.err) |socket_err| return socket_err;
+    }
+    return err;
 }
 
 fn post_send_failure(options: S3Client.RequestOptions) ConditionalWriteError {

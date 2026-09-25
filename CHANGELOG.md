@@ -22,6 +22,15 @@ version is zero, the Zig source API is intentionally unstable.
   what the failed one left. The default, `poison`, is unchanged; an
   indeterminate compaction output, a changed object or a corrupt one still
   poisons under `keep_ready_on_storage`.
+- `ltx_s3`: `Config.observer` (`Observer`) sees every request attempt: an
+  `Attempt` as it begins (method, key, query, attempt number, whether it
+  takes a pooled connection, and how long the client was idle), each later
+  `Stage` it reaches (optional), and an `AttemptEnd` (the stage it ended
+  at, the status, the `<Code>` of an error answer, the error and the
+  transport's own cause, the time since the request's first attempt, and
+  whether it is sent again). `S3Client.last_parse_failure` says why an
+  answer read whole did not parse (a listing page, a continuation token,
+  an upload id, a ranged answer's headers).
 
 ### Fixed
 
@@ -54,6 +63,11 @@ version is zero, the Zig source API is intentionally unstable.
 - An `ltx_s3` listing page that says it is truncated but carries no
   continuation token no longer fails the listing at once: the level is
   listed again from its start, at most `max_listing_restarts` (2) times.
+- `ltx_s3` closes the connection of a PUT or POST that got an error answer
+  after it reads the answer's code: MinIO closes such a connection (after a
+  412, for one) without saying so, and a request sent on it again fails.
+  The code comes from at most 1 KiB of a body of at most 4 KiB, and never
+  from a GET's 404 or a HEAD's answer.
 
 ### Changed
 
