@@ -51,7 +51,7 @@ const sqlite = struct {
 var sql_buffer: [192]u8 = undefined;
 
 fn sql(comptime format: []const u8, args: anytype) ![*:0]const u8 {
-    const text = try std.fmt.bufPrintZ(&sql_buffer, format, args);
+    const text = try std.mem.printSentinel(&sql_buffer, format, args, 0);
     return text.ptr;
 }
 
@@ -238,10 +238,11 @@ pub fn main(init: std.process.Init) !void {
     var syncs: u64 = 0;
     var statement_buffer: [176]u8 = undefined;
     while (rows * row_blob_bytes < target_bytes) {
-        const statement = try std.fmt.bufPrintZ(
+        const statement = try std.mem.printSentinel(
             &statement_buffer,
             "INSERT INTO kv VALUES ({d}, {d}, zeroblob({d}))",
             .{ rows, rows, row_blob_bytes },
+            0,
         );
         try session.exec(statement.ptr);
         rows += 1;
@@ -366,10 +367,11 @@ pub fn main(init: std.process.Init) !void {
         return error.ImageMismatch;
     }
     var uri_buffer: [std.fs.max_path_bytes + 64]u8 = undefined;
-    const uri = try std.fmt.bufPrintZ(
+    const uri = try std.mem.printSentinel(
         &uri_buffer,
         "file:.zig-cache/scale-check/restored.db?mode=ro&immutable=1",
         .{},
+        0,
     );
     const count = try query_count(uri);
     if (count != rows) return error.RowCountMismatch;
