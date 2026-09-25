@@ -139,6 +139,7 @@ defer controller.finish();
 
 _ = try controller.sync(now_ms);
 _ = try controller.maintain(1); // one caller-selected adjacent-level quantum
+_ = try controller.maintain_batch(2, 8); // the same, once 8 sources wait
 const durable = try controller.position();
 const diagnostics = controller.diagnostics();
 ```
@@ -198,6 +199,17 @@ pre-cleanup tree must still verify to the same durable latest position and
 database image. A cleanup-only call returns
 `MaintenanceResult.reconciled` before it compacts an uncovered tail; call
 `maintain` again to continue the bounded work.
+
+`maintain_batch(level, min_source_files)` compacts only once the source level
+holds at least that many files above the destination's coverage and returns
+`idle` before then; `maintain(level)` is `maintain_batch(level, 1)`. It still
+reconciles covered sources and snapshots first. Compaction appends one output
+to its destination and never merges what is already there, so a host that
+drains every level until idle adds one file to its top level per drain, and
+its restore plans grow without bound. Compacting each rung only in full
+batches, and folding the top level into a new snapshot
+(`ltx.snapshot_level`, whose newest file takes one input of the fold), keeps
+every level and every restore plan bounded.
 
 For S3 multipart publication, treat `PublicationIndeterminate` as a distinct
 reconciliation state, not as permission to upload the same logical transition

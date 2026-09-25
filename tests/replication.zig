@@ -1372,6 +1372,174 @@ test "maintenance compacts one adjacent job and safely retains covered files" {
     try expect_row_count(temporary.dir, std.testing.io, "verified.db", 4);
 }
 
+fn init_kv_controller(
+    temporary: *std.testing.TmpDir,
+    client: object.Client,
+    resources: *replication.Resources,
+) !replication.Controller {
+    use_transactional_output(resources);
+    var controller = try replication.Controller.init(
+        options(temporary, client, "app.db", .require_empty),
+        resources,
+    );
+    errdefer controller.finish();
+    try exec_sql(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        "CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)",
+    );
+    return controller;
+}
+
+test "maintain_batch leaves a source below its batch alone and compacts it once full" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const storage = try std.testing.allocator.create(TestResources);
+    defer std.testing.allocator.destroy(storage);
+    var resources = storage.bind();
+    var controller = try init_kv_controller(&temporary, store.client(), &resources);
+    defer controller.finish();
+    // One level-1 file per row, one short of a batch.
+    const batch = max_compaction_inputs;
+    for (1..batch) |row| {
+        try publish_row(&controller, &temporary, @intCast(row));
+        try compact_levels(&controller, &.{1});
+    }
+    const below = try expect_level(store.client(), 1, batch - 1);
+    defer free_level(below);
+    try std.testing.expect((try controller.maintain_batch(2, batch)) == .idle);
+    const untouched = try expect_level(store.client(), 2, 0);
+    defer free_level(untouched);
+
+    try publish_row(&controller, &temporary, batch);
+    try compact_levels(&controller, &.{1});
+    const result = try controller.maintain_batch(2, batch);
+    try std.testing.expectEqual(@as(u32, batch), result.compacted.input_file_count);
+    try std.testing.expectEqual(@as(u64, batch), result.compacted.deleted_file_count);
+    try std.testing.expectEqual(@as(u64, 1), result.compacted.identity.min_txid.value);
+    try std.testing.expectEqual(@as(u64, batch), result.compacted.identity.max_txid.value);
+    const drained = try expect_level(store.client(), 1, 0);
+    defer free_level(drained);
+    const upper = try expect_level(store.client(), 2, 1);
+    defer free_level(upper);
+
+    // A minimum of zero is one, as `maintain` is.
+    try publish_row(&controller, &temporary, batch + 1);
+    try compact_levels(&controller, &.{1});
+    const single = try controller.maintain_batch(2, 0);
+    try std.testing.expectEqual(@as(u32, 1), single.compacted.input_file_count);
+    try std.testing.expect((try controller.maintain(2)) == .idle);
+}
+
+test "maintain_batch reconciles covered sources below its batch" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    var fault = DeleteFaultClient{
+        .backing = store.client(),
+        .mode = .before_batch,
+        .enabled = false,
+    };
+    const storage = try std.testing.allocator.create(TestResources);
+    defer std.testing.allocator.destroy(storage);
+    var resources = storage.bind();
+    var controller = try init_kv_controller(&temporary, fault.client(), &resources);
+    const batch = max_compaction_inputs;
+    for (1..batch + 1) |row| {
+        try publish_row(&controller, &temporary, @intCast(row));
+        try compact_levels(&controller, &.{1});
+    }
+    // The batch's output lands and its sources stay behind.
+    fault.enabled = true;
+    const expected_position = try controller.position();
+    try std.testing.expectError(error.StorageFailure, controller.maintain_batch(2, batch));
+    const retained = try expect_level(store.client(), 1, batch);
+    defer free_level(retained);
+    const published = try expect_level(store.client(), 2, 1);
+    defer free_level(published);
+    controller.finish();
+
+    // No source lies above the output, far below any batch; the covered
+    // sources are still deleted.
+    resources = storage.bind();
+    use_transactional_output(&resources);
+    var recovered = try replication.Controller.init(
+        options(
+            &temporary,
+            store.client(),
+            "app.db",
+            .{ .verified_local = expected_position },
+        ),
+        &resources,
+    );
+    defer recovered.finish();
+    switch (try recovered.maintain_batch(2, 2 * batch)) {
+        .reconciled => |report| {
+            try std.testing.expectEqual(@as(u8, 2), report.destination_level);
+            try std.testing.expectEqual(@as(u64, batch), report.covered_through_txid.value);
+            try std.testing.expectEqual(@as(u64, batch), report.deleted_file_count);
+        },
+        else => return error.TestExpectedReconciliation,
+    }
+    const cleaned = try expect_level(store.client(), 1, 0);
+    defer free_level(cleaned);
+    try std.testing.expect((try recovered.maintain_batch(2, 2 * batch)) == .idle);
+}
+
+test "a snapshot fold covers the top level and deletes what it covers" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const storage = try std.testing.allocator.create(TestResources);
+    defer std.testing.allocator.destroy(storage);
+    var resources = storage.bind();
+    var controller = try init_kv_controller(&temporary, store.client(), &resources);
+    defer controller.finish();
+    // Once a snapshot exists it takes one input of every fold, so a full
+    // fold reads one top-level file less than the compaction inputs.
+    const fold = max_compaction_inputs - 1;
+    var row: u32 = 0;
+    for (0..2) |round| {
+        for (0..fold) |index| {
+            row += 1;
+            try publish_row(&controller, &temporary, row);
+            try compact_levels(&controller, &.{ 1, 2, 3 });
+            if (index + 1 < fold) {
+                try std.testing.expect(
+                    (try controller.maintain_batch(ltx.snapshot_level, fold)) == .idle,
+                );
+            }
+        }
+        const top = try expect_level(store.client(), 3, fold);
+        defer free_level(top);
+        const result = try controller.maintain_batch(ltx.snapshot_level, fold);
+        // The first fold has no snapshot to read; the second reads the
+        // first and deletes it with the top level's files.
+        const input_file_count: u32 = @intCast(fold + round);
+        try std.testing.expectEqual(input_file_count, result.compacted.input_file_count);
+        try std.testing.expectEqual(@as(u64, input_file_count), result.compacted.deleted_file_count);
+        try std.testing.expectEqual(@as(u64, 1), result.compacted.identity.min_txid.value);
+        try std.testing.expectEqual(@as(u64, row), result.compacted.identity.max_txid.value);
+        const folded = try expect_level(store.client(), 3, 0);
+        defer free_level(folded);
+        const snapshots = try expect_level(store.client(), ltx.snapshot_level, 1);
+        defer free_level(snapshots);
+        try std.testing.expectEqual(@as(u64, row), snapshots[0].max_txid.value);
+    }
+
+    var backend = try replica.RestoreBackend.init(
+        temporary.dir,
+        std.testing.io,
+        "verified.db",
+    );
+    const restored = try controller.restore(ltx.TXID.init(0), backend.backend());
+    try std.testing.expectEqual(@as(u64, row), restored.position.txid.value);
+    try std.testing.expectEqual(@as(u32, 1), restored.file_count);
+    try expect_row_count(temporary.dir, std.testing.io, "verified.db", row);
+}
+
 test "maintenance verifies a covering upper before deleting any source" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();

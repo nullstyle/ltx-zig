@@ -837,13 +837,30 @@ pub const Controller = struct {
         self: *Controller,
         destination_level: u8,
     ) Error!MaintenanceResult {
+        return self.maintain_batch(destination_level, 1);
+    }
+
+    /// One maintenance quantum that compacts only a full batch: `.idle`
+    /// while the source level holds fewer than `min_source_files` files
+    /// above the destination's coverage (zero counts as one). Covered
+    /// sources and snapshots are still reconciled first, so a source below
+    /// its batch never keeps a duplicate the destination covers. A batch
+    /// that is due compacts as many inputs as the compaction budget allows.
+    pub fn maintain_batch(
+        self: *Controller,
+        destination_level: u8,
+        min_source_files: u32,
+    ) Error!MaintenanceResult {
         try self.require_operation_ready(.maintain);
         _ = self.source_level(destination_level) catch |err| {
             self.reject_operation(.maintain);
             return err;
         };
         self.accept_operation(.maintain);
-        const report = self.maintain_internal(destination_level) catch |err| {
+        const report = self.maintain_internal(
+            destination_level,
+            min_source_files,
+        ) catch |err| {
             self.fail_operation(.maintain, err, .poisoned);
             return err;
         };
@@ -954,7 +971,11 @@ pub const Controller = struct {
         return .{ .position = restored, .file_count = count };
     }
 
-    fn maintain_internal(self: *Controller, destination_level: u8) Error!MaintenanceResult {
+    fn maintain_internal(
+        self: *Controller,
+        destination_level: u8,
+        min_source_files: u32,
+    ) Error!MaintenanceResult {
         const source_level_value = try self.source_level(destination_level);
         try self.list_all_levels();
         const upper_plan = try self.upper_restore_plan(destination_level);
@@ -965,7 +986,8 @@ pub const Controller = struct {
             upper_plan,
         )) |report| return .{ .reconciled = report };
         const source = source_after(self.level_lists[source_level_value], coverage_txid);
-        if (source.len == 0) return .idle;
+        const batch_file_count: usize = @max(min_source_files, 1);
+        if (source.len < batch_file_count) return .idle;
         const snapshot = if (destination_level == ltx.snapshot_level)
             newest_snapshot(self.level_lists[ltx.snapshot_level])
         else

@@ -7,6 +7,15 @@ version is zero, the Zig source API is intentionally unstable.
 
 ## [Unreleased]
 
+### Added
+
+- `Controller.maintain_batch(destination_level, min_source_files)` compacts
+  only once the source level holds that many files above the destination's
+  coverage, and reports `idle` before then; covered sources are still
+  reconciled first. `maintain` is `maintain_batch(level, 1)`. A host that
+  drains every level until idle adds one top-level file per drain; batches
+  per rung and a snapshot fold on top keep restore plans bounded.
+
 ### Fixed
 
 - Capture no longer publishes a database snapshot on every sync while the WAL
