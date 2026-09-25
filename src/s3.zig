@@ -1084,8 +1084,8 @@ pub const S3Client = struct {
         none,
         /// The payload is bytes only this writer publishes at this key, so
         /// sending them again writes what a late landing would. Such a
-        /// request stays indeterminate once an attempt was
-        /// (`RequestState`).
+        /// request stays indeterminate once an attempt was, until a resend
+        /// is answered 2xx (`RequestState`).
         same_bytes,
     };
 
@@ -1109,7 +1109,7 @@ pub const S3Client = struct {
     /// connection returns to the pool, so the returned bytes stay valid
     /// afterwards. A request that is a publication ends
     /// `PublicationIndeterminate` once any attempt may have landed,
-    /// whatever ends it.
+    /// whatever ends it but a same-bytes resend's success.
     fn perform(
         self: *S3Client,
         method: std.http.Method,
@@ -1132,7 +1132,7 @@ pub const S3Client = struct {
             },
         }
         self.last_parse_failure = "";
-        var state: RequestState = .{};
+        var state: RequestState = .{ .replay = options.replay };
         var first_ms: u64 = 0;
         var attempt: u32 = 1;
         while (true) : (attempt += 1) {
@@ -1333,8 +1333,11 @@ pub const S3Client = struct {
     /// `PublicationIndeterminate`: a later refused connect, a definite
     /// refusal, the policy stopping, the attempts running out, or a pause
     /// that failed. A later attempt's answer says nothing of an earlier
-    /// attempt that may still land.
+    /// attempt that may still land, but for a 2xx to a same-bytes resend:
+    /// the key then holds exactly these bytes, and the earlier attempt,
+    /// should it land late, writes them again.
     const RequestState = struct {
+        replay: Replay = .none,
         indeterminate: bool = false,
 
         fn note(self: *RequestState, ending: Ending) void {
@@ -1342,8 +1345,12 @@ pub const S3Client = struct {
         }
 
         fn finish(self: RequestState, result: ConditionalWriteError!Outcome) ConditionalWriteError!Outcome {
-            if (self.indeterminate) return error.PublicationIndeterminate;
-            return result;
+            if (!self.indeterminate) return result;
+            if (self.replay == .same_bytes) {
+                const outcome = result catch return error.PublicationIndeterminate;
+                if (outcome.status.class() == .success) return outcome;
+            }
+            return error.PublicationIndeterminate;
         }
 
         fn fail(self: RequestState, err: ConditionalWriteError) ConditionalWriteError {
@@ -2607,27 +2614,38 @@ test "only a publication's attempt without a definite answer is indeterminate" {
     try std.testing.expectEqual(@as(?ConditionalWriteError, error.PublicationIndeterminate), ending.reported(error.StorageFailure));
 }
 
-test "an indeterminate attempt stays indeterminate when a later attempt is refused or answered 403" {
+test "an indeterminate attempt stays indeterminate until a same-bytes resend is answered 2xx" {
     const judge = S3Client.judge_attempt;
     const replay: S3Client.RequestOptions = .{ .publication = .indeterminate_after_send, .replay = .same_bytes };
     const lost: S3Client.AttemptTrace = .{ .stage = .receive_head, .cause = error.HttpConnectionClosing };
-    // Attempt 1's answer was lost; attempt 2's connect was refused, and the
-    // policy stopped there.
-    var refused: S3Client.RequestState = .{};
+    // Attempt 1's answer was lost; attempt 2 was answered 200: the key holds
+    // exactly these bytes, and attempt 1 landing late writes them again.
+    var landed: S3Client.RequestState = .{ .replay = .same_bytes };
+    landed.note(judge(.PUT, replay, error.StorageFailure, lost));
+    landed.note(judge(.PUT, replay, null, .{ .stage = .status, .status = 200 }));
+    try std.testing.expectEqual(std.http.Status.ok, (try landed.finish(.{ .status = .ok })).status);
+    // Attempt 1 was answered 503, and attempt 2 too, the last the policy
+    // allowed.
+    var busy: S3Client.RequestState = .{ .replay = .same_bytes };
+    busy.note(judge(.PUT, replay, null, .{ .stage = .status, .status = 503 }));
+    busy.note(judge(.PUT, replay, null, .{ .stage = .status, .status = 503 }));
+    try std.testing.expectError(error.PublicationIndeterminate, busy.finish(.{ .status = .service_unavailable }));
+    // Attempt 2's connect was refused, and the policy stopped there.
+    var refused: S3Client.RequestState = .{ .replay = .same_bytes };
     refused.note(judge(.PUT, replay, error.StorageFailure, lost));
     const refused_ending = judge(.PUT, replay, error.StorageFailure, .{ .stage = .connect, .cause = error.ConnectionRefused });
     try std.testing.expect(!refused_ending.indeterminate);
     refused.note(refused_ending);
     try std.testing.expectError(error.PublicationIndeterminate, refused.finish(error.StorageFailure));
     // Attempt 2 was answered 403: a definite refusal of attempt 2 only.
-    var answered: S3Client.RequestState = .{};
+    var answered: S3Client.RequestState = .{ .replay = .same_bytes };
     answered.note(judge(.PUT, replay, error.StorageFailure, lost));
     answered.note(judge(.PUT, replay, null, .{ .stage = .status, .status = 403 }));
     try std.testing.expectError(error.PublicationIndeterminate, answered.finish(.{ .status = .forbidden }));
     // A pause that failed (a stopping host) ends it the same way.
     try std.testing.expectEqual(error.PublicationIndeterminate, answered.fail(error.StorageFailure));
     // Without an earlier indeterminate attempt, the result stands.
-    var definite: S3Client.RequestState = .{};
+    var definite: S3Client.RequestState = .{ .replay = .same_bytes };
     definite.note(judge(.PUT, replay, null, .{ .stage = .status, .status = 403 }));
     try std.testing.expectEqual(std.http.Status.forbidden, (try definite.finish(.{ .status = .forbidden })).status);
 }
