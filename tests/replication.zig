@@ -1108,6 +1108,41 @@ test "restore-latest restores before opening capture and seeds its position" {
     restored.finish();
 }
 
+test "restore-latest of an idle database publishes once, then nothing" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const storage = try std.testing.allocator.create(TestResources);
+    defer std.testing.allocator.destroy(storage);
+    var resources = storage.bind();
+    var source = try replication.Controller.init(
+        options(&temporary, store.client(), "source.db", .require_empty),
+        &resources,
+    );
+    try exec_sql(
+        temporary.dir,
+        std.testing.io,
+        "source.db",
+        "CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT); INSERT INTO kv VALUES (1, 'one');",
+    );
+    _ = try source.sync(1000);
+    source.finish();
+
+    resources = storage.bind();
+    var restored = try replication.Controller.init(
+        options(&temporary, store.client(), "restored.db", .restore_latest),
+        &resources,
+    );
+    defer restored.finish();
+    // The restored file has no WAL: the first pass cannot prove it matches
+    // txid 1, so it publishes one full image; every idle pass after that
+    // must be unchanged.
+    const first = try restored.sync(2000);
+    try std.testing.expectEqual(@as(u64, 2), first.published.position.txid.value);
+    try std.testing.expectEqual(replication.SyncResult.unchanged, try restored.sync(3000));
+    try std.testing.expectEqual(replication.SyncResult.unchanged, try restored.sync(4000));
+}
+
 fn publish_row(
     controller: *replication.Controller,
     temporary: *std.testing.TmpDir,

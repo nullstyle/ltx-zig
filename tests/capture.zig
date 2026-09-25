@@ -37,6 +37,7 @@ const sqlite = struct {
     extern fn sqlite3_finalize(statement: ?*anyopaque) c_int;
     extern fn sqlite3_column_int64(statement: ?*anyopaque, column: c_int) i64;
     extern fn sqlite3_errmsg(db: ?*anyopaque) [*:0]const u8;
+    extern fn sqlite3_exec(db: ?*anyopaque, sql: [*:0]const u8, cb: ?*const anyopaque, arg: ?*anyopaque, err: ?*?[*:0]u8) c_int;
 };
 
 const codec_limits = ltx.Limits{
@@ -814,6 +815,138 @@ test "valid uncommitted WAL tail captures a database snapshot" {
     try restore_and_expect(&temporary, client, 2);
 }
 
+test "a snapshot of an emptied WAL anchors the next capture" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    _ = try session.sync(&capture_workspaces, 1000);
+    // Anyone's TRUNCATE checkpoint (or a last close) leaves an empty WAL.
+    try session.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    _ = try session.sync(&capture_workspaces, 2000);
+    try std.testing.expectEqual(@as(u64, 2), session.position.txid.value);
+
+    // Nothing changed: the snapshot must have anchored the session, so the
+    // idle passes after it publish nothing.
+    try std.testing.expectError(
+        error.CaptureUnchanged,
+        session.sync(&capture_workspaces, 3000),
+    );
+    try std.testing.expectError(
+        error.CaptureUnchanged,
+        session.sync(&capture_workspaces, 4000),
+    );
+    try std.testing.expectEqual(@as(u64, 2), session.position.txid.value);
+    try expect_level_zero_count(client, 2);
+
+    // And the next commit is an incremental on that anchor.
+    try session.exec("INSERT INTO kv VALUES (2, 'two')");
+    const pages = try session.sync(&capture_workspaces, 5000);
+    try std.testing.expect(pages < session.segment_commit_pages);
+    try std.testing.expectEqual(@as(u64, 3), session.position.txid.value);
+    try restore_and_expect(&temporary, client, 2);
+}
+
+test "a reopened session over a checkpointed file publishes one snapshot" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+    var position: ltx.Position = undefined;
+    {
+        var first = try ltx_capture.Session.init(
+            temporary.dir,
+            std.testing.io,
+            "app.db",
+            codec_limits,
+            wal_limits,
+            client,
+        );
+        // The last close checkpoints the WAL into the file.
+        defer first.finish();
+        try first.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+        try first.exec("INSERT INTO kv VALUES (1, 'one')");
+        _ = try first.sync(&capture_workspaces, 1000);
+        position = first.position;
+    }
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    try session.seed_position(position);
+    _ = try session.sync(&capture_workspaces, 2000);
+    try std.testing.expectEqual(@as(u64, 2), session.position.txid.value);
+    try std.testing.expectError(
+        error.CaptureUnchanged,
+        session.sync(&capture_workspaces, 3000),
+    );
+    try std.testing.expectEqual(@as(u64, 2), session.position.txid.value);
+    try expect_level_zero_count(client, 2);
+    try restore_and_expect(&temporary, client, 1);
+}
+
+test "a snapshot of a header-only WAL anchors the next capture" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one'), (2, 'two')");
+    var valid_header: [ltx_wal.header_size_bytes]u8 = undefined;
+    {
+        var wal_file = try temporary.dir.openFile(std.testing.io, "app.db-wal", .{});
+        defer wal_file.close(std.testing.io);
+        _ = try wal_file.readPositionalAll(std.testing.io, &valid_header, 0);
+    }
+    try session.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    {
+        var wal_file = try temporary.dir.createFile(std.testing.io, "app.db-wal", .{});
+        defer wal_file.close(std.testing.io);
+        try wal_file.writePositionalAll(std.testing.io, &valid_header, 0);
+        try wal_file.sync(std.testing.io);
+    }
+    _ = try session.sync(&capture_workspaces, 1000);
+    try std.testing.expectError(
+        error.CaptureUnchanged,
+        session.sync(&capture_workspaces, 2000),
+    );
+    try std.testing.expectEqual(@as(u64, 1), session.position.txid.value);
+    try restore_and_expect(&temporary, client, 2);
+}
+
 test "short nonempty WAL is rejected without advancing capture" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -1213,4 +1346,64 @@ test "frame-count checkpoint tier bounds WAL length" {
     try std.testing.expect(checkpointed);
     try std.testing.expect(session.last_checkpoint_ms >= 2000);
     try restore_and_expect(&temporary, client, @intCast(batch + 1));
+}
+
+fn exec_foreign(db: ?*anyopaque, sql: [*:0]const u8) !void {
+    if (sqlite.sqlite3_exec(db, sql, null, null, null) != sqlite_ok) {
+        return error.ForeignExec;
+    }
+}
+
+fn restored_count(dir: std.Io.Dir, io: std.Io, name: []const u8, sql: [*:0]const u8) !i64 {
+    var absolute: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base_length = try dir.realPath(io, &absolute);
+    var uri: [std.Io.Dir.max_path_bytes + 64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&uri, "file:{s}/{s}?immutable=1", .{ absolute[0..base_length], name });
+    uri[path.len] = 0;
+    var db: ?*anyopaque = null;
+    if (sqlite.sqlite3_open_v2(@ptrCast(&uri), &db, sqlite_open_readonly | sqlite_open_uri, null) != sqlite_ok) return error.RestoreOpenFailure;
+    defer _ = sqlite.sqlite3_close_v2(db);
+    var statement: ?*anyopaque = null;
+    if (sqlite.sqlite3_prepare_v2(db, sql, -1, &statement, null) != sqlite_ok) return error.RestoreQueryFailure;
+    defer _ = sqlite.sqlite3_finalize(statement);
+    if (sqlite.sqlite3_step(statement) != sqlite_row) return error.RestoreQueryFailure;
+    return sqlite.sqlite3_column_int64(statement, 0);
+}
+
+test "a WAL restarted by a foreign checkpoint after a session checkpoint is captured in full" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+    var session = try ltx_capture.Session.init(temporary.dir, std.testing.io, "app.db", codec_limits, wal_limits, client);
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("CREATE TABLE other (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    try session.exec("INSERT INTO other VALUES (1, 'one')");
+    _ = try session.sync(&capture_workspaces, 1000);
+    try session.checkpoint_passive(1500);
+    try std.testing.expect(session.segment_restarted);
+
+    var absolute: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base_length = try temporary.dir.realPath(std.testing.io, &absolute);
+    var name: [std.Io.Dir.max_path_bytes + 16]u8 = undefined;
+    const path = try std.fmt.bufPrint(&name, "{s}/app.db", .{absolute[0..base_length]});
+    name[path.len] = 0;
+    var foreign: ?*anyopaque = null;
+    if (sqlite.sqlite3_open_v2(@ptrCast(&name), &foreign, 0x2, null) != sqlite_ok) return error.ForeignOpen;
+    // Another connection commits after the session's control row, moves
+    // the whole WAL into the file, and commits again: the WAL restarts
+    // under new salts, and the frames of the first commit are gone from it.
+    try exec_foreign(foreign, "INSERT INTO other VALUES (2, 'two')");
+    try exec_foreign(foreign, "PRAGMA wal_checkpoint(PASSIVE)");
+    try exec_foreign(foreign, "INSERT INTO kv VALUES (3, 'three')");
+    _ = sqlite.sqlite3_close_v2(foreign);
+
+    _ = try session.sync(&capture_workspaces, 2000);
+    try restore_and_expect(&temporary, client, 2);
+    const restored_other = try restored_count(temporary.dir, std.testing.io, "restored.db", "SELECT COUNT(*) FROM other");
+    try std.testing.expectEqual(@as(i64, 2), restored_other);
 }

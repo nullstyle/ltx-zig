@@ -93,7 +93,10 @@ or an explicit call) restarts the segment and the next committed frames still
 capture as an incremental. Any foreign discontinuity — another process
 checkpointing, a replaced WAL — falls back to a fresh snapshot, which is
 always safe because missing pages are read from the database file. A WAL
-larger than the workspace is rejected, never partially read.
+that holds no committed frame (another process emptied it, or it has only a
+header) first gets a control-row commit, so the snapshot anchors on that
+segment and the idle syncs after it publish nothing. A WAL larger than the
+workspace is rejected, never partially read.
 
 Automatic checkpoint failure never masks a capture that has already published
 and advanced its position. Instead, `checkpoint_pending` remains true and a
@@ -304,6 +307,9 @@ rather than replace the 512 MiB series above.
   from the last captured frame; only the first capture and post-restart
   syncs scan from the beginning. After restoring a replica, call
   `seed_position` before the first sync so the continuation numbers its
-  TXIDs after the recovered position instead of restarting at one.
+  TXIDs after the recovered position instead of restarting at one. A
+  session-initiated checkpoint records the salts of the segment its control
+  row starts; a foreign commit, full checkpoint and WAL restart that all land
+  between that control row and the salts read still pass as a continuation.
 - Restore requires the plan's first file to start at TXID 1 from the empty
   position; chains that begin mid-history need an earlier snapshot.

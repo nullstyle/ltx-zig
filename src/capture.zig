@@ -138,7 +138,10 @@ pub const Session = struct {
     /// Set after a checkpoint this session initiated: the next committed
     /// WAL frames belong to a fresh segment that continues the captured
     /// position, so they are captured as an incremental rather than
-    /// triggering a snapshot fallback.
+    /// triggering a snapshot fallback. `segment_salt` then holds that
+    /// segment's salts: a WAL restarted again by someone else's checkpoint
+    /// may have dropped frames the session never read, so it does not
+    /// continue.
     segment_restarted: bool = false,
     last_wal_bytes: u64 = 0,
     last_wal_frame_count: u64 = 0,
@@ -267,19 +270,67 @@ pub const Session = struct {
     pub fn sync(self: *Session, workspaces: *Workspaces, timestamp_ms: i64) Error!u32 {
         try self.validate_workspaces(workspaces);
         try self.validate_timestamp(timestamp_ms);
-        try self.exec("BEGIN");
-        const captured = self.sync_locked(workspaces, timestamp_ms) catch |err| {
-            self.exec("ROLLBACK") catch {};
-            if (err == error.CaptureUnchanged) {
-                self.record_sync_timestamp(timestamp_ms);
-                self.checkpoint_if_due(timestamp_ms);
-            }
-            return err;
+        const captured = self.capture_transaction(workspaces, timestamp_ms, .anchored) catch |err| switch (err) {
+            // The WAL holds no committed frame, so a snapshot read from the
+            // database file alone would leave nothing for the next pass to
+            // compare against: every later pass over the same empty WAL
+            // would publish another one. Start a segment first, as a
+            // session checkpoint does, and capture it in full.
+            error.SegmentMissing => retry: {
+                try self.start_segment();
+                break :retry self.capture_transaction(workspaces, timestamp_ms, .full) catch |retry_err| switch (retry_err) {
+                    error.SegmentMissing => unreachable,
+                    else => |other| return self.capture_failed(other, timestamp_ms),
+                };
+            },
+            else => |other| return self.capture_failed(other, timestamp_ms),
         };
-        self.exec("ROLLBACK") catch {};
         self.record_sync_timestamp(timestamp_ms);
         self.checkpoint_if_due(timestamp_ms);
         return captured;
+    }
+
+    const CaptureMode = enum {
+        /// Continue the anchored segment; report a WAL without a committed
+        /// frame as `SegmentMissing` instead of snapshotting the file.
+        anchored,
+        /// Publish a full image: from the WAL segment when one exists, from
+        /// the database file alone otherwise.
+        full,
+    };
+
+    fn capture_transaction(
+        self: *Session,
+        workspaces: *Workspaces,
+        timestamp_ms: i64,
+        mode: CaptureMode,
+    ) (Error || error{SegmentMissing})!u32 {
+        try self.exec("BEGIN");
+        defer self.exec("ROLLBACK") catch {};
+        return self.sync_locked(workspaces, timestamp_ms, mode);
+    }
+
+    fn capture_failed(self: *Session, err: (Error || error{SegmentMissing}), timestamp_ms: i64) Error {
+        const failure: Error = switch (err) {
+            error.SegmentMissing => unreachable,
+            else => |other| other,
+        };
+        if (failure == error.CaptureUnchanged) {
+            self.record_sync_timestamp(timestamp_ms);
+            self.checkpoint_if_due(timestamp_ms);
+        }
+        return failure;
+    }
+
+    /// Commits a control row so the WAL holds a committed frame whose salts
+    /// and end offset the capture that follows records. Another writer that
+    /// holds the write lock starts a segment of its own when it commits;
+    /// until it does, the full capture reads the database file as before.
+    fn start_segment(self: *Session) Error!void {
+        self.exec("UPDATE _litestream_seq SET seq = seq + 1 WHERE id = 1") catch |err| switch (err) {
+            error.SQLiteBusy => {},
+            else => return err,
+        };
     }
 
     fn checkpoint_if_due(self: *Session, timestamp_ms: i64) void {
@@ -358,6 +409,7 @@ pub const Session = struct {
         try self.exec("UPDATE _litestream_seq SET seq = seq + 1 WHERE id = 1");
         self.segment_restarted = true;
         self.segment_end_offset_bytes = 0;
+        self.segment_salt = self.read_wal_salts();
         self.last_checkpoint_ms = now_ms;
         self.checkpoint_clock_started = true;
         self.checkpoint_pending = false;
@@ -389,10 +441,12 @@ pub const Session = struct {
         self: *Session,
         workspaces: *Workspaces,
         timestamp_ms: i64,
-    ) Error!u32 {
+        mode: CaptureMode,
+    ) (Error || error{SegmentMissing})!u32 {
         _ = try self.query_int64("SELECT seq FROM _litestream_seq WHERE id = 1", 0);
         const wal_bytes = try self.read_wal(workspaces.wal_storage);
         if (wal_bytes.len == 0) {
+            if (mode == .anchored) return error.SegmentMissing;
             return self.encode_database_snapshot(workspaces, timestamp_ms);
         }
         if (wal_bytes.len < wal.header_size_bytes) return error.TruncatedHeader;
@@ -408,8 +462,8 @@ pub const Session = struct {
         const wal_size_bytes = std.math.cast(u64, wal_bytes.len) orelse
             return error.WALTooLarge;
         const reaches_previous_end = wal_size_bytes >= self.segment_end_offset_bytes;
-        const resumable = !first_capture and !self.segment_restarted and salts_match and
-            reaches_previous_end and
+        const resumable = mode == .anchored and !first_capture and
+            !self.segment_restarted and salts_match and reaches_previous_end and
             self.segment_end_offset_bytes >= wal.header_size_bytes + one_frame;
         var reader = if (resumable)
             try wal.Reader.init_with_offset(
@@ -427,10 +481,14 @@ pub const Session = struct {
             .entries = workspaces.map_entries,
         });
 
-        const segment_continues = self.segment_restarted or
-            (salts_match and reaches_previous_end);
+        // A full capture follows a WAL that held no committed frame: what
+        // the WAL holds now may begin after frames someone else checkpointed
+        // since the anchor, so none of it continues the anchor.
+        const segment_continues = mode == .anchored and salts_match and
+            (self.segment_restarted or reaches_previous_end);
         if (map.end_offset_bytes == 0) {
             if (resumable) return error.CaptureUnchanged;
+            if (mode == .anchored) return error.SegmentMissing;
             return self.encode_database_snapshot(workspaces, timestamp_ms);
         }
         if (!first_capture and segment_continues and
@@ -537,6 +595,23 @@ pub const Session = struct {
             return error.WALTooLarge;
         if (read != size) return error.WALTooLarge;
         return storage[0..size];
+    }
+
+    /// The salts of the WAL segment on disk, or zeros (which no capture
+    /// matches) when there is no complete header to read.
+    fn read_wal_salts(self: *Session) wal.SaltPair {
+        const none: wal.SaltPair = .{ .salt_1 = 0, .salt_2 = 0 };
+        var header_bytes: [wal.header_size_bytes]u8 = undefined;
+        var file = self.dir.openFile(
+            self.io,
+            self.wal_path[0..self.wal_path_bytes],
+            .{},
+        ) catch return none;
+        defer file.close(self.io);
+        const read = file.readPositionalAll(self.io, &header_bytes, 0) catch return none;
+        if (read != header_bytes.len) return none;
+        const header = wal.decode_header(&header_bytes) catch return none;
+        return .{ .salt_1 = header.salt_1, .salt_2 = header.salt_2 };
     }
 
     fn encode_and_publish(

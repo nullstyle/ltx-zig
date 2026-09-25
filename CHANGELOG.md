@@ -7,6 +7,20 @@ version is zero, the Zig source API is intentionally unstable.
 
 ## [Unreleased]
 
+### Fixed
+
+- Capture no longer publishes a database snapshot on every sync while the WAL
+  holds no committed frame (emptied by another connection's TRUNCATE
+  checkpoint or last close, or left with a header only). The session first
+  commits a control row, as its own checkpoint does, and captures that
+  segment in full, so the snapshot anchors the next capture and idle syncs
+  report `CaptureUnchanged`.
+- A WAL that another connection checkpointed and restarted after a
+  session-initiated checkpoint is no longer captured as a continuation,
+  which dropped the foreign commits whose frames the restart overwrote. The
+  session records the restarted segment's salts and falls back to a full
+  image when they change.
+
 ### Changed
 
 - The replication roadmap records the completed M6–M11 qualification, the
