@@ -56,20 +56,21 @@ pub const max_listing_restarts: u32 = 2;
 pub const RetryCause = union(enum) {
     /// The transport failed before a complete response arrived.
     transport,
-    /// The store answered with a retryable HTTP status (5xx or 429).
+    /// The store answered a status that may pass (`is_transient_status`).
     status: u16,
 };
 
-/// Caller-injected retry policy. Retries apply to transport failures and
-/// to retryable statuses on idempotent methods only (GET, HEAD, DELETE, and
-/// unconditional PUT). A ranged GET constrained by `If-Match` is also safe to
-/// retry with the same generation. Conditional PUT and POST requests are never
-/// retried.
-/// Transactional publication may retry a definite pre-send transport failure,
-/// but never retries after delivery begins or after a response status arrives.
-/// Delay selection and sleeping are both injected so the module never reads
-/// an ambient clock; hosts encode jitter, caps, cancellation, and the actual
-/// wait in these callbacks.
+/// Caller-injected retry policy. A connect that failed sent nothing, so
+/// every request is retried after one. After sending, transport failures
+/// and statuses that may pass (`is_transient_status`) are retried for
+/// GET, HEAD, DELETE and unconditional PUT; a ranged GET constrained by
+/// `If-Match` keeps its generation. A conditional PUT is retried only
+/// after a transient 4xx, where the store stored nothing; POST and
+/// transactional publication never once sent: a lost answer or a 5xx may
+/// hide a write, and the request ends `PublicationIndeterminate`, whatever
+/// a later attempt found. Delay selection and sleeping are both injected so
+/// the module never reads an ambient clock; hosts encode jitter, caps,
+/// cancellation, and the actual wait in these callbacks.
 pub const RetryPolicy = struct {
     context: *anyopaque,
     next_delay_ms_fn: *const fn (context: *anyopaque, attempt: u32, cause: RetryCause) ?u64,
@@ -208,6 +209,11 @@ pub const Config = struct {
     /// Optional retry policy for transient transport failures and
     /// retryable statuses on idempotent requests.
     retry: ?RetryPolicy = null,
+    /// Close the pooled connections before an attempt when the client's
+    /// previous attempt ended longer ago than this, on `clock`: a store or
+    /// a proxy closes an idle connection (MinIO after 30 s) without the
+    /// client knowing, and a request sent into it fails. 0 keeps them.
+    max_idle_reuse_ms: u64 = 0,
     /// Optional observer of every request attempt.
     observer: ?Observer = null,
 };
@@ -679,9 +685,9 @@ pub const S3Client = struct {
                 .publication = .indeterminate_after_send,
             },
         );
-        if (outcome.status != .ok) {
-            return publication_status_failure(outcome.status);
-        }
+        // A 5xx or a lost answer is `PublicationIndeterminate` from
+        // `perform`; any other status is the store's refusal.
+        if (outcome.status != .ok) return error.StorageFailure;
     }
 
     fn abort_write_session(context: *anyopaque) void {
@@ -871,9 +877,7 @@ pub const S3Client = struct {
                 .publication = .indeterminate_after_send,
             },
         );
-        if (outcome.status != .ok) {
-            return publication_status_failure(outcome.status);
-        }
+        if (outcome.status != .ok) return error.StorageFailure;
         validate_complete_multipart_response(outcome.bytes) catch {
             self.last_parse_failure = "a completion answer that is not a CompleteMultipartUploadResult";
             return error.PublicationIndeterminate;
@@ -916,8 +920,11 @@ pub const S3Client = struct {
     /// Writes one object only when its key is absent, for host-side lease
     /// fencing: the first writer wins and later contenders receive
     /// `ObjectExists`. Uses `If-None-Match: *`, which the store must support.
-    /// A failure after delivery begins returns `PublicationIndeterminate` and
-    /// is never retried automatically; reconcile the stored generation.
+    /// A failure after delivery begins without a definite answer (a lost
+    /// answer, a 5xx) returns `PublicationIndeterminate` and is never
+    /// retried automatically; reconcile the stored generation. A refused
+    /// connect and a transient 4xx (the store stored nothing) are retried
+    /// under the policy.
     pub fn put_if_absent(
         self: *S3Client,
         level: u8,
@@ -933,7 +940,7 @@ pub const S3Client = struct {
         if (bytes.len > self.send_workspace.len) return error.ObjectTooLarge;
         const key = try self.key_path(level, identity);
         @memcpy(self.send_workspace[0..bytes.len], bytes);
-        const outcome = try self.perform_conditional(
+        const outcome = try self.perform(
             .PUT,
             key,
             "",
@@ -941,12 +948,13 @@ pub const S3Client = struct {
                 .payload = self.send_workspace[0..bytes.len],
                 .metadata_ms = created_at_ms,
                 .conditional = .create_only,
+                .publication = .indeterminate_after_send,
             },
         );
         switch (outcome.status) {
             .ok, .created => {},
             .precondition_failed => return error.ObjectExists,
-            else => return conditional_status_failure(outcome.status),
+            else => return error.StorageFailure,
         }
     }
 
@@ -976,9 +984,10 @@ pub const S3Client = struct {
     /// (as returned by `object_etag`, quotes included). This is the
     /// replace-if-generation primitive for lease renewal: a contender that
     /// renewed between the caller's read and write shifts the ETag and this
-    /// call fails with `ETagMismatch`. A failure after delivery begins returns
-    /// `PublicationIndeterminate` and is never retried automatically; reconcile
-    /// the stored generation before renewal continues.
+    /// call fails with `ETagMismatch`. A failure after delivery begins
+    /// without a definite answer returns `PublicationIndeterminate` and is
+    /// never retried automatically; reconcile the stored generation before
+    /// renewal continues. It is retried as `put_if_absent` is.
     pub fn put_if_match(
         self: *S3Client,
         level: u8,
@@ -995,7 +1004,7 @@ pub const S3Client = struct {
         if (bytes.len > self.send_workspace.len) return error.ObjectTooLarge;
         const key = try self.key_path(level, identity);
         @memcpy(self.send_workspace[0..bytes.len], bytes);
-        const outcome = try self.perform_conditional(
+        const outcome = try self.perform(
             .PUT,
             key,
             "",
@@ -1003,12 +1012,13 @@ pub const S3Client = struct {
                 .payload = self.send_workspace[0..bytes.len],
                 .metadata_ms = created_at_ms,
                 .conditional = .{ .match_etag = expected_etag },
+                .publication = .indeterminate_after_send,
             },
         );
         switch (outcome.status) {
             .ok => {},
             .precondition_failed => return error.ETagMismatch,
-            else => return conditional_status_failure(outcome.status),
+            else => return error.StorageFailure,
         }
     }
 
@@ -1050,11 +1060,25 @@ pub const S3Client = struct {
         conditional: Conditional = .none,
         byte_range: ?ByteRange = null,
         publication: Publication = .definite,
+        replay: Replay = .none,
     };
 
     const Publication = enum {
         definite,
+        /// Once sent, an attempt without a definite answer (a lost answer,
+        /// a 5xx) may have landed: the request ends `PublicationIndeterminate`.
         indeterminate_after_send,
+    };
+
+    /// Whether a publication may be sent again after an attempt that may
+    /// have landed.
+    const Replay = enum {
+        none,
+        /// The payload is bytes only this writer publishes at this key, so
+        /// sending them again writes what a late landing would. Such a
+        /// request stays indeterminate once an attempt was
+        /// (`RequestState`).
+        same_bytes,
     };
 
     const Outcome = struct {
@@ -1068,62 +1092,39 @@ pub const S3Client = struct {
         content_range: ?ContentRange = null,
     };
 
-    /// Signs and performs one request, retrying transient failures when a
-    /// policy is configured. The response body, when requested, is read
-    /// fully into `body_destination` before the connection returns to the
-    /// pool, so the returned bytes stay valid afterwards.
+    /// Signs and performs one request, retrying under the policy what may
+    /// pass (`judge_attempt`): each attempt is shown to the observer, a
+    /// pooled connection idle past `Config.max_idle_reuse_ms` is closed
+    /// before an attempt, and every pooled connection is closed after a
+    /// transport failure that is retried. The response body, when
+    /// requested, is read fully into `body_destination` before the
+    /// connection returns to the pool, so the returned bytes stay valid
+    /// afterwards. A request that is a publication ends
+    /// `PublicationIndeterminate` once any attempt may have landed,
+    /// whatever ends it.
     fn perform(
         self: *S3Client,
         method: std.http.Method,
         key: []const u8,
         query: []const u8,
         options: RequestOptions,
-    ) Error!Outcome {
+    ) ConditionalWriteError!Outcome {
         switch (options.conditional) {
             .none => {},
-            .create_only => unreachable,
-            .match_etag => {
-                std.debug.assert(method == .GET);
+            .create_only => {
+                std.debug.assert(method == .PUT);
+                std.debug.assert(options.publication == .indeterminate_after_send);
+            },
+            .match_etag => if (method == .GET) {
                 std.debug.assert(options.byte_range != null);
                 std.debug.assert(options.publication == .definite);
+            } else {
+                std.debug.assert(method == .PUT);
+                std.debug.assert(options.publication == .indeterminate_after_send);
             },
         }
-        return self.perform_attempts(method, key, query, options, true);
-    }
-
-    /// Executes a fenced PUT exactly once. Once sending starts, any transport
-    /// failure is conservatively indeterminate because the store may have
-    /// committed the conditional write before the response was lost.
-    fn perform_conditional(
-        self: *S3Client,
-        method: std.http.Method,
-        key: []const u8,
-        query: []const u8,
-        options: RequestOptions,
-    ) ConditionalWriteError!Outcome {
-        std.debug.assert(method == .PUT);
-        switch (options.conditional) {
-            .none => unreachable,
-            .create_only, .match_etag => {},
-        }
-        std.debug.assert(options.byte_range == null);
-        var publication_options = options;
-        publication_options.publication = .indeterminate_after_send;
-        return self.perform_attempts(method, key, query, publication_options, false);
-    }
-
-    /// The attempts of one request, each shown to the observer: again
-    /// after a pause while `retry_after` allows (never when `may_retry` is
-    /// false).
-    fn perform_attempts(
-        self: *S3Client,
-        method: std.http.Method,
-        key: []const u8,
-        query: []const u8,
-        options: RequestOptions,
-        may_retry: bool,
-    ) ConditionalWriteError!Outcome {
         self.last_parse_failure = "";
+        var state: RequestState = .{};
         var first_ms: u64 = 0;
         var attempt: u32 = 1;
         while (true) : (attempt += 1) {
@@ -1131,41 +1132,39 @@ pub const S3Client = struct {
             if (attempt == 1) first_ms = begun.start_ms;
             var trace: AttemptTrace = .{};
             const result = self.perform_once(method, key, query, options, begun.start_ms, &trace);
-            const delay = if (may_retry) self.retry_after(attempt, method, options, result) else null;
-            self.end_attempt(&begun.attempt, &trace, result, first_ms, delay != null);
-            if (delay) |pause_ms| {
-                try self.config.retry.?.sleep_ms(pause_ms);
-                continue;
-            }
-            return result;
+            const failure: ?ConditionalWriteError = if (result) |_| null else |err| err;
+            const ending = judge_attempt(method, options, failure, trace);
+            state.note(ending);
+            const delay = if (ending.retryable) self.retry_delay(attempt, ending.cause) else null;
+            self.end_attempt(&begun.attempt, &trace, ending.reported(failure), first_ms, delay != null);
+            const pause_ms = delay orelse return state.finish(result);
+            // A store that restarted stales every pooled connection.
+            if (ending.transport) self.drop_pooled_connections();
+            self.config.retry.?.sleep_ms(pause_ms) catch |err| return state.fail(err);
         }
     }
 
-    /// The pause before the next attempt, or null to end the request with
-    /// this attempt's result: a transport failure, or a 5xx or 429 answer
-    /// to a request that is not a publication, under the policy.
-    fn retry_after(
-        self: *const S3Client,
-        attempt: u32,
-        method: std.http.Method,
-        options: RequestOptions,
-        result: ConditionalWriteError!Outcome,
-    ) ?u64 {
+    /// The policy's pause before attempt `attempt + 1`, or null when the
+    /// attempts are spent or the policy says stop.
+    fn retry_delay(self: *const S3Client, attempt: u32, cause: RetryCause) ?u64 {
         const policy = self.config.retry orelse return null;
-        const outcome = result catch |err| {
-            if (err != error.StorageFailure) return null;
-            return retry_delay(policy, attempt, .transport, method, options.conditional);
-        };
-        const retryable = @backingInt(outcome.status) >= 500 or
-            outcome.status == .too_many_requests;
-        if (!retryable or options.publication == .indeterminate_after_send) return null;
-        return retry_delay(policy, attempt, .{
-            .status = @backingInt(outcome.status),
-        }, method, options.conditional);
+        if (attempt >= policy.max_attempts) return null;
+        return policy.next_delay_ms_fn(policy.context, attempt, cause);
+    }
+
+    /// Close every pooled connection: the next attempt opens a new one.
+    fn drop_pooled_connections(self: *S3Client) void {
+        const pool = &self.http.connection_pool;
+        if (pool.free_len == 0) return;
+        const size = pool.free_size;
+        pool.resize(self.io, 0) catch {};
+        pool.resize(self.io, size) catch {};
     }
 
     /// One attempt about to start, as the observer sees it, and its start
-    /// on `Config.clock`. An open pooled connection is the one it takes.
+    /// on `Config.clock`. The pooled connections are closed first when the
+    /// client sat idle past `Config.max_idle_reuse_ms`; an open pooled
+    /// connection is the one the attempt takes.
     fn begin_attempt(
         self: *S3Client,
         method: std.http.Method,
@@ -1174,6 +1173,10 @@ pub const S3Client = struct {
         attempt: u32,
     ) Begun {
         const now_ms = self.config.clock.now_ms();
+        if (self.last_attempt_end_ms) |end_ms| {
+            const limit_ms = self.config.max_idle_reuse_ms;
+            if (limit_ms != 0 and now_ms -| end_ms > limit_ms) self.drop_pooled_connections();
+        }
         const begun: Begun = .{
             .attempt = .{
                 .method = method,
@@ -1194,7 +1197,7 @@ pub const S3Client = struct {
         self: *S3Client,
         attempt: *const Attempt,
         trace: *const AttemptTrace,
-        result: ConditionalWriteError!Outcome,
+        failure: ?ConditionalWriteError,
         first_ms: u64,
         will_retry: bool,
     ) void {
@@ -1206,7 +1209,7 @@ pub const S3Client = struct {
             .stage = trace.stage,
             .status = trace.status,
             .s3_code = trace.s3_code,
-            .failure = if (result) |_| null else |err| err,
+            .failure = failure,
             .cause = trace.cause,
             .elapsed_ms = end_ms -| first_ms,
             .will_retry = will_retry,
@@ -1230,8 +1233,106 @@ pub const S3Client = struct {
         cause: ?anyerror = null,
     };
 
+    /// How one attempt ended, as the retry loop weighs it.
+    const Ending = struct {
+        /// It may be sent again, if the policy allows: nothing was sent,
+        /// or it failed in a way that may pass and sending it again is
+        /// safe for this request.
+        retryable: bool,
+        /// The store may have done what it asked, though no answer said
+        /// so: a publication that was sent and got no definite answer.
+        indeterminate: bool,
+        /// The transport failed (no answer came, or none that parsed): the
+        /// retry opens a new connection.
+        transport: bool,
+        cause: RetryCause,
+
+        /// The attempt's failure as the observer is told it: an attempt
+        /// that may have landed is `PublicationIndeterminate`.
+        fn reported(ending: Ending, failure: ?ConditionalWriteError) ?ConditionalWriteError {
+            const err = failure orelse return null;
+            return if (ending.indeterminate) error.PublicationIndeterminate else err;
+        }
+    };
+
+    /// Weigh one attempt. A connect that failed sent nothing: every
+    /// request may be sent again, conditional writes and POSTs too. A
+    /// request that was sent and failed on the transport, or was answered
+    /// a transient status (`is_transient_status`), may be sent again when
+    /// that is safe: a read, a delete or an unconditional PUT that is not
+    /// a publication; a publication only when it replays the same bytes;
+    /// a conditional PUT only after a transient 4xx, where the store
+    /// stored nothing, never after a 5xx or a lost answer, where it may
+    /// have. A request that could not be built (stage `connect` with no
+    /// cause) never passes.
+    fn judge_attempt(
+        method: std.http.Method,
+        options: RequestOptions,
+        failure: ?ConditionalWriteError,
+        trace: AttemptTrace,
+    ) Ending {
+        const publication = options.publication == .indeterminate_after_send;
+        if (failure) |err| {
+            if (trace.stage == .connect) {
+                const refused = trace.cause != null;
+                return .{ .retryable = refused, .indeterminate = false, .transport = refused, .cause = .transport };
+            }
+            const transport = err == error.StorageFailure;
+            return .{
+                .retryable = transport and may_send_again(method, options, 0),
+                .indeterminate = publication,
+                .transport = transport,
+                .cause = .transport,
+            };
+        }
+        const transient = is_transient_status(trace.status, trace.s3_code);
+        return .{
+            .retryable = transient and may_send_again(method, options, trace.status),
+            .indeterminate = publication and trace.status >= 500,
+            .transport = false,
+            .cause = .{ .status = trace.status },
+        };
+    }
+
+    /// Whether a request that was sent may be sent again after it failed
+    /// in a way that may pass (`status` 0: no answer came).
+    fn may_send_again(method: std.http.Method, options: RequestOptions, status: u16) bool {
+        if (options.publication == .indeterminate_after_send) {
+            if (options.replay == .same_bytes) return true;
+            return options.conditional != .none and status >= 400 and status < 500;
+        }
+        return switch (method) {
+            .GET, .HEAD, .DELETE, .PUT => true,
+            else => false,
+        };
+    }
+
+    /// What the retry loop keeps across one request's attempts. Once an
+    /// attempt may have landed, every way out of the loop is
+    /// `PublicationIndeterminate`: a later refused connect, a definite
+    /// refusal, the policy stopping, the attempts running out, or a pause
+    /// that failed. A later attempt's answer says nothing of an earlier
+    /// attempt that may still land.
+    const RequestState = struct {
+        indeterminate: bool = false,
+
+        fn note(self: *RequestState, ending: Ending) void {
+            if (ending.indeterminate) self.indeterminate = true;
+        }
+
+        fn finish(self: RequestState, result: ConditionalWriteError!Outcome) ConditionalWriteError!Outcome {
+            if (self.indeterminate) return error.PublicationIndeterminate;
+            return result;
+        }
+
+        fn fail(self: RequestState, err: ConditionalWriteError) ConditionalWriteError {
+            return if (self.indeterminate) error.PublicationIndeterminate else err;
+        }
+    };
+
     /// Signs and performs exactly one request attempt, signed at `now_ms`,
-    /// and leaves in `trace` how far it got.
+    /// and leaves in `trace` how far it got. A transport failure is
+    /// `StorageFailure` at whatever stage; `perform` weighs it.
     fn perform_once(
         self: *S3Client,
         method: std.http.Method,
@@ -1369,12 +1470,12 @@ pub const S3Client = struct {
             request.sendBodiless();
         sent catch |err| {
             trace.cause = transport_cause(&request, err);
-            return post_send_failure(options);
+            return error.StorageFailure;
         };
         self.enter_stage(trace, .receive_head);
         var response = request.receiveHead(&self.redirect_buffer) catch |err| {
             trace.cause = transport_cause(&request, err);
-            return post_send_failure(options);
+            return error.StorageFailure;
         };
         return self.take_answer(&request, &response, method, options, trace);
     }
@@ -1433,9 +1534,6 @@ pub const S3Client = struct {
         const bytes = read_bounded_response_body(reader, destination) catch |err| {
             trace.cause = request.reader.body_err orelse
                 transport_cause(request, error.ReadFailed);
-            if (options.publication == .indeterminate_after_send) {
-                return error.PublicationIndeterminate;
-            }
             if (options.byte_range != null and err == error.ObjectTooLarge) {
                 return error.StorageFailure;
             }
@@ -2103,25 +2201,6 @@ fn mark_bodyless_response_complete(
     request.reader.state = .ready;
 }
 
-/// The retry decision: within budget, allowed for the method, and the
-/// policy still returning a delay.
-fn retry_delay(
-    policy: RetryPolicy,
-    attempt: u32,
-    cause: RetryCause,
-    method: std.http.Method,
-    conditional: Conditional,
-) ?u64 {
-    if (attempt >= policy.max_attempts) return null;
-    switch (conditional) {
-        .none => {},
-        .create_only => return null,
-        .match_etag => if (method != .GET) return null,
-    }
-    if (!method_retryable(method)) return null;
-    return policy.next_delay_ms_fn(policy.context, attempt, cause);
-}
-
 /// The transport's own error under `err`: the socket's error when a read
 /// or a write of the connection failed.
 fn transport_cause(request: *const std.http.Client.Request, err: anyerror) anyerror {
@@ -2135,27 +2214,6 @@ fn transport_cause(request: *const std.http.Client.Request, err: anyerror) anyer
     return err;
 }
 
-fn post_send_failure(options: S3Client.RequestOptions) ConditionalWriteError {
-    if (options.publication == .indeterminate_after_send) {
-        return error.PublicationIndeterminate;
-    }
-    return error.StorageFailure;
-}
-
-fn conditional_status_failure(status: std.http.Status) ConditionalWriteError {
-    if (@backingInt(status) >= 500 or status == .too_many_requests) {
-        return error.PublicationIndeterminate;
-    }
-    return error.StorageFailure;
-}
-
-fn publication_status_failure(status: std.http.Status) Error {
-    if (@backingInt(status) >= 500 or status == .too_many_requests) {
-        return error.PublicationIndeterminate;
-    }
-    return error.StorageFailure;
-}
-
 fn abort_status_is_clean(status: std.http.Status) bool {
     return switch (status) {
         .ok, .no_content, .not_found => true,
@@ -2163,9 +2221,18 @@ fn abort_status_is_clean(status: std.http.Status) bool {
     };
 }
 
-fn method_retryable(method: std.http.Method) bool {
-    return switch (method) {
-        .GET, .HEAD, .DELETE, .PUT => true,
+/// Whether an answer's status is a failure that may pass: 500, 502, 503
+/// and 504 (the store or a proxy in front of it failed or is busy), 429 and
+/// 408 (slow down; the client was slow), and 400 when its code says the
+/// client was slow or the store lost the body (`RequestTimeout`,
+/// `IncompleteBody`; MinIO answers a PUT that races a delete of its
+/// directory this way). Not 501, 505 or 507, nor any other 4xx: those do
+/// not change on their own.
+pub fn is_transient_status(status: u16, s3_code: []const u8) bool {
+    return switch (status) {
+        500, 502, 503, 504, 429, 408 => true,
+        400 => std.mem.eql(u8, s3_code, "RequestTimeout") or
+            std.mem.eql(u8, s3_code, "IncompleteBody"),
         else => false,
     };
 }
@@ -2426,113 +2493,135 @@ test "empty payload hash is the standard constant" {
 test "retry decisions respect budget, method, and policy callback" {
     const Probe = struct {
         calls: u32 = 0,
-        sleep_calls: u32 = 0,
-        last_delay_ms: u64 = 0,
-        stop_after: u32 = std.math.maxInt(u32),
         fn next(context: *anyopaque, attempt: u32, cause: RetryCause) ?u64 {
+            _ = attempt;
             const self: *@This() = @ptrCast(@alignCast(context));
             self.calls += 1;
-            if (attempt >= self.stop_after) return null;
             return switch (cause) {
                 .transport => 10,
                 .status => |code| if (code == 429) 20 else null,
             };
         }
 
-        fn sleep(context: *anyopaque, delay_ms: u64) Error!void {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            self.sleep_calls += 1;
-            self.last_delay_ms = delay_ms;
-        }
+        fn sleep(_: *anyopaque, _: u64) Error!void {}
     };
     var probe = Probe{};
-    const policy = RetryPolicy{
-        .context = &probe,
-        .next_delay_ms_fn = Probe.next,
-        .sleep_ms_fn = Probe.sleep,
-        .max_attempts = 3,
+    var send_workspace: [1]u8 = undefined;
+    var clock_context: u8 = 0;
+    const FixedClock = struct {
+        fn now_ms(_: *anyopaque) u64 {
+            return 0;
+        }
     };
+    var client = try S3Client.init(std.testing.allocator, std.testing.io, .{
+        .host = "127.0.0.1",
+        .port = 9000,
+        .bucket = "test",
+        .access_key = "key",
+        .secret_key = "secret",
+        .clock = .{ .context = &clock_context, .now_ms_fn = FixedClock.now_ms },
+        .retry = .{ .context = &probe, .next_delay_ms_fn = Probe.next, .sleep_ms_fn = Probe.sleep, .max_attempts = 3 },
+    }, &send_workspace);
+    defer client.deinit();
 
-    // First failure within budget yields the callback's delay.
-    try std.testing.expectEqual(
-        @as(?u64, 10),
-        retry_delay(policy, 1, .transport, .GET, .none),
-    );
-    // POST is never retried.
-    try std.testing.expectEqual(
-        @as(?u64, null),
-        retry_delay(policy, 1, .transport, .POST, .none),
-    );
-    // A conditional PUT is not safely retryable after a lost response.
-    try std.testing.expectEqual(
-        @as(?u64, null),
-        retry_delay(policy, 1, .transport, .PUT, .create_only),
-    );
-    // A conditional read remains bound to the same generation on retry.
-    try std.testing.expectEqual(
-        @as(?u64, 10),
-        retry_delay(
-            policy,
-            1,
-            .transport,
-            .GET,
-            .{ .match_etag = "\"generation\"" },
-        ),
-    );
-    // The last allowed attempt produces no further delay.
-    try std.testing.expectEqual(
-        @as(?u64, null),
-        retry_delay(policy, 3, .transport, .GET, .none),
-    );
-    // A non-429 status stops through the callback.
-    try std.testing.expectEqual(
-        @as(?u64, null),
-        retry_delay(policy, 1, .{ .status = 503 }, .PUT, .none),
-    );
-    try std.testing.expectEqual(
-        @as(?u64, 20),
-        retry_delay(policy, 1, .{ .status = 429 }, .PUT, .none),
-    );
-    try std.testing.expectEqual(@as(u32, 4), probe.calls);
-    try policy.sleep_ms(20);
-    try std.testing.expectEqual(@as(u32, 1), probe.sleep_calls);
-    try std.testing.expectEqual(@as(u64, 20), probe.last_delay_ms);
+    // Within the budget the callback's delay; at the last attempt none.
+    try std.testing.expectEqual(@as(?u64, 10), client.retry_delay(1, .transport));
+    try std.testing.expectEqual(@as(?u64, null), client.retry_delay(3, .transport));
+    // The callback stops a status it will not retry.
+    try std.testing.expectEqual(@as(?u64, null), client.retry_delay(1, .{ .status = 503 }));
+    try std.testing.expectEqual(@as(?u64, 20), client.retry_delay(1, .{ .status = 429 }));
+    try std.testing.expectEqual(@as(u32, 3), probe.calls);
+
+    const refused: S3Client.AttemptTrace = .{ .stage = .connect, .cause = error.ConnectionRefused };
+    const lost: S3Client.AttemptTrace = .{ .stage = .receive_head, .cause = error.HttpConnectionClosing };
+    const plain: S3Client.RequestOptions = .{};
+    const create_only: S3Client.RequestOptions = .{ .conditional = .create_only, .publication = .indeterminate_after_send };
+    const judge = S3Client.judge_attempt;
+    // A connect that failed sent nothing: every request, POST and
+    // conditional PUT too.
+    try std.testing.expect(judge(.POST, plain, error.StorageFailure, refused).retryable);
+    try std.testing.expect(judge(.PUT, create_only, error.StorageFailure, refused).retryable);
+    // A request that could not be built never passes.
+    try std.testing.expect(!judge(.GET, plain, error.StorageFailure, .{ .stage = .connect }).retryable);
+    // Once sent, reads, deletes and unconditional PUTs go again; POSTs do not.
+    try std.testing.expect(judge(.GET, plain, error.StorageFailure, lost).retryable);
+    try std.testing.expect(judge(.DELETE, plain, error.StorageFailure, lost).retryable);
+    try std.testing.expect(!judge(.POST, plain, error.StorageFailure, lost).retryable);
+    // A conditional read keeps its generation on retry.
+    const match_read: S3Client.RequestOptions = .{ .conditional = .{ .match_etag = "\"generation\"" }, .byte_range = .{ .start_bytes = 0, .end_bytes = 0 } };
+    try std.testing.expect(judge(.GET, match_read, error.StorageFailure, lost).retryable);
+    // A conditional PUT goes again after a transient 4xx only.
+    try std.testing.expect(!judge(.PUT, create_only, error.StorageFailure, lost).retryable);
+    try std.testing.expect(judge(.PUT, create_only, null, .{ .stage = .status, .status = 429 }).retryable);
+    try std.testing.expect(judge(.PUT, create_only, null, .{ .stage = .status, .status = 400, .s3_code = "IncompleteBody" }).retryable);
+    try std.testing.expect(!judge(.PUT, create_only, null, .{ .stage = .status, .status = 503 }).retryable);
+    // A local failure after the answer (a body too large) is final.
+    try std.testing.expect(!judge(.GET, plain, error.ObjectTooLarge, .{ .stage = .read_body }).retryable);
 }
 
-test "only publication classifies post-send failure as indeterminate" {
-    try std.testing.expectEqual(
-        error.StorageFailure,
-        post_send_failure(.{}),
-    );
-    try std.testing.expectEqual(
-        error.StorageFailure,
-        post_send_failure(.{ .conditional = .create_only }),
-    );
-    try std.testing.expectEqual(
-        error.StorageFailure,
-        post_send_failure(.{
-            .conditional = .{ .match_etag = "\"generation\"" },
-        }),
-    );
-    try std.testing.expectEqual(
-        error.PublicationIndeterminate,
-        post_send_failure(.{ .publication = .indeterminate_after_send }),
-    );
+test "only a publication's attempt without a definite answer is indeterminate" {
+    const judge = S3Client.judge_attempt;
+    const lost: S3Client.AttemptTrace = .{ .stage = .receive_head, .cause = error.HttpConnectionClosing };
+    const refused: S3Client.AttemptTrace = .{ .stage = .connect, .cause = error.ConnectionRefused };
+    const publication: S3Client.RequestOptions = .{ .publication = .indeterminate_after_send };
+    try std.testing.expect(!judge(.PUT, .{}, error.StorageFailure, lost).indeterminate);
+    try std.testing.expect(judge(.PUT, publication, error.StorageFailure, lost).indeterminate);
+    try std.testing.expect(judge(.POST, publication, error.ObjectTooLarge, .{ .stage = .read_body }).indeterminate);
+    try std.testing.expect(!judge(.PUT, publication, error.StorageFailure, refused).indeterminate);
+    // A 5xx may hide a write; a 4xx is the store's refusal.
+    try std.testing.expect(judge(.PUT, publication, null, .{ .stage = .status, .status = 500 }).indeterminate);
+    try std.testing.expect(judge(.PUT, publication, null, .{ .stage = .status, .status = 507 }).indeterminate);
+    try std.testing.expect(!judge(.PUT, publication, null, .{ .stage = .status, .status = 429 }).indeterminate);
+    try std.testing.expect(!judge(.PUT, publication, null, .{ .stage = .status, .status = 400 }).indeterminate);
+    try std.testing.expect(!judge(.PUT, publication, null, .{ .stage = .status, .status = 200 }).indeterminate);
+    // Without a replay of the same bytes, nothing that may have landed is
+    // sent again.
+    try std.testing.expect(!judge(.PUT, publication, error.StorageFailure, lost).retryable);
+    try std.testing.expect(!judge(.PUT, publication, null, .{ .stage = .status, .status = 503 }).retryable);
+    const replay: S3Client.RequestOptions = .{ .publication = .indeterminate_after_send, .replay = .same_bytes };
+    try std.testing.expect(judge(.PUT, replay, error.StorageFailure, lost).retryable);
+    try std.testing.expect(judge(.PUT, replay, null, .{ .stage = .status, .status = 503 }).retryable);
+    // The observer is told an attempt that may have landed as such.
+    const ending = judge(.PUT, publication, error.StorageFailure, lost);
+    try std.testing.expectEqual(@as(?ConditionalWriteError, error.PublicationIndeterminate), ending.reported(error.StorageFailure));
 }
 
-test "publication status failures preserve uncertainty" {
-    try std.testing.expectEqual(
-        error.PublicationIndeterminate,
-        publication_status_failure(.internal_server_error),
-    );
-    try std.testing.expectEqual(
-        error.PublicationIndeterminate,
-        publication_status_failure(.too_many_requests),
-    );
-    try std.testing.expectEqual(
-        error.StorageFailure,
-        publication_status_failure(.bad_request),
-    );
+test "an indeterminate attempt stays indeterminate when a later attempt is refused or answered 403" {
+    const judge = S3Client.judge_attempt;
+    const replay: S3Client.RequestOptions = .{ .publication = .indeterminate_after_send, .replay = .same_bytes };
+    const lost: S3Client.AttemptTrace = .{ .stage = .receive_head, .cause = error.HttpConnectionClosing };
+    // Attempt 1's answer was lost; attempt 2's connect was refused, and the
+    // policy stopped there.
+    var refused: S3Client.RequestState = .{};
+    refused.note(judge(.PUT, replay, error.StorageFailure, lost));
+    const refused_ending = judge(.PUT, replay, error.StorageFailure, .{ .stage = .connect, .cause = error.ConnectionRefused });
+    try std.testing.expect(!refused_ending.indeterminate);
+    refused.note(refused_ending);
+    try std.testing.expectError(error.PublicationIndeterminate, refused.finish(error.StorageFailure));
+    // Attempt 2 was answered 403: a definite refusal of attempt 2 only.
+    var answered: S3Client.RequestState = .{};
+    answered.note(judge(.PUT, replay, error.StorageFailure, lost));
+    answered.note(judge(.PUT, replay, null, .{ .stage = .status, .status = 403 }));
+    try std.testing.expectError(error.PublicationIndeterminate, answered.finish(.{ .status = .forbidden }));
+    // A pause that failed (a stopping host) ends it the same way.
+    try std.testing.expectEqual(error.PublicationIndeterminate, answered.fail(error.StorageFailure));
+    // Without an earlier indeterminate attempt, the result stands.
+    var definite: S3Client.RequestState = .{};
+    definite.note(judge(.PUT, replay, null, .{ .stage = .status, .status = 403 }));
+    try std.testing.expectEqual(std.http.Status.forbidden, (try definite.finish(.{ .status = .forbidden })).status);
+}
+
+test "400 RequestTimeout and IncompleteBody are transient, 501 is not" {
+    for ([_]u16{ 500, 502, 503, 504, 429, 408 }) |status| {
+        try std.testing.expect(is_transient_status(status, ""));
+    }
+    try std.testing.expect(is_transient_status(400, "RequestTimeout"));
+    try std.testing.expect(is_transient_status(400, "IncompleteBody"));
+    try std.testing.expect(!is_transient_status(400, "InvalidArgument"));
+    try std.testing.expect(!is_transient_status(400, ""));
+    for ([_]u16{ 200, 206, 403, 404, 409, 412, 416, 501, 505, 507 }) |status| {
+        try std.testing.expect(!is_transient_status(status, "RequestTimeout"));
+    }
 }
 
 test "multipart abort treats a missing upload as already clean" {

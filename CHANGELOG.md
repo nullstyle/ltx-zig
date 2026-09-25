@@ -31,6 +31,12 @@ version is zero, the Zig source API is intentionally unstable.
   whether it is sent again). `S3Client.last_parse_failure` says why an
   answer read whole did not parse (a listing page, a continuation token,
   an upload id, a ranged answer's headers).
+- `ltx_s3`: `Config.max_idle_reuse_ms` closes the pooled connections
+  before an attempt when the client's previous attempt ended longer ago
+  (on `Config.clock`): MinIO closes an idle connection after 30 s, and a
+  request sent into it fails. `is_transient_status(status, s3_code)` is
+  the client's rule for a status that may pass, for hosts that classify
+  alike.
 
 ### Fixed
 
@@ -71,6 +77,22 @@ version is zero, the Zig source API is intentionally unstable.
 
 ### Changed
 
+- `ltx_s3` retries follow one rule for every request, conditional writes
+  included. A connect that failed sent nothing, so it is retried for every
+  request, POST and conditional PUT too. After sending, a transport failure
+  or a status that may pass (500, 502, 503, 504, 429, 408, and 400
+  `RequestTimeout` or `IncompleteBody`; no longer 501, 505 or 507) is
+  retried for GET, HEAD, DELETE and unconditional PUT, and for a
+  conditional PUT only after a transient 4xx, where the store stored
+  nothing. A publication (a write session's PUT or completion, a
+  conditional PUT) that was sent and got a lost answer or a 5xx ends
+  `PublicationIndeterminate`, and it stays so whatever ends the request
+  afterwards: a refused connect, a definite refusal, the policy or a
+  failed pause. A publication's 4xx, 429 included, is now `StorageFailure`
+  (a refusal: nothing was stored) where it was `PublicationIndeterminate`.
+  Every pooled connection is closed after a transport failure that is
+  retried, so the retry opens a new one: a store that restarted stales
+  them all.
 - The replication roadmap records the completed M6–M11 qualification, the
   v0.4.0 release, and the consumer-driven next increment: deployment
   evidence from the consumer build-out, diagnostics and scale baselines
