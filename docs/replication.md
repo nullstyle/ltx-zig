@@ -303,7 +303,10 @@ rather than replace the 512 MiB series above.
 - `ltx_capture`: passive checkpointing only — no writer barrier, which the
   single-writer-per-database model makes unnecessary. Three tiers bound the
   WAL: `checkpoint_threshold_bytes`, `checkpoint_interval_ms`, and
-  `checkpoint_max_frames`. Syncs on a continuing segment resume mid-WAL
+  `checkpoint_max_frames`. The byte and frame tiers count the committed
+  frames of the current segment, not the WAL file: SQLite restarts a WAL in
+  place and does not shrink the file unless `journal_size_limit` says so.
+  Syncs on a continuing segment resume mid-WAL
   from the last captured frame; only the first capture and post-restart
   syncs scan from the beginning. After restoring a replica, call
   `seed_position` before the first sync so the continuation numbers its

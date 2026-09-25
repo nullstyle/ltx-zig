@@ -143,10 +143,16 @@ pub const Session = struct {
     /// may have dropped frames the session never read, so it does not
     /// continue.
     segment_restarted: bool = false,
+    /// The committed end of the last published segment, header included.
+    /// Not the WAL file's size: SQLite restarts a WAL in place and keeps
+    /// the file at its largest unless `journal_size_limit` shrinks it, so
+    /// after a checkpoint the file would still count frames the checkpoint
+    /// moved, and every control row would start another checkpoint.
     last_wal_bytes: u64 = 0,
     last_wal_frame_count: u64 = 0,
-    /// When nonzero, a successful sync whose WAL reached this size runs a
-    /// passive checkpoint afterwards, bounding WAL growth.
+    /// When nonzero, a successful sync whose WAL segment reached this many
+    /// committed bytes runs a passive checkpoint afterwards, bounding WAL
+    /// growth.
     checkpoint_threshold_bytes: u64 = 0,
     /// When nonzero, a successful sync at least this many milliseconds
     /// after the last checkpoint runs one, bounding WAL age for
@@ -630,8 +636,6 @@ pub const Session = struct {
             .max_txid = ltx.TXID.init(next_txid),
         };
         const header = try self.capture_header(reader, wal_bytes.len, map, identity, timestamp_ms);
-        const wal_size_bytes = std.math.cast(u64, wal_bytes.len) orelse
-            return error.WALTooLarge;
         const wal_frame_count = try committed_frame_count(reader, map);
         var write_session: ?object.WriteSession = if (self.client.supports_write_sessions())
             try self.client.begin_write(0, identity, timestamp_ms)
@@ -661,7 +665,7 @@ pub const Session = struct {
         } else {
             try self.client.write(0, identity, timestamp_ms, sink.written());
         }
-        self.record_published(reader, map, verified, wal_size_bytes, wal_frame_count);
+        self.record_published(reader, map, verified, wal_frame_count);
         return written;
     }
 
@@ -737,7 +741,6 @@ pub const Session = struct {
         reader: *const wal.Reader,
         map: wal.PageMap,
         verified: ltx.VerifiedLTX,
-        wal_size_bytes: u64,
         wal_frame_count: u64,
     ) void {
         self.position = verified.post_apply_position();
@@ -748,7 +751,7 @@ pub const Session = struct {
         self.segment_end_offset_bytes = map.end_offset_bytes;
         self.segment_commit_pages = map.commit_pages;
         self.segment_restarted = false;
-        self.last_wal_bytes = wal_size_bytes;
+        self.last_wal_bytes = map.end_offset_bytes;
         self.last_wal_frame_count = wal_frame_count;
     }
 

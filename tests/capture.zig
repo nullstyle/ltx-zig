@@ -1194,6 +1194,53 @@ test "checkpoint threshold bounds wal growth across syncs" {
     try restore_and_expect(&temporary, client, 6);
 }
 
+test "an idle session publishes nothing while a restarted WAL file stays over the byte threshold" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+
+    var session = try ltx_capture.Session.init(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        codec_limits,
+        wal_limits,
+        client,
+    );
+    defer session.finish();
+    // The stock SQLite default: a restarted WAL keeps its file at the
+    // largest size it reached, stale frames and all.
+    try session.exec("PRAGMA journal_size_limit=-1");
+    session.checkpoint_threshold_bytes = 32 + 3 * (24 + 4096);
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v BLOB)");
+    try session.exec("INSERT INTO kv VALUES (1, zeroblob(12000))");
+    _ = try session.sync(&capture_workspaces, 1000);
+    try std.testing.expect(session.segment_restarted);
+    // The checkpoint's control row is captured once.
+    _ = try session.sync(&capture_workspaces, 2000);
+    try std.testing.expectEqual(@as(u64, 2), session.position.txid.value);
+    const stat = try temporary.dir.statFile(std.testing.io, "app.db-wal", .{});
+    try std.testing.expect(stat.size >= session.checkpoint_threshold_bytes);
+
+    // The threshold counts the segment's committed frames, not the file:
+    // a restart does not bring the file under it, and an idle sync must
+    // not start another checkpoint and control row.
+    var idle: i64 = 0;
+    while (idle < 8) : (idle += 1) {
+        try std.testing.expectError(
+            error.CaptureUnchanged,
+            session.sync(&capture_workspaces, 3000 + idle),
+        );
+    }
+    try std.testing.expectEqual(@as(u64, 2), session.position.txid.value);
+    try expect_level_zero_count(client, 2);
+    try restore_and_expect(&temporary, client, 1);
+}
+
 var sql_buffer: [128]u8 = undefined;
 
 test "mid-WAL resume captures every incremental on one continuing segment" {

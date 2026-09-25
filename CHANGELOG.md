@@ -20,6 +20,12 @@ version is zero, the Zig source API is intentionally unstable.
   which dropped the foreign commits whose frames the restart overwrote. The
   session records the restarted segment's salts and falls back to a full
   image when they change.
+- An idle session no longer publishes a control row on every sync once its
+  WAL file reached `checkpoint_threshold_bytes`. The byte tier compared the
+  WAL file's size, and SQLite keeps a restarted WAL file at its largest
+  unless `journal_size_limit` shrinks it (the stock default is -1), so each
+  published control row started another checkpoint and another control
+  row. The tier now counts the committed bytes of the current segment.
 
 ### Changed
 
