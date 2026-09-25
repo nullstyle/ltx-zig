@@ -44,6 +44,19 @@ pub const Startup = union(enum) {
     restore_latest,
 };
 
+/// What a failed `maintain` or `maintain_batch` call does to the controller.
+pub const MaintenanceFailures = enum {
+    /// Every failure poisons the controller, as any other processing
+    /// failure does.
+    poison,
+    /// A failure of the object store itself (`StorageFailure`,
+    /// `ObjectNotFound`, `GenerationUnavailable`) leaves the controller
+    /// ready; every other failure poisons it. No maintenance state outlives
+    /// a call: the next call lists every level again and reconciles what
+    /// the failed one left, exactly as a fresh controller would.
+    keep_ready_on_storage,
+};
+
 pub const Config = struct {
     codec_limits: ltx.Limits,
     wal_limits: wal.Limits,
@@ -59,6 +72,7 @@ pub const Config = struct {
     checkpoint_threshold_bytes: u64 = 0,
     checkpoint_interval_ms: u64 = 0,
     checkpoint_max_frames: u32 = 0,
+    maintenance_failures: MaintenanceFailures = .poison,
 };
 
 const max_compaction_levels = @as(usize, ltx.snapshot_level);
@@ -76,6 +90,7 @@ const StableConfig = struct {
     checkpoint_threshold_bytes: u64,
     checkpoint_interval_ms: u64,
     checkpoint_max_frames: u32,
+    maintenance_failures: MaintenanceFailures,
 
     fn copy(config: Config) StableConfig {
         var stable = StableConfig{
@@ -91,6 +106,7 @@ const StableConfig = struct {
             .checkpoint_threshold_bytes = config.checkpoint_threshold_bytes,
             .checkpoint_interval_ms = config.checkpoint_interval_ms,
             .checkpoint_max_frames = config.checkpoint_max_frames,
+            .maintenance_failures = config.maintenance_failures,
         };
         @memcpy(stable.levels[0..config.levels.levels.len], config.levels.levels);
         return stable;
@@ -846,6 +862,8 @@ pub const Controller = struct {
     /// sources and snapshots are still reconciled first, so a source below
     /// its batch never keeps a duplicate the destination covers. A batch
     /// that is due compacts as many inputs as the compaction budget allows.
+    /// A failure poisons the controller unless `Config.maintenance_failures`
+    /// keeps it ready for that cause.
     pub fn maintain_batch(
         self: *Controller,
         destination_level: u8,
@@ -861,7 +879,7 @@ pub const Controller = struct {
             destination_level,
             min_source_files,
         ) catch |err| {
-            self.fail_operation(.maintain, err, .poisoned);
+            self.fail_operation(.maintain, err, self.maintenance_failure(err));
             return err;
         };
         self.succeed_operation(.{ .maintain = report });
@@ -1319,6 +1337,19 @@ pub const Controller = struct {
         self.state = switch (disposition) {
             .ready => .ready,
             .poisoned => .poisoned,
+        };
+    }
+
+    fn maintenance_failure(self: *const Controller, cause: Error) FailureDisposition {
+        return switch (self.config.maintenance_failures) {
+            .poison => .poisoned,
+            .keep_ready_on_storage => switch (cause) {
+                error.StorageFailure,
+                error.ObjectNotFound,
+                error.GenerationUnavailable,
+                => .ready,
+                else => .poisoned,
+            },
         };
     }
 

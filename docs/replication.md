@@ -200,6 +200,23 @@ database image. A cleanup-only call returns
 `MaintenanceResult.reconciled` before it compacts an uncovered tail; call
 `maintain` again to continue the bounded work.
 
+A host may keep the controller ready after some maintenance failures instead:
+`Config.maintenance_failures = .keep_ready_on_storage`. A maintenance call
+keeps no state from one call to the next. Each call lists every level again
+and reconciles from that listing, so the same controller continues exactly
+as a fresh one would. With this setting, a failure of the object store itself
+(`StorageFailure`, `ObjectNotFound`, or `GenerationUnavailable`) is counted
+and kept in `last_accepted_operation`, and the controller stays ready: sync
+continues, and the next `maintain` reconciles what the failed call left.
+Every other failure still poisons the controller. `PublicationIndeterminate`
+poisons because the compaction output can still land, and a later call could
+write an output that overlaps it at another key. `ObjectChanged` poisons
+because, with one writer, an object changes only if other bytes were written
+at its key. Decode and identity failures poison as before. While maintenance
+fails, level 0 gains one file per published sync. The host must bound how
+long it continues without a successful drain, before any level listing
+outgrows `max_files_per_level`.
+
 `maintain_batch(level, min_source_files)` compacts only once the source level
 holds at least that many files above the destination's coverage and returns
 `idle` before then; `maintain(level)` is `maintain_batch(level, 1)`. It still

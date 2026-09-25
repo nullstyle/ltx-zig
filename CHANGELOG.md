@@ -15,6 +15,13 @@ version is zero, the Zig source API is intentionally unstable.
   reconciled first. `maintain` is `maintain_batch(level, 1)`. A host that
   drains every level until idle adds one top-level file per drain; batches
   per rung and a snapshot fold on top keep restore plans bounded.
+- `Config.maintenance_failures` (`MaintenanceFailures`) lets a host keep a
+  controller ready after a maintenance call fails because of the object
+  store itself (`StorageFailure`, `ObjectNotFound`,
+  `GenerationUnavailable`), so capture goes on and the next call reconciles
+  what the failed one left. The default, `poison`, is unchanged; an
+  indeterminate compaction output, a changed object or a corrupt one still
+  poisons under `keep_ready_on_storage`.
 
 ### Fixed
 

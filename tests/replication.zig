@@ -451,6 +451,88 @@ const DeleteFaultClient = struct {
     }
 };
 
+/// A whole-object client that fails maintenance requests with a chosen
+/// error while armed: every object read, or the write of a compaction
+/// output (any level above 0). With `output_lands`, the output is written
+/// before the error, as when an answer is lost. Capture writes to level 0
+/// always pass through.
+const MaintenanceFaultClient = struct {
+    backing: object.Client,
+    read_fault: ?object.Error = null,
+    output_fault: ?object.Error = null,
+    output_lands: bool = false,
+
+    fn client(self: *MaintenanceFaultClient) object.Client {
+        return .{
+            .context = self,
+            .list_fn = list,
+            .read_range_fn = read_range,
+            .write_fn = write,
+            .delete_fn = delete_objects,
+        };
+    }
+
+    fn disarm(self: *MaintenanceFaultClient) void {
+        self.read_fault = null;
+        self.output_fault = null;
+    }
+
+    fn list(
+        context: *anyopaque,
+        level: u8,
+        seek: ltx.TXID,
+        destination: []ltx.FileInfo,
+    ) object.Error![]const ltx.FileInfo {
+        const self: *MaintenanceFaultClient = @ptrCast(@alignCast(context));
+        return self.backing.list(level, seek, destination);
+    }
+
+    fn read_range(
+        context: *anyopaque,
+        info: ltx.FileInfo,
+        expected_generation: ?object.ReadGeneration,
+        offset_bytes: u64,
+        destination: []u8,
+    ) object.Error!object.ReadGeneration {
+        const self: *MaintenanceFaultClient = @ptrCast(@alignCast(context));
+        if (self.read_fault) |fault| return fault;
+        return self.backing.read_range_fn(
+            self.backing.context,
+            info,
+            expected_generation,
+            offset_bytes,
+            destination,
+        );
+    }
+
+    fn write(
+        context: *anyopaque,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+        bytes: []const u8,
+    ) object.Error!void {
+        const self: *MaintenanceFaultClient = @ptrCast(@alignCast(context));
+        if (level != 0) {
+            if (self.output_fault) |fault| {
+                if (self.output_lands) {
+                    try self.backing.write(level, identity, created_at_ms, bytes);
+                }
+                return fault;
+            }
+        }
+        return self.backing.write(level, identity, created_at_ms, bytes);
+    }
+
+    fn delete_objects(
+        context: *anyopaque,
+        files: []const ltx.FileInfo,
+    ) object.Error!void {
+        const self: *MaintenanceFaultClient = @ptrCast(@alignCast(context));
+        return self.backing.delete(files);
+    }
+};
+
 const WholeObjectClient = struct {
     backing: object.Client,
 
@@ -1580,6 +1662,230 @@ test "maintenance verifies a covering upper before deleting any source" {
     try std.testing.expectEqual(@as(u64, 2), retained[1].max_txid.value);
     const upper = try expect_level(client, 1, 1);
     defer free_level(upper);
+}
+
+fn kept_ready_options(
+    temporary: *std.testing.TmpDir,
+    client: object.Client,
+    failures: replication.MaintenanceFailures,
+) replication.Options {
+    var value = options(temporary, client, "app.db", .require_empty);
+    value.config.maintenance_failures = failures;
+    return value;
+}
+
+fn create_table(temporary: *std.testing.TmpDir) !void {
+    try exec_sql(
+        temporary.dir,
+        std.testing.io,
+        "app.db",
+        "CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)",
+    );
+}
+
+/// The failed maintenance left the controller ready at its position, and
+/// its diagnostics keep the failure.
+fn expect_kept_ready(
+    controller: *replication.Controller,
+    expected_position: ltx.Position,
+    cause: replication.Error,
+) !void {
+    try std.testing.expectEqual(expected_position, try controller.position());
+    const diagnostics = controller.diagnostics();
+    try std.testing.expectEqual(replication.ControllerLifecycle.ready, diagnostics.lifecycle);
+    try expect_last_failure(diagnostics, .maintain, cause);
+}
+
+fn expect_poisoned(controller: *replication.Controller, cause: replication.Error) !void {
+    try std.testing.expectError(error.Poisoned, controller.position());
+    try std.testing.expectError(error.Poisoned, controller.sync(1_000_000));
+    const diagnostics = controller.diagnostics();
+    try std.testing.expectEqual(replication.ControllerLifecycle.poisoned, diagnostics.lifecycle);
+    try expect_last_failure(diagnostics, .maintain, cause);
+}
+
+fn run_delete_fault_kept_ready(
+    mode: DeleteFaultMode,
+    retained_after_failure: usize,
+    deleted_on_next_maintain: u64,
+) !void {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    var fault = DeleteFaultClient{ .backing = store.client(), .mode = mode };
+    const storage = try std.testing.allocator.create(TestResources);
+    defer std.testing.allocator.destroy(storage);
+    var resources = storage.bind();
+    use_transactional_output(&resources);
+    var controller = try replication.Controller.init(
+        kept_ready_options(&temporary, fault.client(), .keep_ready_on_storage),
+        &resources,
+    );
+    defer controller.finish();
+    try create_table(&temporary);
+    for (1..6) |row| try publish_row(&controller, &temporary, @intCast(row));
+    const failed_position = try controller.position();
+    try std.testing.expectError(error.StorageFailure, controller.maintain(1));
+    try expect_kept_ready(&controller, failed_position, error.StorageFailure);
+    const retained = try expect_level(store.client(), 0, retained_after_failure);
+    defer free_level(retained);
+    const published = try expect_level(store.client(), 1, 1);
+    defer free_level(published);
+    try std.testing.expectEqual(@as(u64, 4), published[0].max_txid.value);
+
+    // The capture goes on. The same controller's next maintain lists the
+    // levels again, deletes the sources the published output covers, and
+    // compacts the tail on the call after.
+    try publish_row(&controller, &temporary, 6);
+    try expect_reconciliation(try controller.maintain(1), deleted_on_next_maintain);
+    const tail = try expect_level(store.client(), 0, 2);
+    defer free_level(tail);
+    try std.testing.expectEqual(@as(u64, 5), tail[0].max_txid.value);
+    try std.testing.expectEqual(@as(u64, 6), tail[1].max_txid.value);
+    try std.testing.expect((try controller.maintain(1)) == .compacted);
+    const empty = try expect_level(store.client(), 0, 0);
+    defer free_level(empty);
+    try expect_counters(controller.diagnostics().maintain, 3, 0, 2, 1);
+
+    var backend = try replica.RestoreBackend.init(
+        temporary.dir,
+        std.testing.io,
+        "verified.db",
+    );
+    const restored = try controller.restore(ltx.TXID.init(0), backend.backend());
+    try std.testing.expectEqual(try controller.position(), restored.position);
+    try expect_row_count(temporary.dir, std.testing.io, "verified.db", 6);
+}
+
+test "an opted-in controller stays ready after a maintenance storage failure and converges on its next maintain" {
+    try run_delete_fault_kept_ready(.before_batch, 5, 4);
+    try run_delete_fault_kept_ready(.after_first, 4, 3);
+}
+
+fn run_read_fault(
+    failures: replication.MaintenanceFailures,
+    cause: object.Error,
+    kept_ready: bool,
+) !void {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    var fault = MaintenanceFaultClient{ .backing = store.client() };
+    const storage = try std.testing.allocator.create(TestResources);
+    defer std.testing.allocator.destroy(storage);
+    var resources = storage.bind();
+    var controller = try replication.Controller.init(
+        kept_ready_options(&temporary, fault.client(), failures),
+        &resources,
+    );
+    defer controller.finish();
+    try create_table(&temporary);
+    try publish_row(&controller, &temporary, 1);
+    try publish_row(&controller, &temporary, 2);
+    const failed_position = try controller.position();
+    fault.read_fault = cause;
+    try std.testing.expectError(cause, controller.maintain(1));
+    fault.disarm();
+    const retained = try expect_level(store.client(), 0, 2);
+    defer free_level(retained);
+    const upper = try expect_level(store.client(), 1, 0);
+    defer free_level(upper);
+    if (!kept_ready) return expect_poisoned(&controller, cause);
+    try expect_kept_ready(&controller, failed_position, cause);
+    try publish_row(&controller, &temporary, 3);
+    try std.testing.expect((try controller.maintain(1)) == .compacted);
+    const empty = try expect_level(store.client(), 0, 0);
+    defer free_level(empty);
+}
+
+test "an opted-in controller stays ready only after a failure of the store itself" {
+    // The store failed, or did not have what a listing named, or gave no
+    // generation: nothing was written, and the next call lists again.
+    try run_read_fault(.keep_ready_on_storage, error.StorageFailure, true);
+    try run_read_fault(.keep_ready_on_storage, error.ObjectNotFound, true);
+    try run_read_fault(.keep_ready_on_storage, error.GenerationUnavailable, true);
+    // Under one writer, an object changes only when other bytes were
+    // written to its key.
+    try run_read_fault(.keep_ready_on_storage, error.ObjectChanged, false);
+    // The default poisons on every failure.
+    try run_read_fault(.poison, error.StorageFailure, false);
+}
+
+fn run_planted_upper(plant: enum { garbage, other_identity }, cause: replication.Error) !void {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+    const storage = try std.testing.allocator.create(TestResources);
+    defer std.testing.allocator.destroy(storage);
+    var resources = storage.bind();
+    use_transactional_output(&resources);
+    var controller = try replication.Controller.init(
+        kept_ready_options(&temporary, client, .keep_ready_on_storage),
+        &resources,
+    );
+    defer controller.finish();
+    try create_table(&temporary);
+    try publish_row(&controller, &temporary, 1);
+    try publish_row(&controller, &temporary, 2);
+    const sources = try expect_level(client, 0, 2);
+    defer free_level(sources);
+
+    // A level-1 object at [1-2] that covers both sources by its key.
+    const upper = ltx.FileIdentity{
+        .min_txid = ltx.TXID.init(1),
+        .max_txid = ltx.TXID.init(2),
+    };
+    switch (plant) {
+        .garbage => {
+            const corrupt_bytes: [256]u8 = @splat(0);
+            try client.write(1, upper, 1500, &corrupt_bytes);
+        },
+        // The valid snapshot [1-1], written under the key [1-2].
+        .other_identity => {
+            const bytes = try std.testing.allocator.alloc(u8, @intCast(sources[0].size_bytes));
+            defer std.testing.allocator.free(bytes);
+            try client.write(1, upper, 1500, try client.read_all(sources[0], bytes));
+        },
+    }
+    try std.testing.expectError(cause, controller.maintain(1));
+    try expect_poisoned(&controller, cause);
+    const retained = try expect_level(client, 0, 2);
+    defer free_level(retained);
+}
+
+test "an opted-in controller still poisons on a maintenance identity mismatch" {
+    try run_planted_upper(.other_identity, error.ObjectIdentityMismatch);
+    try run_planted_upper(.garbage, error.InvalidMagic);
+}
+
+test "an opted-in controller still poisons on an indeterminate compaction output" {
+    // The output may still land: a ready controller could write another
+    // output over the same sources at another key.
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    var fault = MaintenanceFaultClient{
+        .backing = store.client(),
+        .output_fault = error.PublicationIndeterminate,
+        .output_lands = true,
+    };
+    const storage = try std.testing.allocator.create(TestResources);
+    defer std.testing.allocator.destroy(storage);
+    var resources = storage.bind();
+    var controller = try replication.Controller.init(
+        kept_ready_options(&temporary, fault.client(), .keep_ready_on_storage),
+        &resources,
+    );
+    defer controller.finish();
+    try create_table(&temporary);
+    try publish_row(&controller, &temporary, 1);
+    try publish_row(&controller, &temporary, 2);
+    try std.testing.expectError(error.PublicationIndeterminate, controller.maintain(1));
+    try expect_poisoned(&controller, error.PublicationIndeterminate);
+    const landed = try expect_level(store.client(), 1, 1);
+    defer free_level(landed);
+    try std.testing.expectEqual(@as(u64, 2), landed[0].max_txid.value);
 }
 
 test "invalid calls stay ready and processing failures poison until finish" {

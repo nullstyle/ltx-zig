@@ -65,7 +65,8 @@ relax those byte-level compatibility or safety requirements.
 - `ltx_replication` provides the synchronous per-database `Controller`. It
   owns capture position, all-level listing, startup restore, one selected
   adjacent-level maintenance quantum (optionally only once a full batch of
-  sources waits), safe retention, and restore execution;
+  sources waits, and optionally left ready after a failure of the store
+  itself), safe retention, and restore execution;
   the host retains scheduling, concurrency, acknowledgement, and fencing.
   Restore-latest startup requires a host-quiesced target with no SQLite
   sidecars, and initialization copies the level ladder and validates every
