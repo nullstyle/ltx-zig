@@ -1661,6 +1661,50 @@ test "scripted lost multipart completion is resent, and NoSuchUpload with a matc
     try expect_completion_settled_by_head(scripted_part_one_success, head_with(&.{.{ .name = "etag", .value = "\"kms-object-1\"" }}));
 }
 
+fn expect_completion_not_settled_by_head(comptime part: ScriptedMultipartRequest, comptime head: ScriptedMultipartRequest) !void {
+    // The first completion is done, and its answer lost; the second finds
+    // no upload, and the HEAD finds another object at the key. `settle`
+    // finds the same, aborts the upload, and the HEAD after the abort
+    // still finds no object of this upload.
+    const requests = [_]ScriptedMultipartRequest{
+        scripted_begin_success,
+        part,
+        .{ .method = .POST, .target = scripted_upload_target, .action = .drop_after_body },
+        no_such_upload_completion,
+        head,
+        no_such_upload_completion,
+        head,
+        scripted_abort_clean,
+        head,
+    };
+    var script: MultipartScript = .{};
+    try script.start(&requests);
+    defer script.end();
+    var retry_probe = RetryProbe{};
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try init_settling_s3(script.port(), &send_workspace, .{ .context = &retry_probe, .next_delay_ms_fn = RetryProbe.next, .sleep_ms_fn = RetryProbe.sleep, .max_attempts = 3 });
+    defer s3.deinit();
+    defer script.end();
+    try s3.begin_multipart(0, scripted_multipart_identity, 10_550);
+    try s3.put_part(1, "tail");
+    try std.testing.expectError(error.PublicationIndeterminate, s3.complete_multipart());
+    try std.testing.expect(s3.unsettled_publication().?.multipart.complete_sent);
+    try std.testing.expect(s3.multipart != null);
+    try std.testing.expectEqual(ltx_s3.Settlement.cancelled, try s3.settle());
+    try script.task.await(std.testing.io);
+    try std.testing.expect(s3.multipart == null);
+    try std.testing.expect(s3.unsettled_publication() == null);
+}
+
+test "scripted lost multipart completion whose HEAD finds another object stays unsettled" {
+    // Another MD5 with the right part count and length.
+    try expect_completion_not_settled_by_head(md5_part_one_success, head_with(&.{.{ .name = "etag", .value = "\"00000000000000000000000000000000-1\"" }}));
+    // The upload's ETag with another length.
+    try expect_completion_not_settled_by_head(md5_part_one_success, .{ .method = .HEAD, .target = scripted_multipart_key, .action = .{ .respond = .{ .status = .ok, .headers = &md5_upload_headers, .body = "tails" } } });
+    // A part ETag that is not an MD5 (KMS), and another part count.
+    try expect_completion_not_settled_by_head(scripted_part_one_success, head_with(&.{.{ .name = "etag", .value = "\"kms-object-2\"" }}));
+}
+
 test "scripted settle aborts an unsettled multipart upload and HEADs its key" {
     const requests = [_]ScriptedMultipartRequest{
         scripted_begin_success,
