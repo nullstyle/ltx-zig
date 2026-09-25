@@ -51,7 +51,11 @@ relax those byte-level compatibility or safety requirements.
   where, or name one that has waited too long. Fenced and
   transactional publication report remote
   post-send uncertainty as `PublicationIndeterminate`; reconcile the exact
-  object identity before durable progress advances.
+  object identity before durable progress advances. A single-writer host
+  can let the client do it (`Config.single_writer_publication`): a write
+  session's publication is sent again with the same bytes, and one whose
+  outcome is still unknown (`unsettled_publication`) blocks writes and
+  deletes with `PublicationUnsettled` until `settle` resolves it.
 - `ltx_replica` provides the Litestream level ladder, restore, compaction, and
   retention planners, plus restore and compaction executors over caller-owned
   workspaces. They remain public lower-level escape hatches beneath the

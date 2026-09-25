@@ -834,11 +834,46 @@ fn end_server(task: *std.Io.Future(anyerror!void)) !void {
     };
 }
 
+/// What a scripted server saw of one request: its method, the first 256
+/// bytes of its body and the body's length, and its Litestream timestamp.
+const Seen = struct {
+    method: std.http.Method = .GET,
+    body: [256]u8 = undefined,
+    body_bytes: usize = 0,
+    body_len: u64 = 0,
+    timestamp: [32]u8 = undefined,
+    timestamp_len: usize = 0,
+
+    fn begin(request: *const std.http.Server.Request) Seen {
+        var seen: Seen = .{ .method = request.head.method };
+        var headers = request.iterateHeaders();
+        while (headers.next()) |header| {
+            if (!std.ascii.eqlIgnoreCase(header.name, "x-amz-meta-litestream-timestamp")) continue;
+            seen.timestamp_len = @min(header.value.len, seen.timestamp.len);
+            @memcpy(seen.timestamp[0..seen.timestamp_len], header.value[0..seen.timestamp_len]);
+        }
+        return seen;
+    }
+
+    fn bodyText(self: *const Seen) []const u8 {
+        return self.body[0..self.body_bytes];
+    }
+
+    fn timestampText(self: *const Seen) []const u8 {
+        return self.timestamp[0..self.timestamp_len];
+    }
+};
+
 /// Serves `script` in order, one request a step, on as many connections
 /// as the client opens; a connection stays open until the client closes
 /// it, a `drop` closes it, or an answer does not keep it alive.
 /// `connections[i]` counts the requests the i-th connection carried.
 fn serve_script(server: *std.Io.net.Server, script: []const Scripted, connections: []u32) anyerror!void {
+    return serve_script_seen(server, script, connections, &.{});
+}
+
+/// `serve_script`, keeping what it saw of the first `seen.len` requests.
+fn serve_script_seen(server: *std.Io.net.Server, script: []const Scripted, connections: []u32, seen: []Seen) anyerror!void {
     var step: usize = 0;
     var index: usize = 0;
     while (step < script.len) : (index += 1) {
@@ -857,10 +892,14 @@ fn serve_script(server: *std.Io.net.Server, script: []const Scripted, connection
                 try not_canceled(&stream_reader);
                 break;
             };
+            // The body is read over the head's buffer: take the head first.
+            var entry = Seen.begin(&request);
             if (request.head.method.requestHasBody()) {
                 const body_reader = try request.readerExpectContinue(&body_buffer);
-                _ = try body_reader.discardRemaining();
+                entry.body_bytes = try body_reader.readSliceShort(&entry.body);
+                entry.body_len = entry.body_bytes + try body_reader.discardRemaining();
             }
+            if (step < seen.len) seen[step] = entry;
             connections[index] += 1;
             const current = script[step];
             step += 1;
@@ -1309,6 +1348,420 @@ test "scripted conditional PUT is retried after a refused connect or a 429, neve
     try std.testing.expectError(error.PublicationIndeterminate, s3.put_if_absent(0, identity, 3, "claim"));
     try std.testing.expectEqual(@as(u32, 2), relisten.calls);
     try relisten.end();
+}
+
+// ---- single-writer publication: same-bytes resends and settlement -------------
+
+/// A client of a scripted server on `port` that settles its publications
+/// (`single_writer_publication`), with `retry`.
+fn init_settling_s3(port: u16, send_workspace: []u8, retry: ?ltx_s3.RetryPolicy) !ltx_s3.S3Client {
+    var s3 = try init_scripted_s3(port, send_workspace, retry);
+    s3.config.single_writer_publication = true;
+    return s3;
+}
+
+const settled_payload = "small payload";
+const settled_timestamp_ms: i64 = 10_400;
+
+/// A write session of `settled_payload` at the scripted key: what a
+/// capture publishes.
+fn publish_small(s3: *ltx_s3.S3Client) !void {
+    var session = try s3.client().begin_write(0, scripted_multipart_identity, settled_timestamp_ms);
+    try session.writer().write_all(settled_payload);
+    return session.finish();
+}
+
+/// The client holds its single PUT unsettled, with its bytes.
+fn expect_unsettled_put(s3: *const ltx_s3.S3Client) !void {
+    const put = s3.unsettled_publication().?.single_put;
+    try std.testing.expectEqual(@as(u8, 0), put.level);
+    try std.testing.expectEqual(scripted_multipart_identity, put.identity);
+    try std.testing.expectEqual(settled_timestamp_ms, put.created_at_ms);
+    try std.testing.expectEqual(settled_payload.len, put.length_bytes);
+    try std.testing.expect(s3.write_session == null);
+}
+
+/// A request sent again carried the first one's bytes and timestamp.
+fn expect_same_put(first: Seen, again: Seen) !void {
+    try std.testing.expectEqual(std.http.Method.PUT, again.method);
+    try std.testing.expectEqualStrings(first.bodyText(), again.bodyText());
+    try std.testing.expectEqual(first.body_len, again.body_len);
+    try std.testing.expectEqualStrings(first.timestampText(), again.timestampText());
+}
+
+/// A scripted server on a loopback port whose listener the retry policy's
+/// first pause closes, once the script is served: every connect after it
+/// is refused.
+const Deafen = struct {
+    server: std.Io.net.Server = undefined,
+    task: std.Io.Future(anyerror!void) = undefined,
+    listening: bool = false,
+    connections: [2]u32 = @splat(0),
+    seen: [2]Seen = @splat(.{}),
+    /// The policy's delay calls.
+    calls: u32 = 0,
+
+    fn start(self: *Deafen, script: []const Scripted) !void {
+        var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        self.server = try address.listen(std.testing.io, .{});
+        self.listening = true;
+        self.task = std.testing.io.async(serve_script_seen, .{ &self.server, script, &self.connections, &self.seen });
+    }
+
+    fn deinit(self: *Deafen) void {
+        if (!self.listening) return;
+        _ = self.task.cancel(std.testing.io) catch {};
+        self.server.deinit(std.testing.io);
+    }
+
+    fn policy(self: *Deafen, max_attempts: u32) ltx_s3.RetryPolicy {
+        return .{ .context = self, .next_delay_ms_fn = next, .sleep_ms_fn = sleep, .max_attempts = max_attempts };
+    }
+
+    fn next(context: *anyopaque, _: u32, _: ltx_s3.RetryCause) ?u64 {
+        const self: *Deafen = @ptrCast(@alignCast(context));
+        self.calls += 1;
+        return 1;
+    }
+
+    fn sleep(context: *anyopaque, _: u64) ltx_s3.Error!void {
+        const self: *Deafen = @ptrCast(@alignCast(context));
+        if (!self.listening) return;
+        self.task.await(std.testing.io) catch return error.StorageFailure;
+        self.server.deinit(std.testing.io);
+        self.listening = false;
+    }
+};
+
+test "scripted lost single-put acknowledgement is resent with the same bytes under single_writer_publication" {
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const script = [_]Scripted{ .drop, .{ .answer = .{ .status = .ok } } };
+    var connections: [2]u32 = @splat(0);
+    var seen: [2]Seen = @splat(.{});
+    var server_task = std.testing.io.async(serve_script_seen, .{ &server, &script, &connections, &seen });
+    defer _ = server_task.cancel(std.testing.io) catch {};
+    var retry_probe = RetryProbe{};
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try init_settling_s3(server.socket.address.getPort(), &send_workspace, .{ .context = &retry_probe, .next_delay_ms_fn = RetryProbe.next, .sleep_ms_fn = RetryProbe.sleep, .max_attempts = 3 });
+    defer s3.deinit();
+    try publish_small(&s3);
+    try end_server(&server_task);
+    try std.testing.expectEqual(@as(u32, 1), retry_probe.calls);
+    try std.testing.expectEqualStrings(settled_payload, seen[0].bodyText());
+    try expect_same_put(seen[0], seen[1]);
+    try std.testing.expect(s3.unsettled_publication() == null);
+    try std.testing.expectEqual(ltx_s3.Settlement.none, try s3.settle());
+}
+
+test "scripted resends that run out leave the put unsettled" {
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const busy = error_answer(.service_unavailable, "SlowDown");
+    const script = [_]Scripted{ .drop, busy, busy };
+    var connections: [3]u32 = @splat(0);
+    var seen: [3]Seen = @splat(.{});
+    var server_task = std.testing.io.async(serve_script_seen, .{ &server, &script, &connections, &seen });
+    defer _ = server_task.cancel(std.testing.io) catch {};
+    var retry_probe = RetryProbe{};
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try init_settling_s3(server.socket.address.getPort(), &send_workspace, .{ .context = &retry_probe, .next_delay_ms_fn = RetryProbe.next, .sleep_ms_fn = RetryProbe.sleep, .max_attempts = 3 });
+    defer s3.deinit();
+    try std.testing.expectError(error.PublicationIndeterminate, publish_small(&s3));
+    try end_server(&server_task);
+    try std.testing.expectEqual(@as(u32, 2), retry_probe.calls);
+    try expect_same_put(seen[0], seen[1]);
+    try expect_same_put(seen[0], seen[2]);
+    try expect_unsettled_put(&s3);
+}
+
+test "scripted lost answer followed by a refused connect is unsettled" {
+    // Attempt 1 may have landed; the store then refuses connects until the
+    // policy stops. A refused connect sent nothing, but says nothing of
+    // attempt 1 either.
+    var deafen: Deafen = .{};
+    try deafen.start(&.{.drop});
+    defer deafen.deinit();
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try init_settling_s3(deafen.server.socket.address.getPort(), &send_workspace, deafen.policy(4));
+    defer s3.deinit();
+    try std.testing.expectError(error.PublicationIndeterminate, publish_small(&s3));
+    try std.testing.expect(!deafen.listening);
+    try std.testing.expectEqual(@as(u32, 3), deafen.calls);
+    try std.testing.expectEqualStrings(settled_payload, deafen.seen[0].bodyText());
+    try expect_unsettled_put(&s3);
+}
+
+test "scripted lost answer followed by a 403 is unsettled" {
+    // The 403 refuses attempt 2 only; attempt 1 may still land.
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const script = [_]Scripted{ .drop, error_answer(.forbidden, "AccessDenied") };
+    var connections: [2]u32 = @splat(0);
+    var server_task = std.testing.io.async(serve_script, .{ &server, &script, &connections });
+    defer _ = server_task.cancel(std.testing.io) catch {};
+    var retry_probe = RetryProbe{};
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try init_settling_s3(server.socket.address.getPort(), &send_workspace, .{ .context = &retry_probe, .next_delay_ms_fn = RetryProbe.next, .sleep_ms_fn = RetryProbe.sleep, .max_attempts = 5 });
+    defer s3.deinit();
+    try std.testing.expectError(error.PublicationIndeterminate, publish_small(&s3));
+    try end_server(&server_task);
+    try std.testing.expectEqual(@as(u32, 1), retry_probe.calls);
+    try expect_unsettled_put(&s3);
+}
+
+test "scripted unsettled put blocks writes and deletes but not reads, and settle resends it" {
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const busy = error_answer(.service_unavailable, "SlowDown");
+    const script = [_]Scripted{
+        .drop,
+        busy,
+        not_found_answer,
+        .{ .answer = .{ .status = .partial_content, .body = "abc", .headers = &valid_range_headers } },
+        busy,
+        busy,
+        .{ .answer = .{ .status = .ok } },
+    };
+    var connections: [8]u32 = @splat(0);
+    var seen: [7]Seen = @splat(.{});
+    var server_task = std.testing.io.async(serve_script_seen, .{ &server, &script, &connections, &seen });
+    defer _ = server_task.cancel(std.testing.io) catch {};
+    var retry_probe = RetryProbe{};
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try init_settling_s3(server.socket.address.getPort(), &send_workspace, .{ .context = &retry_probe, .next_delay_ms_fn = RetryProbe.next, .sleep_ms_fn = RetryProbe.sleep, .max_attempts = 2 });
+    defer s3.deinit();
+    try std.testing.expectError(error.PublicationIndeterminate, publish_small(&s3));
+    try expect_unsettled_put(&s3);
+
+    // Every write and delete is refused, and sends nothing; an upload the
+    // client would keep reads as unsettled, never as misuse.
+    const client = s3.client();
+    const other: ltx.FileIdentity = .{ .min_txid = .init(72), .max_txid = .init(72) };
+    try std.testing.expectError(error.PublicationUnsettled, client.write(0, other, 1, "other"));
+    try std.testing.expectError(error.PublicationUnsettled, client.begin_write(0, other, 1));
+    try std.testing.expectError(error.PublicationUnsettled, client.delete(&.{object_info(other, 1)}));
+    try std.testing.expectError(error.PublicationUnsettled, s3.put_if_absent(0, other, 1, "claim"));
+    try std.testing.expectError(error.PublicationUnsettled, s3.put_if_match(0, other, 1, "claim", "\"etag\""));
+    try std.testing.expectError(error.PublicationUnsettled, s3.begin_multipart(0, other, 1));
+    try std.testing.expectError(error.PublicationUnsettled, s3.put_part(1, "part"));
+    try std.testing.expectError(error.PublicationUnsettled, s3.complete_multipart());
+    try std.testing.expectError(error.PublicationUnsettled, s3.abort_multipart());
+    // Reads go on.
+    try std.testing.expectError(error.ObjectNotFound, s3.object_etag(0, other));
+    var destination: [3]u8 = undefined;
+    _ = try client.read_range(object_info(other, 6), 0, &destination);
+    try std.testing.expectEqualStrings("abc", &destination);
+
+    // The first settle's resends meet 503s until the policy stops: still
+    // unsettled. The next sends the same bytes again and is answered:
+    // landed.
+    try std.testing.expectError(error.PublicationIndeterminate, s3.settle());
+    try expect_unsettled_put(&s3);
+    try std.testing.expectEqual(ltx_s3.Settlement.landed, try s3.settle());
+    try end_server(&server_task);
+    for (seen[4..7]) |again| try expect_same_put(seen[0], again);
+    try std.testing.expect(s3.unsettled_publication() == null);
+    var session = try client.begin_write(0, other, 2);
+    session.abort();
+}
+
+// A part ETag that is an MD5 (of "a"), and the ETag a store gives the
+// object one such part completes: the MD5 of that MD5, then `-1`.
+const md5_part_headers = [_]std.http.Header{.{ .name = "etag", .value = "\"0cc175b9c0f1b6a831c399e269772661\"" }};
+const md5_upload_headers = [_]std.http.Header{.{ .name = "etag", .value = "\"b6ff9a06b7e20bcb2858c5b8ff744aea-1\"" }};
+const md5_part_one_success = ScriptedMultipartRequest{
+    .method = .PUT,
+    .target = scripted_part_one_target,
+    .action = .{ .respond = .{ .status = .ok, .headers = &md5_part_headers } },
+};
+const no_such_upload_completion = ScriptedMultipartRequest{
+    .method = .POST,
+    .target = scripted_upload_target,
+    .action = .{ .respond = .{ .status = .not_found, .body = "<Error><Code>NoSuchUpload</Code><Message>scripted</Message></Error>" } },
+};
+const head_absent = ScriptedMultipartRequest{
+    .method = .HEAD,
+    .target = scripted_multipart_key,
+    .action = .{ .respond = .{ .status = .not_found } },
+};
+
+/// A HEAD of the scripted key answered with `headers` and a length of 4
+/// bytes, the one part "tail".
+fn head_with(comptime headers: []const std.http.Header) ScriptedMultipartRequest {
+    return .{ .method = .HEAD, .target = scripted_multipart_key, .action = .{ .respond = .{ .status = .ok, .headers = headers, .body = "tail" } } };
+}
+
+/// `serve_scripted_multipart_requests` on a loopback port. A settling
+/// client keeps an upload a failed test left, and its `deinit` aborts it:
+/// `end` stops the server and closes its listener first, so that request
+/// is refused at once instead of waiting in the listen backlog for good.
+const MultipartScript = struct {
+    server: std.Io.net.Server = undefined,
+    task: std.Io.Future(anyerror!void) = undefined,
+    open: bool = false,
+
+    fn start(self: *MultipartScript, requests: []const ScriptedMultipartRequest) !void {
+        var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        self.server = try address.listen(std.testing.io, .{});
+        self.open = true;
+        self.task = std.testing.io.async(serve, .{ &self.server, requests });
+    }
+
+    fn serve(server: *std.Io.net.Server, requests: []const ScriptedMultipartRequest) anyerror!void {
+        return serve_scripted_multipart_requests(server, requests);
+    }
+
+    fn port(self: *const MultipartScript) u16 {
+        return self.server.socket.address.getPort();
+    }
+
+    fn end(self: *MultipartScript) void {
+        if (!self.open) return;
+        _ = self.task.cancel(std.testing.io) catch {};
+        self.server.deinit(std.testing.io);
+        self.open = false;
+    }
+};
+
+fn expect_completion_settled_by_head(comptime part: ScriptedMultipartRequest, comptime head: ScriptedMultipartRequest) !void {
+    // The first completion is done, and its answer lost; the second finds
+    // no upload, and the HEAD finds this upload's object.
+    const requests = [_]ScriptedMultipartRequest{
+        scripted_begin_success,
+        part,
+        .{ .method = .POST, .target = scripted_upload_target, .action = .drop_after_body },
+        no_such_upload_completion,
+        head,
+    };
+    var script: MultipartScript = .{};
+    try script.start(&requests);
+    defer script.end();
+    var retry_probe = RetryProbe{};
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try init_settling_s3(script.port(), &send_workspace, .{ .context = &retry_probe, .next_delay_ms_fn = RetryProbe.next, .sleep_ms_fn = RetryProbe.sleep, .max_attempts = 3 });
+    defer s3.deinit();
+    defer script.end();
+    try s3.begin_multipart(0, scripted_multipart_identity, 10_500);
+    try s3.put_part(1, "tail");
+    try s3.complete_multipart();
+    try script.task.await(std.testing.io);
+    try std.testing.expectEqual(@as(u32, 1), retry_probe.calls);
+    try std.testing.expect(s3.multipart == null);
+    try std.testing.expect(s3.unsettled_publication() == null);
+}
+
+test "scripted lost multipart completion is resent, and NoSuchUpload with a matching HEAD ETag is success" {
+    try expect_completion_settled_by_head(md5_part_one_success, head_with(&md5_upload_headers));
+    // A part ETag that is not an MD5 (KMS): the part count and the length.
+    try expect_completion_settled_by_head(scripted_part_one_success, head_with(&.{.{ .name = "etag", .value = "\"kms-object-1\"" }}));
+}
+
+test "scripted settle aborts an unsettled multipart upload and HEADs its key" {
+    const requests = [_]ScriptedMultipartRequest{
+        scripted_begin_success,
+        md5_part_one_success,
+        // The completion: lost, then 503 until the policy stops; the HEAD
+        // finds nothing yet.
+        .{ .method = .POST, .target = scripted_upload_target, .action = .drop_after_body },
+        .{ .method = .POST, .target = scripted_upload_target, .action = .{ .respond = .{ .status = .service_unavailable } } },
+        head_absent,
+        // `settle`: the completion again finds no upload, and neither does
+        // a HEAD; the abort, then the HEAD that decides.
+        no_such_upload_completion,
+        head_absent,
+        .{ .method = .DELETE, .target = scripted_upload_target, .action = .{ .respond = .{ .status = .no_content } } },
+        head_absent,
+    };
+    var script: MultipartScript = .{};
+    try script.start(&requests);
+    defer script.end();
+    var retry_probe = RetryProbe{};
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try init_settling_s3(script.port(), &send_workspace, .{ .context = &retry_probe, .next_delay_ms_fn = RetryProbe.next, .sleep_ms_fn = RetryProbe.sleep, .max_attempts = 2 });
+    defer s3.deinit();
+    defer script.end();
+    try s3.begin_multipart(0, scripted_multipart_identity, 10_600);
+    try s3.put_part(1, "tail");
+    try std.testing.expectError(error.PublicationIndeterminate, s3.complete_multipart());
+    const upload = s3.unsettled_publication().?.multipart;
+    try std.testing.expect(upload.complete_sent);
+    try std.testing.expectEqual(scripted_multipart_identity, upload.identity);
+    try std.testing.expect(s3.multipart != null);
+    try std.testing.expectError(error.PublicationUnsettled, s3.client().begin_write(0, scripted_multipart_identity, 10_601));
+    try std.testing.expectError(error.PublicationUnsettled, s3.abort_multipart());
+
+    try std.testing.expectEqual(ltx_s3.Settlement.cancelled, try s3.settle());
+    try script.task.await(std.testing.io);
+    try std.testing.expect(s3.multipart == null);
+    try std.testing.expect(s3.unsettled_publication() == null);
+    var session = try s3.client().begin_write(0, scripted_multipart_identity, 10_602);
+    session.abort();
+}
+
+test "scripted failed part whose abort fails leaves the upload unsettled, and settle aborts it" {
+    // The retained-upload wedge: without settlement the client refused
+    // every later write and delete with InvalidState for good.
+    @memset(&multipart_a, 0x9d);
+    @memset(&multipart_tail, 0xd9);
+    const failed = ScriptedMultipartAction{ .respond = .{ .status = .internal_server_error } };
+    const requests = [_]ScriptedMultipartRequest{
+        scripted_begin_success,
+        .{ .method = .PUT, .target = scripted_part_one_target, .action = failed },
+        .{ .method = .DELETE, .target = scripted_upload_target, .action = failed },
+        scripted_abort_clean,
+    };
+    var script: MultipartScript = .{};
+    try script.start(&requests);
+    defer script.end();
+    var s3 = try init_settling_s3(script.port(), &automatic_send_workspace, null);
+    defer s3.deinit();
+    defer script.end();
+    var session = try s3.client().begin_write(0, scripted_multipart_identity, 10_700);
+    try session.writer().write_all(&multipart_a);
+    try std.testing.expectError(error.OutputFailure, session.writer().write_all(&multipart_tail));
+    try std.testing.expectEqual(ltx_object.WriteSessionState.failed, session.current_state());
+    const upload = s3.unsettled_publication().?.multipart;
+    try std.testing.expect(!upload.complete_sent);
+    try std.testing.expect(s3.multipart != null);
+    try std.testing.expectError(error.PublicationUnsettled, s3.client().begin_write(0, scripted_multipart_identity, 10_701));
+    try std.testing.expectError(error.PublicationUnsettled, s3.client().delete(&.{object_info(scripted_multipart_identity, 1)}));
+
+    // No completion was sent, so nothing can land: the abort settles it.
+    try std.testing.expectEqual(ltx_s3.Settlement.cancelled, try s3.settle());
+    try script.task.await(std.testing.io);
+    try std.testing.expect(s3.multipart == null);
+    var replacement = try s3.client().begin_write(0, scripted_multipart_identity, 10_702);
+    replacement.abort();
+}
+
+test "scripted lost initiation is retried and leaves one orphan" {
+    const requests = [_]ScriptedMultipartRequest{
+        .{ .method = .POST, .target = scripted_initiation_target, .action = .drop_after_body },
+        scripted_begin_success,
+        scripted_abort_clean,
+    };
+    var script: MultipartScript = .{};
+    try script.start(&requests);
+    defer script.end();
+    var retry_probe = RetryProbe{};
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try init_settling_s3(script.port(), &send_workspace, .{ .context = &retry_probe, .next_delay_ms_fn = RetryProbe.next, .sleep_ms_fn = RetryProbe.sleep, .max_attempts = 3 });
+    defer s3.deinit();
+    defer script.end();
+    // The first initiation may have made an upload whose id never came
+    // back: nothing completes it. The client holds the second's.
+    try s3.begin_multipart(0, scripted_multipart_identity, 10_800);
+    try std.testing.expectEqual(@as(u32, 1), retry_probe.calls);
+    const state = s3.multipart.?;
+    try std.testing.expectEqualStrings(scripted_upload_id, state.upload_id[0..state.upload_id_bytes]);
+    try s3.abort_multipart();
+    try script.task.await(std.testing.io);
+    try std.testing.expect(s3.unsettled_publication() == null);
 }
 
 /// One page a scripted listing server answers: the continuation token the
@@ -2307,6 +2760,57 @@ test "multipart upload streams parts into one readable object" {
         .max_txid = identity.max_txid,
         .size_bytes = 0,
     }});
+}
+
+test "a completed upload's repeat completion is NoSuchUpload and its HEAD matches the computed ETag" {
+    // What `settle` meets after a completion whose answer was lost landed:
+    // the store no longer knows the upload, and the object at the key has
+    // the ETag the client computes from its parts.
+    @memset(&multipart_a, 0x4b);
+    @memset(&multipart_tail, 0xb4);
+    var probe: ObserverProbe = .{};
+    var s3 = try ltx_s3.S3Client.init(std.testing.allocator, std.testing.io, .{
+        .host = minio_host,
+        .port = minio_port,
+        .bucket = "ltx-gate",
+        .access_key = minio_root_user,
+        .secret_key = minio_root_password,
+        .prefix = "replica",
+        .clock = .{ .context = &plain_clock_context, .now_ms_fn = TestClock.now_ms },
+        .observer = probe.observer(),
+        .single_writer_publication = true,
+    }, &plain_send_workspace);
+    defer s3.deinit();
+    try s3.ensure_bucket();
+    const identity: ltx.FileIdentity = .{ .min_txid = .init(61), .max_txid = .init(62) };
+    try delete_identity(s3.client(), identity);
+    defer delete_identity(s3.client(), identity) catch {};
+    probe = .{};
+    try s3.begin_multipart(0, identity, 6100);
+    try s3.put_part(1, &multipart_a);
+    try s3.put_part(2, &multipart_tail);
+    var sent = s3.multipart.?;
+    const owner = s3.multipart_owner;
+    try s3.complete_multipart();
+    try std.testing.expect(s3.multipart == null);
+
+    // Hold the upload again as if the completion's answer had been lost.
+    sent.complete_sent = true;
+    s3.multipart = sent;
+    s3.multipart_owner = owner;
+    s3.unsettled = .{ .multipart = .{ .level = 0, .identity = identity, .complete_sent = true } };
+    try std.testing.expectEqual(ltx_s3.Settlement.landed, try s3.settle());
+    try std.testing.expect(s3.multipart == null);
+    try std.testing.expect(s3.unsettled_publication() == null);
+    // Begin, two parts, the completion, the repeat, the HEAD.
+    try std.testing.expectEqual(@as(usize, 6), probe.ended);
+    const repeat = probe.seen[4];
+    try std.testing.expectEqual(std.http.Method.POST, repeat.method);
+    try std.testing.expectEqual(@as(u16, 404), repeat.status);
+    try std.testing.expectEqualStrings("NoSuchUpload", repeat.code());
+    const head = probe.seen[5];
+    try std.testing.expectEqual(std.http.Method.HEAD, head.method);
+    try std.testing.expectEqual(@as(u16, 200), head.status);
 }
 
 test "failed multipart abort preserves cleanup state and blocks writes" {

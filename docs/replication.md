@@ -46,6 +46,11 @@ explicit limits, workspaces, and timestamps. Consult
   discarding its source. In particular, loss of the S3
   `CompleteMultipartUpload` acknowledgement can mean that the object is
   already visible even though the client did not receive the success body.
+  An S3 host that alone writes its LTX keys can let the client settle its
+  own publications (`Config.single_writer_publication`): a write session's
+  PUT or completion whose answer was lost is sent again with the same bytes,
+  and one that stays indeterminate blocks every write and delete of that
+  client with `PublicationUnsettled` until `S3Client.settle` resolves it.
 - Restore and compaction consume each listed object through a caller-owned
   sequential read window. The first successful range returns one bounded,
   opaque generation receipt; every later refill is conditioned on that receipt
@@ -69,7 +74,11 @@ explicit limits, workspaces, and timestamps. Consult
   decision. Conditional PUTs are attempted once and report
   `PublicationIndeterminate` when delivery fails after sending begins. A
   `RetryPolicy` covers transient transport failures and retryable statuses only
-  on unambiguous idempotent requests.
+  on unambiguous idempotent requests. To reconcile a conditional PUT, read the
+  object back: equal bytes mean it landed; for `put_if_match`, the expected
+  generation still stored means it did not, and a retry with the same
+  expected ETag is safe (a late landing of the first attempt succeeds only
+  while that ETag is still stored, and writes the same bytes).
 - Checkpoint policy: configure any combination of
   `checkpoint_threshold_bytes`, `checkpoint_interval_ms`, and
   `checkpoint_max_frames`, or call `Session.checkpoint_passive` explicitly.
@@ -210,7 +219,13 @@ and kept in `last_accepted_operation`, and the controller stays ready: sync
 continues, and the next `maintain` reconciles what the failed call left.
 Every other failure still poisons the controller. `PublicationIndeterminate`
 poisons because the compaction output can still land, and a later call could
-write an output that overlaps it at another key. `ObjectChanged` poisons
+write an output that overlaps it at another key. With
+`Config.publications_settled`, for an object client that settles its own
+publications before it writes anything else (`ltx_s3` under
+`single_writer_publication`), `PublicationIndeterminate` and
+`PublicationUnsettled` leave the controller ready too: every write fails
+until the host settles the output, so no later call can publish one that
+overlaps it. The host settles it before the next sync or maintenance. `ObjectChanged` poisons
 because, with one writer, an object changes only if other bytes were written
 at its key. Decode and identity failures poison as before. While maintenance
 fails, level 0 gains one file per published sync. The host must bound how
@@ -235,7 +250,14 @@ upload or a published object. The write session is poisoned and performs a
 best-effort abort; a missing upload is already clean, while a failed abort
 retains cleanup state and blocks new writes until an explicit cleanup retry
 succeeds. The host must inspect the exact object identity and validate its LTX
-contents before advancing durable position or deleting source objects.
+contents before advancing durable position or deleting source objects. Under
+`single_writer_publication` the client does this itself: the completion is
+sent again with the same body, and when the store no longer knows the upload
+(404 `NoSuchUpload`) a HEAD decides whether the key holds this upload's
+object (the ETag computed from the part ETags, and the parts' total length).
+An upload whose completion stays indeterminate, or whose abort failed, stays
+unsettled; `settle` sends the completion again, or aborts the upload and
+HEADs the key.
 
 ## Consumer lifecycle
 
@@ -313,11 +335,15 @@ rather than replace the 512 MiB series above.
   its XML expansion remain inside the fixed 64 KiB response workspace, and
   `Config.max_listing_pages` bounds total remote pagination even when foreign
   keys are ignored. Failed multipart aborts retain their upload identity and
-  block new writes until an explicit cleanup retry or `deinit` succeeds. If
+  block new writes until an explicit cleanup retry or `deinit` succeeds (under
+  `single_writer_publication`: until `settle` succeeds). If
   multipart initiation reaches the store but its acknowledgement is lost, the
   client never receives an upload ID and therefore has no local cleanup handle;
   deployments must bound those unknown incomplete uploads with store-side
-  lifecycle cleanup.
+  lifecycle cleanup. Under `single_writer_publication` such an initiation is
+  sent again, so each lost one leaves one such upload. Settlement holds only
+  within one client: a publication left unsettled when the process exits can
+  still land after a new client wrote other bytes at its key.
 - `ltx_object.ObjectReader` binds the first nonempty range to an adapter-defined
   `ReadGeneration` receipt and poisons on any later mismatch. Receipts are
   fixed at 128 bytes and are independent for interleaved readers; one-shot

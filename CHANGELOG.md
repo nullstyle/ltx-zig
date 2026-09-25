@@ -37,6 +37,23 @@ version is zero, the Zig source API is intentionally unstable.
   request sent into it fails. `is_transient_status(status, s3_code)` is
   the client's rule for a status that may pass, for hosts that classify
   alike.
+- `ltx_s3`: `Config.single_writer_publication`, for a host that alone writes
+  its LTX keys. A write session's PUT and its multipart completion are sent
+  again with the same bytes after a lost answer or a transient status (a
+  resend answered 2xx ends it well), and a multipart initiation is sent
+  again after a lost answer. A publication whose outcome is still not
+  known, and an upload whose abort failed, leave the client unsettled
+  (`unsettled_publication`, `Unsettled`): every write and delete returns
+  the new `ltx_object` error `PublicationUnsettled` (before `InvalidState`)
+  until `settle` resolves it (`Settlement`: `landed` or `cancelled`) by the
+  same bytes again, the completion again, or an abort and a HEAD of the key.
+  A completion that the store answers 404 `NoSuchUpload` after an earlier
+  one may have landed is decided by a HEAD: the ETag computed from the part
+  ETags and the parts' length. Without the option nothing changes.
+- `Config.publications_settled` keeps a controller ready under
+  `keep_ready_on_storage` after a compaction output ends
+  `PublicationIndeterminate` or `PublicationUnsettled`, for an object client
+  that settles its publications before it writes anything else.
 
 ### Fixed
 

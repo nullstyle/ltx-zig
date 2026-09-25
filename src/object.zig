@@ -39,6 +39,10 @@ pub const Error = error{
     /// Publication crossed the adapter's commit point, but the adapter could
     /// not confirm the durable result. The caller must reconcile the object.
     PublicationIndeterminate,
+    /// An adapter that settles its own publications (S3 under
+    /// `single_writer_publication`) still holds one whose outcome it does
+    /// not know: it writes and deletes nothing until the host settles it.
+    PublicationUnsettled,
     ListingCapacityExceeded,
     ListingPageLimitExceeded,
     PathTooLong,

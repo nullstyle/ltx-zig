@@ -1888,6 +1888,54 @@ test "an opted-in controller still poisons on an indeterminate compaction output
     try std.testing.expectEqual(@as(u64, 2), landed[0].max_txid.value);
 }
 
+fn run_unsettled_output(cause: object.Error, lands: bool) !void {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    var fault = MaintenanceFaultClient{
+        .backing = store.client(),
+        .output_fault = cause,
+        .output_lands = lands,
+    };
+    const storage = try std.testing.allocator.create(TestResources);
+    defer std.testing.allocator.destroy(storage);
+    var resources = storage.bind();
+    var value = kept_ready_options(&temporary, fault.client(), .keep_ready_on_storage);
+    value.config.publications_settled = true;
+    var controller = try replication.Controller.init(value, &resources);
+    defer controller.finish();
+    try create_table(&temporary);
+    try publish_row(&controller, &temporary, 1);
+    try publish_row(&controller, &temporary, 2);
+    const failed_position = try controller.position();
+    try std.testing.expectError(cause, controller.maintain(1));
+    try expect_kept_ready(&controller, failed_position, cause);
+
+    // The client settled it: the output landed, and the next call deletes
+    // the sources it covers, or it did not, and the next call compacts.
+    fault.disarm();
+    try publish_row(&controller, &temporary, 3);
+    if (lands) {
+        switch (try controller.maintain(1)) {
+            .reconciled => |report| try std.testing.expectEqual(@as(u64, 2), report.deleted_file_count),
+            else => return error.TestExpectedReconciliation,
+        }
+    }
+    try std.testing.expect((try controller.maintain(1)) == .compacted);
+    const empty = try expect_level(store.client(), 0, 0);
+    defer free_level(empty);
+    const upper = try expect_level(store.client(), 1, if (lands) 2 else 1);
+    defer free_level(upper);
+    try std.testing.expectEqual(@as(u64, 3), upper[upper.len - 1].max_txid.value);
+}
+
+test "a controller whose client settles its publications stays ready after an unsettled compaction output" {
+    // The output may still land, but the client writes nothing else until
+    // it is settled, so no later output can overlap it.
+    try run_unsettled_output(error.PublicationIndeterminate, true);
+    try run_unsettled_output(error.PublicationUnsettled, false);
+}
+
 test "invalid calls stay ready and processing failures poison until finish" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();

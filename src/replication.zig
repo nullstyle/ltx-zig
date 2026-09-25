@@ -51,9 +51,10 @@ pub const MaintenanceFailures = enum {
     poison,
     /// A failure of the object store itself (`StorageFailure`,
     /// `ObjectNotFound`, `GenerationUnavailable`) leaves the controller
-    /// ready; every other failure poisons it. No maintenance state outlives
-    /// a call: the next call lists every level again and reconciles what
-    /// the failed one left, exactly as a fresh controller would.
+    /// ready; every other failure poisons it (but see
+    /// `Config.publications_settled`). No maintenance state outlives a
+    /// call: the next call lists every level again and reconciles what the
+    /// failed one left, exactly as a fresh controller would.
     keep_ready_on_storage,
 };
 
@@ -73,6 +74,15 @@ pub const Config = struct {
     checkpoint_interval_ms: u64 = 0,
     checkpoint_max_frames: u32 = 0,
     maintenance_failures: MaintenanceFailures = .poison,
+    /// The object client settles a publication whose outcome it does not
+    /// know before it writes anything else (`ltx_s3`'s
+    /// `single_writer_publication`). Under `keep_ready_on_storage`, a
+    /// compaction output that ends `PublicationIndeterminate`, and a write
+    /// refused while one is unsettled (`PublicationUnsettled`), then leave
+    /// the controller ready too: the next call cannot publish an output
+    /// that overlaps an unsettled one, because every write fails until the
+    /// host settles it.
+    publications_settled: bool = false,
 };
 
 const max_compaction_levels = @as(usize, ltx.snapshot_level);
@@ -91,6 +101,7 @@ const StableConfig = struct {
     checkpoint_interval_ms: u64,
     checkpoint_max_frames: u32,
     maintenance_failures: MaintenanceFailures,
+    publications_settled: bool,
 
     fn copy(config: Config) StableConfig {
         var stable = StableConfig{
@@ -107,6 +118,7 @@ const StableConfig = struct {
             .checkpoint_interval_ms = config.checkpoint_interval_ms,
             .checkpoint_max_frames = config.checkpoint_max_frames,
             .maintenance_failures = config.maintenance_failures,
+            .publications_settled = config.publications_settled,
         };
         @memcpy(stable.levels[0..config.levels.levels.len], config.levels.levels);
         return stable;
@@ -1348,6 +1360,9 @@ pub const Controller = struct {
                 error.ObjectNotFound,
                 error.GenerationUnavailable,
                 => .ready,
+                error.PublicationIndeterminate,
+                error.PublicationUnsettled,
+                => if (self.config.publications_settled) .ready else .poisoned,
                 else => .poisoned,
             },
         };

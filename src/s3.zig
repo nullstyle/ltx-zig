@@ -24,7 +24,11 @@
 //! can hide either a committed or rejected write. Conditional methods and
 //! transactional publication, including multipart completion, surface
 //! `PublicationIndeterminate`, so the host must reconcile the object identity
-//! before it advances a durable position or discards source objects.
+//! before it advances a durable position or discards source objects. A host
+//! that alone writes its LTX keys can let the client do that for write
+//! sessions (`Config.single_writer_publication`): a publication is sent again
+//! with the same bytes, and one whose outcome is still not known blocks every
+//! write and delete until `settle` resolves it.
 //!
 //! The gate for this backend is `mise run s3-integration`, which starts a
 //! local MinIO server and runs the backend-agnostic conformance suite
@@ -68,7 +72,10 @@ pub const RetryCause = union(enum) {
 /// after a transient 4xx, where the store stored nothing; POST and
 /// transactional publication never once sent: a lost answer or a 5xx may
 /// hide a write, and the request ends `PublicationIndeterminate`, whatever
-/// a later attempt found. Delay selection and sleeping are both injected so
+/// a later attempt found. Under `Config.single_writer_publication` a write
+/// session's publication is sent again with the same bytes (and ends well
+/// once one is answered 2xx), and a multipart initiation is sent again.
+/// Delay selection and sleeping are both injected so
 /// the module never reads an ambient clock; hosts encode jitter, caps,
 /// cancellation, and the actual wait in these callbacks.
 pub const RetryPolicy = struct {
@@ -224,6 +231,42 @@ pub const Config = struct {
     max_idle_reuse_ms: u64 = 0,
     /// Optional observer of every request attempt.
     observer: ?Observer = null,
+    /// This client alone writes the keys its write sessions publish, so a
+    /// publication may be sent again with the same bytes: a write
+    /// session's PUT and its multipart completion are retried under the
+    /// policy after a lost answer or a transient status, and a multipart
+    /// initiation is retried (a lost one leaves an upload nothing
+    /// completes). A publication whose outcome is still not known, and an
+    /// upload whose abort failed, leave the client unsettled
+    /// (`unsettled_publication`): every write and delete then returns
+    /// `PublicationUnsettled`, so no other bytes and no overlapping object
+    /// are written while an earlier attempt could still land, until
+    /// `settle` resolves it. Reads and listings go on.
+    single_writer_publication: bool = false,
+};
+
+/// A publication whose outcome is not known, or an upload that may still be
+/// open, under `Config.single_writer_publication`.
+pub const Unsettled = union(enum) {
+    /// A write session's single PUT that was sent and got no definite
+    /// answer. Its bytes stay in the send workspace for `settle`.
+    single_put: struct { level: u8, identity: ltx.FileIdentity, created_at_ms: i64, length_bytes: usize },
+    /// A multipart upload whose abort failed, or whose completion was sent
+    /// and may have landed (`complete_sent`). The upload stays in
+    /// `S3Client.multipart` for `settle`.
+    multipart: struct { level: u8, identity: ltx.FileIdentity, complete_sent: bool },
+};
+
+/// How `settle` resolved an unsettled publication.
+pub const Settlement = enum {
+    /// Nothing was unsettled.
+    none,
+    /// The key holds exactly the publication's bytes; an earlier attempt
+    /// that lands late writes them again.
+    landed,
+    /// The upload was aborted and nothing of it is at the key; nothing of
+    /// it can land any more.
+    cancelled,
 };
 
 /// One in-flight multipart upload. A client tracks a single upload at a
@@ -240,6 +283,10 @@ pub const MultipartState = struct {
     etag_lengths: [max_multipart_parts]u8 = @splat(0),
     etags: [max_multipart_parts][64]u8 = @splat(@splat(0)),
     part_sizes: [max_multipart_parts]u64 = @splat(0),
+    /// A completion was sent and may have landed.
+    complete_sent: bool = false,
+    /// An abort was answered: no completion can land any more.
+    aborted: bool = false,
 };
 
 pub const max_multipart_parts = 512;
@@ -314,6 +361,9 @@ pub const S3Client = struct {
     /// string); empty when it did, or the request failed otherwise. Reset
     /// by every request.
     last_parse_failure: []const u8 = "",
+    /// Under `Config.single_writer_publication`: a publication `settle`
+    /// must resolve before anything else is written.
+    unsettled: ?Unsettled = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -555,6 +605,7 @@ pub const S3Client = struct {
         bytes: []const u8,
     ) Error!void {
         const self: *S3Client = @ptrCast(@alignCast(context));
+        try self.check_settled();
         if (self.has_active_write()) return error.InvalidState;
         if (bytes.len > self.send_workspace.len) return error.ObjectTooLarge;
         const key = try self.key_path(level, identity);
@@ -578,6 +629,7 @@ pub const S3Client = struct {
         created_at_ms: i64,
     ) Error!object.WriteSession {
         const self: *S3Client = @ptrCast(@alignCast(context));
+        try self.check_settled();
         if (self.has_active_write()) return error.InvalidState;
         self.write_session = .{
             .level = level,
@@ -678,12 +730,17 @@ pub const S3Client = struct {
         self.write_session = null;
     }
 
+    /// A write session's object in one PUT. Under
+    /// `single_writer_publication` it is sent again with the same bytes, and
+    /// one that stays indeterminate leaves the client unsettled with its
+    /// bytes kept in the send workspace.
     fn finish_single_put(
         self: *S3Client,
         state: *const StreamingWriteState,
     ) Error!void {
         const key = try self.key_path(state.level, state.identity);
-        const outcome = try self.perform(
+        const settles = self.config.single_writer_publication;
+        const outcome = self.perform(
             .PUT,
             key,
             "",
@@ -691,17 +748,31 @@ pub const S3Client = struct {
                 .payload = self.send_workspace[0..state.buffered_bytes],
                 .metadata_ms = state.created_at_ms,
                 .publication = .indeterminate_after_send,
+                .replay = if (settles) .same_bytes else .none,
             },
-        );
+        ) catch |err| {
+            if (settles and err == error.PublicationIndeterminate) {
+                self.unsettled = .{ .single_put = .{
+                    .level = state.level,
+                    .identity = state.identity,
+                    .created_at_ms = state.created_at_ms,
+                    .length_bytes = state.buffered_bytes,
+                } };
+            }
+            return err;
+        };
         // A 5xx or a lost answer is `PublicationIndeterminate` from
         // `perform`; any other status is the store's refusal.
-        if (outcome.status != .ok) return error.StorageFailure;
+        if (outcome.status.class() != .success) return error.StorageFailure;
     }
 
     fn abort_write_session(context: *anyopaque) void {
         const self: *S3Client = @ptrCast(@alignCast(context));
         if (self.write_session == null) return;
         if (self.multipart_owner == .write_session) {
+            // Under `single_writer_publication` a failed abort leaves the
+            // client unsettled; otherwise the upload is kept for an
+            // explicit cleanup retry.
             self.abort_multipart_owned(.write_session) catch {};
         }
         self.write_session = null;
@@ -709,6 +780,85 @@ pub const S3Client = struct {
 
     fn has_active_write(self: *const S3Client) bool {
         return self.write_session != null or self.multipart != null;
+    }
+
+    /// Every write and delete first: nothing is written while a
+    /// publication is unsettled. Before `has_active_write`, so an upload
+    /// kept for its settlement reads as unsettled, not as a caller's
+    /// misuse.
+    fn check_settled(self: *const S3Client) Error!void {
+        if (self.unsettled != null) return error.PublicationUnsettled;
+    }
+
+    /// The publication `settle` must resolve before anything else is
+    /// written; null when there is none.
+    pub fn unsettled_publication(self: *const S3Client) ?Unsettled {
+        return self.unsettled;
+    }
+
+    /// Resolves an unsettled publication (`Config.single_writer_publication`)
+    /// with requests retried under the policy:
+    /// - a single PUT is sent again with the same bytes until one is
+    ///   answered 2xx (`landed`);
+    /// - an upload whose completion was sent gets the completion again
+    ///   (`landed` when it lands); otherwise the upload is aborted (204 and
+    ///   404 are clean), and when a completion was sent a HEAD of the key
+    ///   says whether it landed first (`landed`) or not (`cancelled`);
+    /// - an upload no completion was sent for is aborted (`cancelled`).
+    /// A failure returns its error and leaves the publication unsettled
+    /// (`PublicationIndeterminate` when a resend may have landed); calling
+    /// again continues. Settled, the client writes again.
+    pub fn settle(self: *S3Client) ConditionalWriteError!Settlement {
+        const unsettled = self.unsettled orelse return .none;
+        const settlement: Settlement = switch (unsettled) {
+            .single_put => |put| try self.resend_single_put(put.level, put.identity, put.created_at_ms, put.length_bytes),
+            .multipart => try self.settle_upload(),
+        };
+        self.unsettled = null;
+        return settlement;
+    }
+
+    fn resend_single_put(
+        self: *S3Client,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+        length_bytes: usize,
+    ) ConditionalWriteError!Settlement {
+        const key = try self.key_path(level, identity);
+        const outcome = try self.perform(.PUT, key, "", .{
+            .payload = self.send_workspace[0..length_bytes],
+            .metadata_ms = created_at_ms,
+            .publication = .indeterminate_after_send,
+            .replay = .same_bytes,
+        });
+        // A refusal of this resend says nothing of the attempt before it.
+        if (outcome.status.class() != .success) return error.StorageFailure;
+        return .landed;
+    }
+
+    /// `settle` for an upload kept in `multipart`.
+    fn settle_upload(self: *S3Client) ConditionalWriteError!Settlement {
+        const state = &self.multipart.?;
+        const owner = self.multipart_owner.?;
+        if (state.complete_sent and !state.aborted) {
+            if (self.send_completion(state)) {
+                self.end_multipart();
+                return .landed;
+            } else |_| {}
+        }
+        try self.abort_multipart_owned(owner);
+        if (self.multipart == null) return .cancelled;
+        // A completion was sent: it landed before the abort, or it never
+        // will.
+        const landed = try self.upload_landed(state);
+        self.end_multipart();
+        return if (landed) .landed else .cancelled;
+    }
+
+    fn end_multipart(self: *S3Client) void {
+        self.multipart = null;
+        self.multipart_owner = null;
     }
 
     /// Begins one multipart upload. The client tracks a single in-flight
@@ -722,6 +872,7 @@ pub const S3Client = struct {
         identity: ltx.FileIdentity,
         created_at_ms: i64,
     ) Error!void {
+        try self.check_settled();
         if (self.write_session != null) return error.InvalidState;
         return self.begin_multipart_owned(
             .manual,
@@ -731,6 +882,10 @@ pub const S3Client = struct {
         );
     }
 
+    /// Under `single_writer_publication` a lost answer is sent again: an
+    /// earlier attempt that the store took leaves an upload whose id never
+    /// came back, which nothing completes (store-side lifecycle cleanup
+    /// removes it).
     fn begin_multipart_owned(
         self: *S3Client,
         owner: MultipartOwner,
@@ -750,6 +905,7 @@ pub const S3Client = struct {
             .{
                 .metadata_ms = created_at_ms,
                 .body_destination = &self.xml_workspace,
+                .replay = if (self.config.single_writer_publication) .orphan_only else .none,
             },
         );
         if (outcome.status != .ok) return error.StorageFailure;
@@ -775,6 +931,7 @@ pub const S3Client = struct {
         part_number: u32,
         bytes: []const u8,
     ) Error!void {
+        try self.check_settled();
         if (self.write_session != null) return error.InvalidState;
         if (bytes.len > self.send_workspace.len) return error.ObjectTooLarge;
         @memcpy(self.send_workspace[0..bytes.len], bytes);
@@ -834,8 +991,13 @@ pub const S3Client = struct {
     /// transport failure, retryable status, or invalid acknowledgement after
     /// request delivery begins returns `PublicationIndeterminate` and is never
     /// retried automatically. The caller must reconcile the object identity
-    /// before retrying or deleting source state.
+    /// before retrying or deleting source state. Under
+    /// `single_writer_publication` the completion is sent again with the same
+    /// body instead, and a HEAD of the key decides one that stays
+    /// indeterminate: this upload's object there is success; otherwise the
+    /// upload stays unsettled for `settle`.
     pub fn complete_multipart(self: *S3Client) Error!void {
+        try self.check_settled();
         if (self.write_session != null) return error.InvalidState;
         return self.complete_multipart_owned(.manual);
     }
@@ -853,6 +1015,34 @@ pub const S3Client = struct {
                 return error.InvalidState;
             }
         }
+        self.send_completion(state) catch |err| {
+            if (err == error.PublicationIndeterminate and self.config.single_writer_publication) {
+                self.unsettle_upload(state);
+            }
+            return err;
+        };
+        self.end_multipart();
+    }
+
+    /// Keep the upload for `settle`: its abort failed, or its completion
+    /// may have landed.
+    fn unsettle_upload(self: *S3Client, state: *const MultipartState) void {
+        self.unsettled = .{ .multipart = .{
+            .level = state.level,
+            .identity = state.identity,
+            .complete_sent = state.complete_sent,
+        } };
+    }
+
+    /// Sends `state`'s completion. Under `single_writer_publication` it is
+    /// sent again with the same body while the policy allows; once an
+    /// attempt may have landed, or the upload is gone (404) after an earlier
+    /// completion was sent, a HEAD of the key decides: this upload's object
+    /// there is success, anything else `PublicationIndeterminate`. A store
+    /// answers a completion of an upload it already completed or aborted
+    /// with 404 `NoSuchUpload`.
+    fn send_completion(self: *S3Client, state: *MultipartState) ConditionalWriteError!void {
+        const settles = self.config.single_writer_publication;
         const key = try self.key_path(state.level, state.identity);
         const query = try build_upload_query_with_id(
             &self.query_workspace,
@@ -875,7 +1065,7 @@ pub const S3Client = struct {
         try append_multipart_xml(&self.xml_workspace, &body_offset, "</CompleteMultipartUpload>");
         var body_buffer: [64 * 1024]u8 = undefined;
         @memcpy(body_buffer[0..body_offset], self.xml_workspace[0..body_offset]);
-        const outcome = try self.perform(
+        const result = self.perform(
             .POST,
             key,
             query,
@@ -883,46 +1073,102 @@ pub const S3Client = struct {
                 .payload = body_buffer[0..body_offset],
                 .body_destination = &self.xml_workspace,
                 .publication = .indeterminate_after_send,
+                .replay = if (settles) .same_bytes else .none,
             },
         );
-        if (outcome.status != .ok) return error.StorageFailure;
+        const outcome = result catch |err| {
+            if (!settles or err != error.PublicationIndeterminate) return err;
+            state.complete_sent = true;
+            return self.head_decides(state);
+        };
+        if (outcome.status != .ok) {
+            // The store refused this request, which stored nothing; an
+            // earlier completion may have landed.
+            if (settles and state.complete_sent and outcome.status == .not_found) return self.head_decides(state);
+            return error.StorageFailure;
+        }
         validate_complete_multipart_response(outcome.bytes) catch {
             self.last_parse_failure = "a completion answer that is not a CompleteMultipartUploadResult";
-            return error.PublicationIndeterminate;
+            if (!settles) return error.PublicationIndeterminate;
+            state.complete_sent = true;
+            return self.head_decides(state);
         };
-        self.multipart = null;
-        self.multipart_owner = null;
+    }
+
+    /// A completion that may have landed: success when a HEAD finds this
+    /// upload's object at the key, `PublicationIndeterminate` otherwise
+    /// (the HEAD failed, or the key holds something else or nothing).
+    fn head_decides(self: *S3Client, state: *const MultipartState) ConditionalWriteError!void {
+        const landed = self.upload_landed(state) catch false;
+        if (!landed) return error.PublicationIndeterminate;
+    }
+
+    /// Whether the key holds this upload's completed object, by a HEAD: its
+    /// ETag is the one a store computes for these parts (the MD5 of the
+    /// parts' binary MD5s, then `-` and the part count) and its length the
+    /// parts' sum. A part ETag that is not an MD5 (a store that encrypts
+    /// with KMS) leaves only the count suffix and the length to compare.
+    fn upload_landed(self: *S3Client, state: *const MultipartState) ConditionalWriteError!bool {
+        const key = try self.key_path(state.level, state.identity);
+        const outcome = try self.perform(.HEAD, key, "", .{});
+        if (outcome.status == .not_found) return false;
+        if (outcome.status != .ok) return error.StorageFailure;
+        const etag = outcome.etag orelse return false;
+        var total_bytes: u64 = 0;
+        for (state.part_sizes[0..state.part_count]) |size| total_bytes += size;
+        if (outcome.content_length != total_bytes) return false;
+        var expected: [upload_etag_bytes]u8 = undefined;
+        if (upload_etag(state, &expected)) |computed| return std.ascii.eqlIgnoreCase(etag, computed);
+        var suffix: [16]u8 = undefined;
+        return std.mem.endsWith(u8, etag, std.fmt.bufPrint(&suffix, "-{d}\"", .{state.part_count}) catch unreachable);
     }
 
     /// Aborts the in-flight multipart upload, discarding its parts. A failed
     /// cleanup retains the upload identity so the caller or `deinit` can retry;
-    /// all new writes remain blocked until cleanup succeeds.
+    /// all new writes remain blocked until cleanup succeeds. Under
+    /// `single_writer_publication` a failed abort leaves the client
+    /// unsettled instead, and only `settle` retries it.
     pub fn abort_multipart(self: *S3Client) Error!void {
+        try self.check_settled();
         if (self.write_session != null) return error.InvalidState;
         const owner = self.multipart_owner orelse return error.InvalidState;
         return self.abort_multipart_owned(owner);
     }
 
+    /// Under `single_writer_publication` a failed abort, and an upload whose
+    /// completion was sent (until a HEAD says whether it landed), stay
+    /// unsettled with the upload kept.
     fn abort_multipart_owned(
         self: *S3Client,
         owner: MultipartOwner,
     ) Error!void {
         const state = &(self.multipart orelse return error.InvalidState);
         if (self.multipart_owner != owner) return error.InvalidState;
+        const settles = self.config.single_writer_publication;
         const key = try self.key_path(state.level, state.identity);
         const query = try build_upload_query_with_id(
             &self.query_workspace,
             state.upload_id[0..state.upload_id_bytes],
         );
-        const outcome = try self.perform(
+        const outcome = self.perform(
             .DELETE,
             key,
             query,
             .{},
-        );
-        if (!abort_status_is_clean(outcome.status)) return error.StorageFailure;
-        self.multipart = null;
-        self.multipart_owner = null;
+        ) catch |err| {
+            if (settles) self.unsettle_upload(state);
+            return err;
+        };
+        if (!abort_status_is_clean(outcome.status)) {
+            if (settles) self.unsettle_upload(state);
+            return error.StorageFailure;
+        }
+        if (settles and state.complete_sent) {
+            state.aborted = true;
+            self.unsettle_upload(state);
+            return;
+        }
+        self.end_multipart();
     }
 
     /// Writes one object only when its key is absent, for host-side lease
@@ -932,7 +1178,8 @@ pub const S3Client = struct {
     /// answer, a 5xx) returns `PublicationIndeterminate` and is never
     /// retried automatically; reconcile the stored generation. A refused
     /// connect and a transient 4xx (the store stored nothing) are retried
-    /// under the policy.
+    /// under the policy. To reconcile, read the object back: bytes equal
+    /// to these mean the write landed; anything else is another writer's.
     pub fn put_if_absent(
         self: *S3Client,
         level: u8,
@@ -940,6 +1187,7 @@ pub const S3Client = struct {
         created_at_ms: i64,
         bytes: []const u8,
     ) ConditionalWriteError!void {
+        try self.check_settled();
         if (self.has_active_write()) return error.InvalidState;
         if (level > ltx.max_level) return error.InvalidLevel;
         if (identity.min_txid.value > identity.max_txid.value) {
@@ -995,7 +1243,12 @@ pub const S3Client = struct {
     /// call fails with `ETagMismatch`. A failure after delivery begins
     /// without a definite answer returns `PublicationIndeterminate` and is
     /// never retried automatically; reconcile the stored generation before
-    /// renewal continues. It is retried as `put_if_absent` is.
+    /// renewal continues. It is retried as `put_if_absent` is. To
+    /// reconcile, read the object back: bytes equal to these mean the write
+    /// landed; the expected generation still stored means it did not, and
+    /// a retry with the same expected ETag is then safe (a late landing of
+    /// the first attempt succeeds only while that ETag is still stored,
+    /// and writes the same bytes).
     pub fn put_if_match(
         self: *S3Client,
         level: u8,
@@ -1004,6 +1257,7 @@ pub const S3Client = struct {
         bytes: []const u8,
         expected_etag: []const u8,
     ) ConditionalWriteError!void {
+        try self.check_settled();
         if (self.has_active_write()) return error.InvalidState;
         if (level > ltx.max_level) return error.InvalidLevel;
         if (identity.min_txid.value > identity.max_txid.value) {
@@ -1035,6 +1289,7 @@ pub const S3Client = struct {
         files: []const ltx.FileInfo,
     ) Error!void {
         const self: *S3Client = @ptrCast(@alignCast(context));
+        try self.check_settled();
         if (self.has_active_write()) return error.InvalidState;
         for (files) |info| {
             const key = try self.key_path(
@@ -1078,8 +1333,8 @@ pub const S3Client = struct {
         indeterminate_after_send,
     };
 
-    /// Whether a publication may be sent again after an attempt that may
-    /// have landed.
+    /// Whether a request may be sent again after an attempt that may have
+    /// taken effect, where its method or its publication says no.
     const Replay = enum {
         none,
         /// The payload is bytes only this writer publishes at this key, so
@@ -1087,6 +1342,9 @@ pub const S3Client = struct {
         /// request stays indeterminate once an attempt was, until a resend
         /// is answered 2xx (`RequestState`).
         same_bytes,
+        /// An attempt that took effect leaves only something nothing uses:
+        /// a multipart initiation whose upload id never came back.
+        orphan_only,
     };
 
     const Outcome = struct {
@@ -1098,6 +1356,9 @@ pub const S3Client = struct {
         /// storage and valid until the next request.
         etag: ?[]const u8 = null,
         content_range: ?ContentRange = null,
+        /// The `Content-Length` header when present: for a HEAD, the
+        /// object's size.
+        content_length: ?u64 = null,
     };
 
     /// Signs and performs one request, retrying under the policy what may
@@ -1281,11 +1542,11 @@ pub const S3Client = struct {
     /// request that was sent and failed on the transport, or was answered
     /// a transient status (`is_transient_status`), may be sent again when
     /// that is safe: a read, a delete or an unconditional PUT that is not
-    /// a publication; a publication only when it replays the same bytes;
-    /// a conditional PUT only after a transient 4xx, where the store
-    /// stored nothing, never after a 5xx or a lost answer, where it may
-    /// have. A request that could not be built (stage `connect` with no
-    /// cause) never passes.
+    /// a publication; a POST that can at worst leave an orphan; a
+    /// publication only when it replays the same bytes; a conditional PUT
+    /// only after a transient 4xx, where the store stored nothing, never
+    /// after a 5xx or a lost answer, where it may have. A request that
+    /// could not be built (stage `connect` with no cause) never passes.
     fn judge_attempt(
         method: std.http.Method,
         options: RequestOptions,
@@ -1324,6 +1585,7 @@ pub const S3Client = struct {
         }
         return switch (method) {
             .GET, .HEAD, .DELETE, .PUT => true,
+            .POST => options.replay == .orphan_only,
             else => false,
         };
     }
@@ -1543,6 +1805,7 @@ pub const S3Client = struct {
         }
         const readable_status = status == .ok or
             (options.byte_range != null and status == .partial_content);
+        const content_length = response.head.content_length;
         self.enter_stage(trace, .status);
         if (!readable_status) {
             trace.s3_code = self.read_error_code(request, response, method);
@@ -1550,12 +1813,14 @@ pub const S3Client = struct {
                 .status = status,
                 .etag = etag,
                 .content_range = content_range,
+                .content_length = content_length,
             };
         }
         const destination = options.body_destination orelse return .{
             .status = status,
             .etag = etag,
             .content_range = content_range,
+            .content_length = content_length,
         };
         self.enter_stage(trace, .read_body);
         const reader = response.reader(&self.transfer_buffer);
@@ -1576,6 +1841,7 @@ pub const S3Client = struct {
             .bytes = bytes,
             .etag = etag,
             .content_range = content_range,
+            .content_length = content_length,
         };
     }
 
@@ -2242,6 +2508,26 @@ fn transport_cause(request: *const std.http.Client.Request, err: anyerror) anyer
     return err;
 }
 
+/// A quoted MD5 in hex, `-`, and a part count of at most 10 digits.
+const upload_etag_bytes = 2 + 32 + 1 + 10;
+
+/// The ETag a store gives the object an upload completes: the MD5 of the
+/// parts' binary MD5s, then `-` and the part count, quoted. Null when a
+/// part's ETag is not a quoted 32-digit hex MD5.
+fn upload_etag(state: *const MultipartState, out: *[upload_etag_bytes]u8) ?[]const u8 {
+    var md5 = std.crypto.hash.Md5.init(.{});
+    for (state.etags[0..state.part_count], state.etag_lengths[0..state.part_count]) |*etag, length| {
+        const text = std.mem.trim(u8, etag[0..length], "\"");
+        if (text.len != 32) return null;
+        var digest: [std.crypto.hash.Md5.digest_length]u8 = undefined;
+        _ = std.fmt.hexToBytes(&digest, text) catch return null;
+        md5.update(&digest);
+    }
+    var sum: [std.crypto.hash.Md5.digest_length]u8 = undefined;
+    md5.final(&sum);
+    return std.fmt.bufPrint(out, "\"{x}-{d}\"", .{ &sum, state.part_count }) catch null;
+}
+
 fn abort_status_is_clean(status: std.http.Status) bool {
     return switch (status) {
         .ok, .no_content, .not_found => true,
@@ -2575,6 +2861,12 @@ test "retry decisions respect budget, method, and policy callback" {
     try std.testing.expect(judge(.GET, plain, error.StorageFailure, lost).retryable);
     try std.testing.expect(judge(.DELETE, plain, error.StorageFailure, lost).retryable);
     try std.testing.expect(!judge(.POST, plain, error.StorageFailure, lost).retryable);
+    // A multipart initiation may go again when a lost one leaves only an
+    // orphan upload.
+    const initiation: S3Client.RequestOptions = .{ .replay = .orphan_only };
+    try std.testing.expect(judge(.POST, initiation, error.StorageFailure, lost).retryable);
+    try std.testing.expect(judge(.POST, initiation, null, .{ .stage = .status, .status = 503 }).retryable);
+    try std.testing.expect(!judge(.POST, initiation, error.StorageFailure, lost).indeterminate);
     // A conditional read keeps its generation on retry.
     const match_read: S3Client.RequestOptions = .{ .conditional = .{ .match_etag = "\"generation\"" }, .byte_range = .{ .start_bytes = 0, .end_bytes = 0 } };
     try std.testing.expect(judge(.GET, match_read, error.StorageFailure, lost).retryable);
@@ -2661,6 +2953,23 @@ test "400 RequestTimeout and IncompleteBody are transient, 501 is not" {
     for ([_]u16{ 200, 206, 403, 404, 409, 412, 416, 501, 505, 507 }) |status| {
         try std.testing.expect(!is_transient_status(status, "RequestTimeout"));
     }
+}
+
+test "an upload's ETag is the MD5 of its parts' MD5s and their count" {
+    var state: MultipartState = .{ .level = 0, .identity = .{ .min_txid = .init(1), .max_txid = .init(1) } };
+    // Parts "a" and "b"; the answer is from Python's hashlib.
+    for ([_][]const u8{ "\"0cc175b9c0f1b6a831c399e269772661\"", "\"92EB5FFEE6AE2FEC3AD71C777531578F\"" }) |etag| {
+        @memcpy(state.etags[state.part_count][0..etag.len], etag);
+        state.etag_lengths[state.part_count] = @intCast(etag.len);
+        state.part_count += 1;
+    }
+    var out: [upload_etag_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings("\"96e024ba2074fe77e8e965ba43a704be-2\"", upload_etag(&state, &out).?);
+    // A part ETag that is not an MD5 (KMS encryption) gives none.
+    const kms = "\"not-an-md5\"";
+    @memcpy(state.etags[1][0..kms.len], kms);
+    state.etag_lengths[1] = kms.len;
+    try std.testing.expect(upload_etag(&state, &out) == null);
 }
 
 test "multipart abort treats a missing upload as already clean" {
