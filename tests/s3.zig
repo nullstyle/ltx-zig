@@ -747,7 +747,7 @@ fn serve_put_error_then_head(server: *std.Io.net.Server) anyerror!void {
             "<?xml version=\"1.0\"?><Error><Code>IncompleteBody</Code><Message>You did not provide the number of bytes specified by the Content-Length HTTP header.</Message></Error>",
             .{ .status = .bad_request, .keep_alive = true },
         );
-        if (http_server.receiveHead()) |_| return error.TestUnexpectedResult else |_| {}
+        if (http_server.receiveHead()) |_| return error.TestUnexpectedResult else |_| try not_canceled(&stream_reader);
     }
     var stream = try server.accept(std.testing.io);
     defer stream.close(std.testing.io);
@@ -813,6 +813,27 @@ const Scripted = union(enum) {
     drop,
 };
 
+/// A scripted server's wait for a request on a kept connection failed:
+/// the client closed it, or the test is over and cancelled the server.
+/// Only a cancel is an error. A cancel is delivered once, to the call
+/// waiting then, so a server that took it for a closed connection would
+/// wait in `accept` for good, and the test's cancel with it: a client
+/// that failed early would hang the test instead of failing it.
+fn not_canceled(reader: *const std.Io.net.Stream.Reader) error{Canceled}!void {
+    if (reader.err) |err| if (err == error.Canceled) return error.Canceled;
+}
+
+/// End a scripted server once its client is done. A server that served
+/// its whole script has returned; one that still waits for a request the
+/// script holds is cancelled, and the test fails by name: the client sent
+/// fewer requests than the script, and an await would wait for good.
+fn end_server(task: *std.Io.Future(anyerror!void)) !void {
+    task.cancel(std.testing.io) catch |err| {
+        if (err == error.Canceled) return error.ScriptNotServed;
+        return err;
+    };
+}
+
 /// Serves `script` in order, one request a step, on as many connections
 /// as the client opens; a connection stays open until the client closes
 /// it, a `drop` closes it, or an answer does not keep it alive.
@@ -832,7 +853,10 @@ fn serve_script(server: *std.Io.net.Server, script: []const Scripted, connection
         while (step < script.len) {
             // The client closed this connection: its next request comes
             // on another.
-            var request = http_server.receiveHead() catch break;
+            var request = http_server.receiveHead() catch {
+                try not_canceled(&stream_reader);
+                break;
+            };
             if (request.head.method.requestHasBody()) {
                 const body_reader = try request.readerExpectContinue(&body_buffer);
                 _ = try body_reader.discardRemaining();
@@ -882,6 +906,13 @@ const Relisten = struct {
         }
     }
 
+    /// `end_server`; a server that never started (the client never
+    /// paused) fails the test too.
+    fn end(self: *Relisten) !void {
+        if (self.task) |*task| return end_server(task);
+        return error.ScriptNotServed;
+    }
+
     fn policy(self: *Relisten, max_attempts: u32) ltx_s3.RetryPolicy {
         return .{ .context = self, .next_delay_ms_fn = next, .sleep_ms_fn = sleep, .max_attempts = max_attempts };
     }
@@ -915,6 +946,32 @@ const Relisten = struct {
     }
 };
 
+test "scripted server that waits for a request its client never sends ends the test" {
+    // A client that fails early leaves the server waiting on its kept
+    // connection. The server took the test's cancel there for a closed
+    // connection and waited in accept for good, and the test hung.
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const script: [2]Scripted = @splat(not_found_answer);
+    var connections: [1]u32 = @splat(0);
+    var server_task = std.testing.io.async(serve_script, .{ &server, &script, &connections });
+    defer _ = server_task.cancel(std.testing.io) catch {};
+    var send_workspace: [64]u8 = undefined;
+    var s3 = try ltx_s3.S3Client.init(std.testing.allocator, std.testing.io, .{
+        .host = "127.0.0.1",
+        .port = server.socket.address.getPort(),
+        .bucket = "scripted-early",
+        .access_key = "test-access",
+        .secret_key = "test-secret",
+        .clock = .{ .context = &plain_clock_context, .now_ms_fn = TestClock.now_ms },
+    }, &send_workspace);
+    defer s3.deinit();
+    try std.testing.expectError(error.ObjectNotFound, s3.object_etag(0, .{ .min_txid = .init(1), .max_txid = .init(1) }));
+    try std.testing.expectError(error.ScriptNotServed, end_server(&server_task));
+    try std.testing.expectEqual(@as(u32, 1), connections[0]);
+}
+
 test "scripted observer sees every attempt's stage" {
     // The first connect is refused; the second attempt's connection closes
     // without an answer; the third is answered 503 SlowDown, the fourth
@@ -937,7 +994,7 @@ test "scripted observer sees every attempt's stage" {
         &destination,
     );
     try std.testing.expectEqualStrings("abc", &destination);
-    try relisten.task.?.await(std.testing.io);
+    try relisten.end();
 
     try std.testing.expectEqual(@as(usize, 4), probe.ended);
     const expected_stages = [_]ltx_s3.Stage{ .connect, .receive_head, .status, .status };
@@ -997,7 +1054,7 @@ test "scripted idle pooled connections are dropped before reuse" {
     try std.testing.expectError(error.ObjectNotFound, s3.object_etag(0, identity));
     clock.value_ms += 2000;
     try std.testing.expectError(error.ObjectNotFound, s3.object_etag(0, identity));
-    try server_task.await(std.testing.io);
+    try end_server(&server_task);
     try std.testing.expectEqualSlices(u32, &.{ 2, 1 }, &connections);
     try std.testing.expect(probe.seen[1].reused);
     try std.testing.expectEqual(@as(u64, 500), probe.seen[1].idle_ms);
@@ -1044,7 +1101,7 @@ test "scripted idle time is measured on the steady clock, not the wall clock" {
     steady.value_ms += 2000;
     wall.value_ms -= 3000;
     try std.testing.expectError(error.ObjectNotFound, s3.object_etag(0, identity));
-    try server_task.await(std.testing.io);
+    try end_server(&server_task);
     try std.testing.expectEqualSlices(u32, &.{ 2, 1 }, &connections);
     try std.testing.expect(probe.seen[1].reused);
     try std.testing.expectEqual(@as(u64, 500), probe.seen[1].idle_ms);
@@ -1099,7 +1156,7 @@ test "scripted transport failure drops the pool before the retry" {
     defer _ = server_task.cancel(std.testing.io) catch {};
     const identity: ltx.FileIdentity = .{ .min_txid = .init(1), .max_txid = .init(1) };
     try std.testing.expectError(error.ObjectNotFound, s3.object_etag(0, identity));
-    try server_task.await(std.testing.io);
+    try end_server(&server_task);
     // The first attempt met a stale connection; the retry opened a new one.
     try std.testing.expectEqual(@as(u32, 1), retry_probe.calls);
     try std.testing.expectEqual(@as(usize, 2), probe.ended);
@@ -1183,7 +1240,7 @@ test "scripted transport failure that is not retried leaves no pooled connection
     var server_task = std.testing.io.async(serve_script, .{ &server, &script, &connections });
     defer _ = server_task.cancel(std.testing.io) catch {};
     try std.testing.expectError(error.ObjectNotFound, s3.object_etag(0, identity));
-    try server_task.await(std.testing.io);
+    try end_server(&server_task);
     try std.testing.expect(!probe.seen[3].reused);
     try std.testing.expectEqual(@as(usize, 4), probe.ended);
 }
@@ -1227,7 +1284,7 @@ test "scripted 400 RequestTimeout and IncompleteBody are retried, 501 is not" {
     try std.testing.expectError(error.StorageFailure, s3.client().read_range(info, 0, &destination));
     try std.testing.expectError(error.StorageFailure, s3.client().read_range(info, 0, &destination));
     try std.testing.expectEqual(@as(u32, 2), retry_probe.calls);
-    try server_task.await(std.testing.io);
+    try end_server(&server_task);
 }
 
 test "scripted conditional PUT is retried after a refused connect or a 429, never after a 5xx or a lost answer" {
@@ -1251,7 +1308,7 @@ test "scripted conditional PUT is retried after a refused connect or a 429, neve
     try std.testing.expectError(error.PublicationIndeterminate, s3.put_if_absent(0, identity, 2, "claim"));
     try std.testing.expectError(error.PublicationIndeterminate, s3.put_if_absent(0, identity, 3, "claim"));
     try std.testing.expectEqual(@as(u32, 2), relisten.calls);
-    try relisten.task.?.await(std.testing.io);
+    try relisten.end();
 }
 
 /// One page a scripted listing server answers: the continuation token the
@@ -1300,7 +1357,7 @@ fn serve_scripted_list_pages(
     server: *std.Io.net.Server,
     prefix: []const u8,
     pages: []const ScriptedListPage,
-) !void {
+) anyerror!void {
     for (pages) |page| {
         var stream = try server.accept(std.testing.io);
         defer stream.close(std.testing.io);
@@ -1416,7 +1473,7 @@ test "scripted listing pages past 16 keys under a 900-byte prefix" {
     defer s3.deinit();
     var infos: [24]ltx.FileInfo = undefined;
     const listed = try s3.client().list(0, ltx.TXID.init(0), &infos);
-    try server_task.await(std.testing.io);
+    try end_server(&server_task);
     try std.testing.expectEqual(@as(usize, 20), listed.len);
     for (listed, 1..) |info, txid| {
         try std.testing.expectEqual(@as(u64, txid), info.min_txid.value);
@@ -1445,7 +1502,7 @@ test "scripted listing page truncated without a token is listed again from the s
     defer s3.deinit();
     var infos: [16]ltx.FileInfo = undefined;
     const listed = try s3.client().list(0, ltx.TXID.init(0), &infos);
-    try server_task.await(std.testing.io);
+    try end_server(&server_task);
     try std.testing.expectEqual(@as(usize, 12), listed.len);
     try std.testing.expectEqual(@as(u64, 12), listed[11].min_txid.value);
 }
@@ -1475,7 +1532,7 @@ test "scripted listing fails after its walks keep losing their token" {
         s3.last_parse_failure,
     );
     // Every walk was tried, and no fourth.
-    try server_task.await(std.testing.io);
+    try end_server(&server_task);
 }
 
 const generation_one = "\"generation-one\"";
