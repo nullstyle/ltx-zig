@@ -368,8 +368,16 @@ rather than replace the 512 MiB series above.
   syncs scan from the beginning. After restoring a replica, call
   `seed_position` before the first sync so the continuation numbers its
   TXIDs after the recovered position instead of restarting at one. A
-  session-initiated checkpoint records the salts of the segment its control
-  row starts; a foreign commit, full checkpoint and WAL restart that all land
-  between that control row and the salts read still pass as a continuation.
+  checkpoint moves every committed frame into the database file, also frames
+  another connection committed after the last capture read the WAL (while
+  that capture published, say), and the restart drops them from the WAL.
+  `sync`'s own checkpoint captures them first, as one more transition at the
+  same timestamp, so the restarted segment still continues. When it cannot
+  (a write restarted the WAL before it read them, or their publish failed),
+  and after a `checkpoint_passive` that moved any, the next capture is a full
+  snapshot. A session-initiated checkpoint records the salts of the segment
+  its control row starts; a foreign commit, full checkpoint and WAL restart
+  that all land between that control row and the salts read still pass as a
+  continuation.
 - Restore requires the plan's first file to start at TXID 1 from the empty
   position; chains that begin mid-history need an earlier snapshot.

@@ -17,7 +17,10 @@
 //! Continuing WAL segments resume from the last verified frame boundary.
 //! Byte-, age-, and frame-count tiers can trigger passive checkpoints, while
 //! the session's single-writer ownership makes Celld's separate writer barrier
-//! unnecessary. Crash-replay integration qualifies publication and resume
+//! unnecessary. A checkpoint moves every committed frame, also those another
+//! connection committed after the capture read the WAL; the automatic one
+//! captures those before the WAL restarts, and a checkpoint that cannot makes
+//! the next capture a full snapshot. Crash-replay integration qualifies publication and resume
 //! behavior. A WAL larger than the configured workspace is rejected rather
 //! than partially read.
 //!
@@ -135,13 +138,13 @@ pub const Session = struct {
     segment_salt: wal.SaltPair = .{ .salt_1 = 0, .salt_2 = 0 },
     segment_end_offset_bytes: u64 = 0,
     segment_commit_pages: u32 = 0,
-    /// Set after a checkpoint this session initiated: the next committed
-    /// WAL frames belong to a fresh segment that continues the captured
-    /// position, so they are captured as an incremental rather than
-    /// triggering a snapshot fallback. `segment_salt` then holds that
-    /// segment's salts: a WAL restarted again by someone else's checkpoint
-    /// may have dropped frames the session never read, so it does not
-    /// continue.
+    /// Set after a checkpoint this session initiated that moved only
+    /// frames the session captured: the next committed WAL frames belong to
+    /// a fresh segment that continues the captured position, so they are
+    /// captured as an incremental rather than triggering a snapshot
+    /// fallback. `segment_salt` then holds that segment's salts: a WAL
+    /// restarted again by someone else's checkpoint may have dropped frames
+    /// the session never read, so it does not continue.
     segment_restarted: bool = false,
     /// The committed end of the last published segment, header included.
     /// Not the WAL file's size: SQLite restarts a WAL in place and keeps
@@ -270,9 +273,13 @@ pub const Session = struct {
     /// the transition, encodes it, publishes it at level zero, and advances
     /// the position. `timestamp_ms` is stored in the emitted header. Returns
     /// the encoded page count; `CaptureUnchanged` means no committed
-    /// transaction exists beyond the captured position. Automatic checkpoint
-    /// failures never mask a published capture; `checkpoint_pending` exposes
-    /// the deferred retry, which a later due sync attempts again.
+    /// transaction exists beyond the captured position. A due checkpoint
+    /// follows; transactions another connection committed after the capture
+    /// read the WAL are captured before it restarts the WAL, as one more
+    /// transition at the same timestamp, whose pages count too. Automatic
+    /// checkpoint failures never mask a published capture;
+    /// `checkpoint_pending` exposes the deferred retry, which a later due
+    /// sync attempts again.
     pub fn sync(self: *Session, workspaces: *Workspaces, timestamp_ms: i64) Error!u32 {
         try self.validate_workspaces(workspaces);
         try self.validate_timestamp(timestamp_ms);
@@ -286,14 +293,14 @@ pub const Session = struct {
                 try self.start_segment();
                 break :retry self.capture_transaction(workspaces, timestamp_ms, .full) catch |retry_err| switch (retry_err) {
                     error.SegmentMissing => unreachable,
-                    else => |other| return self.capture_failed(other, timestamp_ms),
+                    else => |other| return self.capture_failed(other, workspaces, timestamp_ms),
                 };
             },
-            else => |other| return self.capture_failed(other, timestamp_ms),
+            else => |other| return self.capture_failed(other, workspaces, timestamp_ms),
         };
         self.record_sync_timestamp(timestamp_ms);
-        self.checkpoint_if_due(timestamp_ms);
-        return captured;
+        const tail = self.checkpoint_if_due(workspaces, timestamp_ms) orelse 0;
+        return captured + tail;
     }
 
     const CaptureMode = enum {
@@ -303,6 +310,12 @@ pub const Session = struct {
         /// Publish a full image: from the WAL segment when one exists, from
         /// the database file alone otherwise.
         full,
+        /// After a complete checkpoint that moved frames committed since
+        /// the last capture: continue the anchored segment, which the WAL
+        /// still holds unless a write restarted it since. Anything else,
+        /// including a restart during the read, is `SegmentMissing`, and
+        /// nothing is published.
+        tail,
     };
 
     fn capture_transaction(
@@ -316,14 +329,22 @@ pub const Session = struct {
         return self.sync_locked(workspaces, timestamp_ms, mode);
     }
 
-    fn capture_failed(self: *Session, err: (Error || error{SegmentMissing}), timestamp_ms: i64) Error {
+    /// A sync whose capture failed. An unchanged one still runs a due
+    /// checkpoint, and returns the pages of the transactions that
+    /// checkpoint captured before it restarted the WAL, if any.
+    fn capture_failed(
+        self: *Session,
+        err: (Error || error{SegmentMissing}),
+        workspaces: *Workspaces,
+        timestamp_ms: i64,
+    ) Error!u32 {
         const failure: Error = switch (err) {
             error.SegmentMissing => unreachable,
             else => |other| other,
         };
         if (failure == error.CaptureUnchanged) {
             self.record_sync_timestamp(timestamp_ms);
-            self.checkpoint_if_due(timestamp_ms);
+            if (self.checkpoint_if_due(workspaces, timestamp_ms)) |tail| return tail;
         }
         return failure;
     }
@@ -339,7 +360,11 @@ pub const Session = struct {
         };
     }
 
-    fn checkpoint_if_due(self: *Session, timestamp_ms: i64) void {
+    /// Runs the automatic checkpoint when a tier is due or one is pending
+    /// (`checkpoint_capturing`). Returns the pages it captured before the
+    /// restart, or null when it published nothing; a failure leaves
+    /// `checkpoint_pending` set.
+    fn checkpoint_if_due(self: *Session, workspaces: *Workspaces, timestamp_ms: i64) ?u32 {
         const over_bytes = self.checkpoint_threshold_bytes != 0 and
             self.last_wal_bytes >= self.checkpoint_threshold_bytes;
         const over_frames = self.checkpoint_max_frames != 0 and
@@ -350,8 +375,10 @@ pub const Session = struct {
         ) catch unreachable;
         const over_time = self.checkpoint_interval_ms != 0 and
             elapsed_ms >= self.checkpoint_interval_ms;
-        if (!self.checkpoint_pending and !over_bytes and !over_frames and !over_time) return;
-        self.checkpoint_passive(timestamp_ms) catch {};
+        if (!self.checkpoint_pending and !over_bytes and !over_frames and !over_time) return null;
+        var tail: ?u32 = null;
+        self.checkpoint_capturing(workspaces, timestamp_ms, &tail) catch {};
+        return tail;
     }
 
     fn validate_workspaces(self: *const Session, workspaces: *const Workspaces) Error!void {
@@ -405,17 +432,82 @@ pub const Session = struct {
     /// row so the restarted WAL carries a committed frame. Frames committed
     /// after this call continue the captured position as an incremental; a
     /// checkpoint performed by anyone else still falls back to a snapshot.
-    /// `CheckpointIncomplete` means a reader prevented a complete pass and
-    /// leaves `checkpoint_pending` set for a later retry.
+    /// The checkpoint moves every committed frame into the database file,
+    /// also frames another connection committed after the last capture
+    /// read the WAL, and the restart drops them from it: when it moved any,
+    /// the next capture is a full snapshot instead (`sync`'s own
+    /// checkpoint captures them first). `CheckpointIncomplete` means a
+    /// reader prevented a complete pass and leaves `checkpoint_pending` set
+    /// for a later retry.
     pub fn checkpoint_passive(self: *Session, now_ms: i64) Error!void {
         try self.validate_timestamp(now_ms);
         self.checkpoint_pending = true;
         const progress = try self.passive_checkpoint_progress();
         if (!progress.complete()) return error.CheckpointIncomplete;
+        try self.restart_segment(self.moved_only_captured(progress), now_ms);
+    }
+
+    /// `sync`'s checkpoint: `checkpoint_passive`, but when it moved frames
+    /// the last capture did not read, they are captured first, as an
+    /// incremental of the segment it moved (`tail` gets its pages), so the
+    /// restarted segment still continues. A handler's commit on another
+    /// connection of the host lands this way whenever it comes while a
+    /// capture publishes. When they cannot be captured (a write restarted
+    /// the WAL first, or the publish failed), the next capture is a full
+    /// snapshot.
+    fn checkpoint_capturing(self: *Session, workspaces: *Workspaces, now_ms: i64, tail: *?u32) Error!void {
+        self.checkpoint_pending = true;
+        const progress = try self.passive_checkpoint_progress();
+        if (!progress.complete()) return error.CheckpointIncomplete;
+        var continues = self.moved_only_captured(progress);
+        if (!continues) {
+            continues = true;
+            tail.* = self.capture_transaction(workspaces, now_ms, .tail) catch |err| switch (err) {
+                error.CaptureUnchanged => null,
+                else => blk: {
+                    continues = false;
+                    break :blk null;
+                },
+            };
+            // The tail capture read the moved segment after the checkpoint,
+            // so it holds every frame the checkpoint moved.
+            continues = continues and progress.log_frames <= self.captured_frame_count();
+        }
+        try self.restart_segment(continues, now_ms);
+    }
+
+    /// Whether a complete checkpoint moved only frames this session
+    /// captured: the WAL still holds the segment the last capture read, and
+    /// the checkpoint moved no frame past that capture's end.
+    fn moved_only_captured(self: *Session, progress: CheckpointProgress) bool {
+        const salts = self.read_wal_salts();
+        if (salts.salt_1 != self.segment_salt.salt_1 or salts.salt_2 != self.segment_salt.salt_2) return false;
+        return progress.log_frames <= self.captured_frame_count();
+    }
+
+    /// The frames of the current segment that the last capture read.
+    fn captured_frame_count(self: *const Session) i64 {
+        if (self.segment_restarted) return 0;
+        if (self.segment_end_offset_bytes < wal.header_size_bytes) return 0;
+        const frame_size_bytes = wal.frame_header_size_bytes + @as(u64, self.page_size);
+        const frames = (self.segment_end_offset_bytes - wal.header_size_bytes) / frame_size_bytes;
+        return std.math.cast(i64, frames) orelse std.math.maxInt(i64);
+    }
+
+    /// After a complete checkpoint: write the control row, which restarts
+    /// the WAL, and record the segment it starts. That segment continues
+    /// the captured position only when `continues`; otherwise the anchor is
+    /// dropped and the next capture is a full snapshot.
+    fn restart_segment(self: *Session, continues: bool, now_ms: i64) Error!void {
         try self.exec("UPDATE _litestream_seq SET seq = seq + 1 WHERE id = 1");
-        self.segment_restarted = true;
         self.segment_end_offset_bytes = 0;
-        self.segment_salt = self.read_wal_salts();
+        if (continues) {
+            self.segment_restarted = true;
+            self.segment_salt = self.read_wal_salts();
+        } else {
+            self.segment_restarted = false;
+            self.segment_salt = .{ .salt_1 = 0, .salt_2 = 0 };
+        }
         self.last_checkpoint_ms = now_ms;
         self.checkpoint_clock_started = true;
         self.checkpoint_pending = false;
@@ -452,14 +544,27 @@ pub const Session = struct {
         _ = try self.query_int64("SELECT seq FROM _litestream_seq WHERE id = 1", 0);
         const wal_bytes = try self.read_wal(workspaces.wal_storage);
         if (wal_bytes.len == 0) {
-            if (mode == .anchored) return error.SegmentMissing;
+            if (mode != .full) return error.SegmentMissing;
             return self.encode_database_snapshot(workspaces, timestamp_ms);
         }
-        if (wal_bytes.len < wal.header_size_bytes) return error.TruncatedHeader;
+        if (wal_bytes.len < wal.header_size_bytes) {
+            if (mode == .tail) return error.SegmentMissing;
+            return error.TruncatedHeader;
+        }
         const header = try wal.decode_header(wal_bytes[0..wal.header_size_bytes]);
         const first_capture = self.position.txid.value == 0;
         const salts_match = header.salt_1 == self.segment_salt.salt_1 and
             header.salt_2 == self.segment_salt.salt_2;
+        if (mode == .tail) {
+            // After a complete checkpoint this read holds no lock that keeps
+            // a writer from restarting the WAL, and a restart writes the
+            // header before any frame: the same salts on disk after the
+            // read mean the bytes read are all the moved segment's.
+            const after = self.read_wal_salts();
+            if (!salts_match or after.salt_1 != header.salt_1 or after.salt_2 != header.salt_2) {
+                return error.SegmentMissing;
+            }
+        }
         // A continuing segment with a previous frame resumes mid-WAL: the
         // reader seeds the cumulative checksum from the last captured frame
         // and scans only new frames. Segments are append-only, so bytes
@@ -468,9 +573,10 @@ pub const Session = struct {
         const wal_size_bytes = std.math.cast(u64, wal_bytes.len) orelse
             return error.WALTooLarge;
         const reaches_previous_end = wal_size_bytes >= self.segment_end_offset_bytes;
-        const resumable = mode == .anchored and !first_capture and
+        const resumable = mode != .full and !first_capture and
             !self.segment_restarted and salts_match and reaches_previous_end and
             self.segment_end_offset_bytes >= wal.header_size_bytes + one_frame;
+        if (mode == .tail and !resumable) return error.SegmentMissing;
         var reader = if (resumable)
             try wal.Reader.init_with_offset(
                 self.wal_limits,
@@ -490,7 +596,7 @@ pub const Session = struct {
         // A full capture follows a WAL that held no committed frame: what
         // the WAL holds now may begin after frames someone else checkpointed
         // since the anchor, so none of it continues the anchor.
-        const segment_continues = mode == .anchored and salts_match and
+        const segment_continues = mode != .full and salts_match and
             (self.segment_restarted or reaches_previous_end);
         if (map.end_offset_bytes == 0) {
             if (resumable) return error.CaptureUnchanged;

@@ -1456,3 +1456,255 @@ test "a WAL restarted by a foreign checkpoint after a session checkpoint is capt
     const restored_other = try restored_count(temporary.dir, std.testing.io, "restored.db", "SELECT COUNT(*) FROM other");
     try std.testing.expectEqual(@as(i64, 2), restored_other);
 }
+
+/// Opens `app.db` under `temporary` on a connection of its own, which never
+/// checkpoints by itself: another connection of the host, such as a
+/// handler thread's.
+fn open_foreign(temporary: *std.testing.TmpDir) !?*anyopaque {
+    var absolute: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base_length = try temporary.dir.realPath(std.testing.io, &absolute);
+    var name: [std.Io.Dir.max_path_bytes + 16]u8 = undefined;
+    const path = try std.fmt.bufPrint(&name, "{s}/app.db", .{absolute[0..base_length]});
+    name[path.len] = 0;
+    var foreign: ?*anyopaque = null;
+    if (sqlite.sqlite3_open_v2(@ptrCast(&name), &foreign, 0x2, null) != sqlite_ok) return error.ForeignOpen;
+    errdefer _ = sqlite.sqlite3_close_v2(foreign);
+    try exec_foreign(foreign, "PRAGMA wal_autocheckpoint=0");
+    return foreign;
+}
+
+/// A streaming client that, once armed, commits `statement` on another
+/// connection as a publish's write session finishes: a commit that lands
+/// while a capture publishes, after it read the WAL. With
+/// `fail_after_commit`, the write session after that one fails its first
+/// write.
+const PublishHookClient = struct {
+    backing: ltx_object.Client,
+    inner: ?ltx_object.WriteSession = null,
+    foreign: ?*anyopaque = null,
+    statement: [*:0]const u8 = "",
+    armed: bool = false,
+    committed: u32 = 0,
+    fail_after_commit: bool = false,
+    failing: bool = false,
+
+    fn client(self: *PublishHookClient) ltx_object.Client {
+        return .{
+            .context = self,
+            .list_fn = list,
+            .read_range_fn = read_range,
+            .write_fn = write_object,
+            .begin_write_fn = begin_write,
+            .delete_fn = delete,
+        };
+    }
+
+    fn list(
+        context: *anyopaque,
+        level: u8,
+        seek: ltx.TXID,
+        destination: []ltx.FileInfo,
+    ) ltx_object.Error![]const ltx.FileInfo {
+        const self: *PublishHookClient = @ptrCast(@alignCast(context));
+        return self.backing.list(level, seek, destination);
+    }
+
+    fn read_range(
+        context: *anyopaque,
+        info: ltx.FileInfo,
+        expected_generation: ?ltx_object.ReadGeneration,
+        offset_bytes: u64,
+        destination: []u8,
+    ) ltx_object.Error!ltx_object.ReadGeneration {
+        const self: *PublishHookClient = @ptrCast(@alignCast(context));
+        return self.backing.read_range_fn(
+            self.backing.context,
+            info,
+            expected_generation,
+            offset_bytes,
+            destination,
+        );
+    }
+
+    fn write_object(
+        context: *anyopaque,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+        bytes: []const u8,
+    ) ltx_object.Error!void {
+        const self: *PublishHookClient = @ptrCast(@alignCast(context));
+        return self.backing.write(level, identity, created_at_ms, bytes);
+    }
+
+    fn begin_write(
+        context: *anyopaque,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+    ) ltx_object.Error!ltx_object.WriteSession {
+        const self: *PublishHookClient = @ptrCast(@alignCast(context));
+        if (self.inner != null) return error.InvalidState;
+        self.inner = try self.backing.begin_write(level, identity, created_at_ms);
+        return ltx_object.WriteSession.init(.{
+            .context = self,
+            .write_fn = write_chunk,
+            .finish_fn = finish_write,
+            .abort_fn = abort_write,
+        });
+    }
+
+    fn delete(context: *anyopaque, files: []const ltx.FileInfo) ltx_object.Error!void {
+        const self: *PublishHookClient = @ptrCast(@alignCast(context));
+        return self.backing.delete(files);
+    }
+
+    fn write_chunk(context: *anyopaque, bytes: []const u8) ltx_object.Error!void {
+        const self: *PublishHookClient = @ptrCast(@alignCast(context));
+        if (self.failing) {
+            self.failing = false;
+            return error.StorageFailure;
+        }
+        const inner = if (self.inner) |*active| active else return error.InvalidState;
+        inner.writer().write_all(bytes) catch return error.StorageFailure;
+    }
+
+    fn finish_write(context: *anyopaque) ltx_object.Error!void {
+        const self: *PublishHookClient = @ptrCast(@alignCast(context));
+        if (self.armed) {
+            self.armed = false;
+            exec_foreign(self.foreign, self.statement) catch return error.StorageFailure;
+            self.committed += 1;
+            self.failing = self.fail_after_commit;
+        }
+        const inner = if (self.inner) |*active| active else return error.InvalidState;
+        defer self.inner = null;
+        try inner.finish();
+    }
+
+    fn abort_write(context: *anyopaque) void {
+        const self: *PublishHookClient = @ptrCast(@alignCast(context));
+        if (self.inner) |*active| active.abort();
+        self.inner = null;
+    }
+};
+
+test "a commit that lands while a capture publishes is captured before the session's checkpoint restarts the WAL" {
+    // The checkpoint after a capture moves every committed frame, also a
+    // commit another connection made after the capture read the WAL. The
+    // restart then drops its frames from the WAL, and a continuing segment
+    // never carried its pages: the tree lacked it for good.
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    var hook = PublishHookClient{ .backing = store.client() };
+    const client = hook.client();
+    var session = try ltx_capture.Session.init(temporary.dir, std.testing.io, "app.db", codec_limits, wal_limits, client);
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("CREATE TABLE other (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    _ = try session.sync(&capture_workspaces, 1000);
+    const foreign = try open_foreign(&temporary);
+    defer _ = sqlite.sqlite3_close_v2(foreign);
+    hook.foreign = foreign;
+
+    try session.exec("INSERT INTO kv VALUES (2, 'two')");
+    hook.statement = "INSERT INTO other VALUES (3, 'three')";
+    hook.armed = true;
+    session.checkpoint_threshold_bytes = 1;
+    _ = try session.sync(&capture_workspaces, 2000);
+    try std.testing.expectEqual(@as(u32, 1), hook.committed);
+    // The commit was captured as a transition of its own before the
+    // restart, and the restarted segment still continues.
+    try std.testing.expectEqual(@as(u64, 3), session.position.txid.value);
+    try std.testing.expect(session.segment_restarted);
+    try std.testing.expect(!session.checkpoint_pending);
+
+    session.checkpoint_threshold_bytes = 0;
+    try session.exec("INSERT INTO kv VALUES (4, 'four')");
+    _ = try session.sync(&capture_workspaces, 3000);
+    try std.testing.expectEqual(@as(u64, 4), session.position.txid.value);
+    try expect_level_zero_count(client, 4);
+    try restore_and_expect(&temporary, client, 3);
+    try std.testing.expectEqual(@as(i64, 1), try restored_count(temporary.dir, std.testing.io, "restored.db", "SELECT COUNT(*) FROM other"));
+}
+
+test "a commit captured after the checkpoint whose publish fails makes the next capture a full snapshot" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    var hook = PublishHookClient{ .backing = store.client(), .fail_after_commit = true };
+    const client = hook.client();
+    var session = try ltx_capture.Session.init(temporary.dir, std.testing.io, "app.db", codec_limits, wal_limits, client);
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("CREATE TABLE other (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    _ = try session.sync(&capture_workspaces, 1000);
+    const foreign = try open_foreign(&temporary);
+    defer _ = sqlite.sqlite3_close_v2(foreign);
+    hook.foreign = foreign;
+
+    try session.exec("INSERT INTO kv VALUES (2, 'two')");
+    hook.statement = "INSERT INTO other VALUES (3, 'three')";
+    hook.armed = true;
+    session.checkpoint_threshold_bytes = 1;
+    // The capture published; the commit's own publish failed, and the
+    // checkpoint already moved it: the restarted segment does not continue.
+    const pages = try session.sync(&capture_workspaces, 2000);
+    try std.testing.expect(pages > 0);
+    try std.testing.expectEqual(@as(u32, 1), hook.committed);
+    try std.testing.expectEqual(@as(u64, 2), session.position.txid.value);
+    try std.testing.expect(!session.segment_restarted);
+    try std.testing.expect(!session.checkpoint_pending);
+
+    session.checkpoint_threshold_bytes = 0;
+    try session.exec("INSERT INTO kv VALUES (4, 'four')");
+    const full_pages = try session.sync(&capture_workspaces, 3000);
+    try std.testing.expectEqual(@as(u64, 3), session.position.txid.value);
+    try std.testing.expect(full_pages >= pages);
+    try restore_and_expect(&temporary, client, 3);
+    try std.testing.expectEqual(@as(i64, 1), try restored_count(temporary.dir, std.testing.io, "restored.db", "SELECT COUNT(*) FROM other"));
+}
+
+test "a manual checkpoint that moves a commit the session never captured makes the next capture a full snapshot" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    const client = store.client();
+    var session = try ltx_capture.Session.init(temporary.dir, std.testing.io, "app.db", codec_limits, wal_limits, client);
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("CREATE TABLE other (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    _ = try session.sync(&capture_workspaces, 1000);
+    const foreign = try open_foreign(&temporary);
+    defer _ = sqlite.sqlite3_close_v2(foreign);
+
+    // Another connection commits after the capture; the checkpoint moves
+    // its frames into the file, and the control row restarts the WAL.
+    try exec_foreign(foreign, "INSERT INTO other VALUES (2, 'two')");
+    try session.checkpoint_passive(1500);
+    try std.testing.expect(!session.segment_restarted);
+    try std.testing.expect(!session.checkpoint_pending);
+
+    try session.exec("INSERT INTO kv VALUES (3, 'three')");
+    _ = try session.sync(&capture_workspaces, 2000);
+    try std.testing.expectEqual(@as(u64, 2), session.position.txid.value);
+    try restore_and_expect(&temporary, client, 2);
+    try std.testing.expectEqual(@as(i64, 1), try restored_count(temporary.dir, std.testing.io, "restored.db", "SELECT COUNT(*) FROM other"));
+
+    // A checkpoint that moved only captured frames still continues.
+    try session.checkpoint_passive(2500);
+    try std.testing.expect(session.segment_restarted);
+    try session.exec("INSERT INTO kv VALUES (4, 'four')");
+    const incremental_pages = try session.sync(&capture_workspaces, 3000);
+    try std.testing.expect(incremental_pages < 4);
+}

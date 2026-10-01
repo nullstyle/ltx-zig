@@ -57,6 +57,16 @@ version is zero, the Zig source API is intentionally unstable.
 
 ### Fixed
 
+- A transaction another connection committed after a capture read the WAL
+  (while it published, say) is no longer lost when a checkpoint follows
+  before the next capture. The checkpoint moved its frames into the
+  database file, the control row restarted the WAL, and the restarted
+  segment continued the captured position without its pages, so no LTX file
+  ever held them. `sync`'s automatic checkpoint now captures such frames
+  before it restarts the WAL, as one more transition at the same timestamp
+  (its pages count toward the sync's result, and an unchanged sync then
+  reports them). When it cannot, and after a `checkpoint_passive` that moved
+  any, the next capture is a full snapshot.
 - A capture or a compaction whose write session met a write the store
   failed (an S3 part sent from inside the encoder: every part but the last)
   returns the store's error, `StorageFailure` for one, instead of the
