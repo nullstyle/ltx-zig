@@ -639,6 +639,121 @@ const OutputWriteFaultClient = struct {
     }
 };
 
+/// A streaming client that, once armed, commits `statement` on another
+/// connection as the next publish finishes (a handler's commit that lands
+/// while a capture publishes), and then lands the publish after that one
+/// and reports `PublicationIndeterminate`, as one whose answer was lost.
+const PublishThenLoseClient = struct {
+    backing: object.Client,
+    temporary: *std.testing.TmpDir,
+    statement: [*:0]const u8 = "",
+    inner: ?object.WriteSession = null,
+    armed: bool = false,
+    losing: bool = false,
+
+    fn client(self: *PublishThenLoseClient) object.Client {
+        return .{
+            .context = self,
+            .list_fn = list,
+            .read_range_fn = read_range,
+            .write_fn = write,
+            .begin_write_fn = begin_write,
+            .delete_fn = delete_objects,
+        };
+    }
+
+    fn list(
+        context: *anyopaque,
+        level: u8,
+        seek: ltx.TXID,
+        destination: []ltx.FileInfo,
+    ) object.Error![]const ltx.FileInfo {
+        const self: *PublishThenLoseClient = @ptrCast(@alignCast(context));
+        return self.backing.list(level, seek, destination);
+    }
+
+    fn read_range(
+        context: *anyopaque,
+        info: ltx.FileInfo,
+        expected_generation: ?object.ReadGeneration,
+        offset_bytes: u64,
+        destination: []u8,
+    ) object.Error!object.ReadGeneration {
+        const self: *PublishThenLoseClient = @ptrCast(@alignCast(context));
+        return self.backing.read_range_fn(
+            self.backing.context,
+            info,
+            expected_generation,
+            offset_bytes,
+            destination,
+        );
+    }
+
+    fn write(
+        context: *anyopaque,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+        bytes: []const u8,
+    ) object.Error!void {
+        const self: *PublishThenLoseClient = @ptrCast(@alignCast(context));
+        return self.backing.write(level, identity, created_at_ms, bytes);
+    }
+
+    fn begin_write(
+        context: *anyopaque,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+    ) object.Error!object.WriteSession {
+        const self: *PublishThenLoseClient = @ptrCast(@alignCast(context));
+        if (self.inner != null) return error.InvalidState;
+        self.inner = try self.backing.begin_write(level, identity, created_at_ms);
+        return object.WriteSession.init(.{
+            .context = self,
+            .write_fn = write_chunk,
+            .finish_fn = finish_write,
+            .abort_fn = abort_write,
+        });
+    }
+
+    fn write_chunk(context: *anyopaque, bytes: []const u8) object.Error!void {
+        const self: *PublishThenLoseClient = @ptrCast(@alignCast(context));
+        const inner = if (self.inner) |*active| active else return error.InvalidState;
+        inner.writer().write_all(bytes) catch return error.StorageFailure;
+    }
+
+    fn finish_write(context: *anyopaque) object.Error!void {
+        const self: *PublishThenLoseClient = @ptrCast(@alignCast(context));
+        const lose = self.losing;
+        self.losing = false;
+        if (self.armed) {
+            self.armed = false;
+            exec_sql(self.temporary.dir, std.testing.io, "app.db", self.statement) catch
+                return error.StorageFailure;
+            self.losing = true;
+        }
+        const inner = if (self.inner) |*active| active else return error.InvalidState;
+        defer self.inner = null;
+        try inner.finish();
+        if (lose) return error.PublicationIndeterminate;
+    }
+
+    fn abort_write(context: *anyopaque) void {
+        const self: *PublishThenLoseClient = @ptrCast(@alignCast(context));
+        if (self.inner) |*active| active.abort();
+        self.inner = null;
+    }
+
+    fn delete_objects(
+        context: *anyopaque,
+        files: []const ltx.FileInfo,
+    ) object.Error!void {
+        const self: *PublishThenLoseClient = @ptrCast(@alignCast(context));
+        return self.backing.delete(files);
+    }
+};
+
 const WholeObjectClient = struct {
     backing: object.Client,
 
@@ -2161,6 +2276,7 @@ test "controller diagnostics preserve accepted operation results" {
     var diagnostics = controller.diagnostics();
     try expect_counters(diagnostics.sync, 1, 0, 1, 0);
     try expect_last_sync(diagnostics, synced);
+    try std.testing.expectEqual(synced.published.position, diagnostics.position);
 
     const unchanged = try controller.sync(1001);
     try std.testing.expectEqual(replication.SyncResult.unchanged, unchanged);
@@ -2204,6 +2320,48 @@ test "controller diagnostics preserve accepted operation results" {
     try expect_counters(diagnostics.maintain, 1, 2, 1, 0);
     try expect_counters(diagnostics.restore, 1, 0, 1, 0);
     try expect_last_restore(diagnostics, restored);
+}
+
+test "a sync whose capture of a commit made during its publish may have landed poisons and keeps the capture's position" {
+    // The checkpoint after the capture moved a commit another connection
+    // made while the capture published, and captured it at the next
+    // identity; that publish landed and its answer was lost. The sync
+    // fails: the next capture would publish other bytes at that identity.
+    // A host that rebuilds reads where the captures reached from the
+    // diagnostics, and finds the tree one file past it.
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    var hook = PublishThenLoseClient{
+        .backing = store.client(),
+        .temporary = &temporary,
+        .statement = "INSERT INTO kv VALUES (100, 'during')",
+    };
+    const storage = try std.testing.allocator.create(TestResources);
+    defer std.testing.allocator.destroy(storage);
+    var resources = storage.bind();
+    use_transactional_output(&resources);
+    var setup = options(&temporary, hook.client(), "app.db", .require_empty);
+    setup.config.checkpoint_threshold_bytes = 1;
+    var controller = try replication.Controller.init(setup, &resources);
+    defer controller.finish();
+    try create_table(&temporary);
+    try publish_row(&controller, &temporary, 1);
+
+    hook.armed = true;
+    try exec_sql(temporary.dir, std.testing.io, "app.db", "INSERT INTO kv VALUES (2, 'value-2')");
+    try std.testing.expectError(error.PublicationIndeterminate, controller.sync(2000));
+    try std.testing.expectError(error.Poisoned, controller.position());
+    var diagnostics = controller.diagnostics();
+    try std.testing.expectEqual(replication.ControllerLifecycle.poisoned, diagnostics.lifecycle);
+    try expect_last_failure(diagnostics, .sync, error.PublicationIndeterminate);
+    try std.testing.expectEqual(@as(u64, 2), diagnostics.position.txid.value);
+    const level_zero = try expect_level(store.client(), 0, 3);
+    defer free_level(level_zero);
+    try std.testing.expectEqual(@as(u64, 3), level_zero[2].max_txid.value);
+    controller.finish();
+    diagnostics = controller.diagnostics();
+    try std.testing.expectEqual(@as(u64, 2), diagnostics.position.txid.value);
 }
 
 test "controller diagnostics retain accepted failures through poison and finish" {
@@ -2259,6 +2417,7 @@ test "controller diagnostics retain accepted failures through poison and finish"
     try std.testing.expectEqual(replication.ControllerLifecycle.poisoned, diagnostics.lifecycle);
     try expect_counters(diagnostics.restore, 2, 0, 0, 2);
     try expect_last_failure(diagnostics, .restore, processing_error);
+    try std.testing.expectEqual(seeded, diagnostics.position);
 
     try std.testing.expectError(error.Poisoned, controller.sync(1000));
     try std.testing.expectError(error.Poisoned, controller.position());
@@ -2273,5 +2432,6 @@ test "controller diagnostics retain accepted failures through poison and finish"
     try expect_counters(diagnostics.sync, 0, 1, 0, 0);
     try expect_counters(diagnostics.restore, 2, 0, 0, 2);
     try expect_last_failure(diagnostics, .restore, processing_error);
+    try std.testing.expectEqual(seeded, diagnostics.position);
     try std.testing.expect(!diagnostics.counters_saturated);
 }

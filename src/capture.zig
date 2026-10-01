@@ -20,9 +20,10 @@
 //! unnecessary. A checkpoint moves every committed frame, also those another
 //! connection committed after the capture read the WAL; the automatic one
 //! captures those before the WAL restarts, and a checkpoint that cannot makes
-//! the next capture a full snapshot. Crash-replay integration qualifies publication and resume
-//! behavior. A WAL larger than the configured workspace is rejected rather
-//! than partially read.
+//! the next capture a full snapshot. A publish of those frames that may have
+//! landed fails the sync. Crash-replay integration qualifies publication and
+//! resume behavior. A WAL larger than the configured workspace is rejected
+//! rather than partially read.
 //!
 //! Captured files use the no-checksum L0 profile exactly like Celld and
 //! Litestream: `HEADER_FLAG_NO_CHECKSUM` with zero pre/post-apply checksums.
@@ -279,7 +280,14 @@ pub const Session = struct {
     /// transition at the same timestamp, whose pages count too. Automatic
     /// checkpoint failures never mask a published capture;
     /// `checkpoint_pending` exposes the deferred retry, which a later due
-    /// sync attempts again.
+    /// sync attempts again. The one exception is that transition's publish
+    /// when it may have landed (`PublicationIndeterminate`), or when the
+    /// client refused it while it holds one that may
+    /// (`PublicationUnsettled`): sync returns that error with `position`
+    /// already at the first capture, and, as after a capture's own
+    /// indeterminate publish, the identity at `position + 1` must be
+    /// reconciled before anything publishes there. A next capture of this
+    /// session would publish other bytes at it.
     pub fn sync(self: *Session, workspaces: *Workspaces, timestamp_ms: i64) Error!u32 {
         try self.validate_workspaces(workspaces);
         try self.validate_timestamp(timestamp_ms);
@@ -299,7 +307,7 @@ pub const Session = struct {
             else => |other| return self.capture_failed(other, workspaces, timestamp_ms),
         };
         self.record_sync_timestamp(timestamp_ms);
-        const tail = self.checkpoint_if_due(workspaces, timestamp_ms) orelse 0;
+        const tail = (try self.checkpoint_if_due(workspaces, timestamp_ms)) orelse 0;
         return captured + tail;
     }
 
@@ -331,7 +339,8 @@ pub const Session = struct {
 
     /// A sync whose capture failed. An unchanged one still runs a due
     /// checkpoint, and returns the pages of the transactions that
-    /// checkpoint captured before it restarted the WAL, if any.
+    /// checkpoint captured before it restarted the WAL, if any, or the
+    /// error of their publish when it may have landed.
     fn capture_failed(
         self: *Session,
         err: (Error || error{SegmentMissing}),
@@ -344,7 +353,7 @@ pub const Session = struct {
         };
         if (failure == error.CaptureUnchanged) {
             self.record_sync_timestamp(timestamp_ms);
-            if (self.checkpoint_if_due(workspaces, timestamp_ms)) |tail| return tail;
+            if (try self.checkpoint_if_due(workspaces, timestamp_ms)) |tail| return tail;
         }
         return failure;
     }
@@ -363,8 +372,10 @@ pub const Session = struct {
     /// Runs the automatic checkpoint when a tier is due or one is pending
     /// (`checkpoint_capturing`). Returns the pages it captured before the
     /// restart, or null when it published nothing; a failure leaves
-    /// `checkpoint_pending` set.
-    fn checkpoint_if_due(self: *Session, workspaces: *Workspaces, timestamp_ms: i64) ?u32 {
+    /// `checkpoint_pending` set. The only error it returns is that of a
+    /// capture of the moved frames whose publish may have landed
+    /// (`Tail.unresolved`).
+    fn checkpoint_if_due(self: *Session, workspaces: *Workspaces, timestamp_ms: i64) Error!?u32 {
         const over_bytes = self.checkpoint_threshold_bytes != 0 and
             self.last_wal_bytes >= self.checkpoint_threshold_bytes;
         const over_frames = self.checkpoint_max_frames != 0 and
@@ -376,10 +387,25 @@ pub const Session = struct {
         const over_time = self.checkpoint_interval_ms != 0 and
             elapsed_ms >= self.checkpoint_interval_ms;
         if (!self.checkpoint_pending and !over_bytes and !over_frames and !over_time) return null;
-        var tail: ?u32 = null;
+        var tail: Tail = .{};
         self.checkpoint_capturing(workspaces, timestamp_ms, &tail) catch {};
-        return tail;
+        if (tail.unresolved) |failure| return failure;
+        return tail.pages;
     }
+
+    /// What `sync`'s checkpoint did with the frames it moved past the last
+    /// capture.
+    const Tail = struct {
+        /// The pages it captured and published; null when it published none.
+        pages: ?u32 = null,
+        /// Its publish may have landed (`PublicationIndeterminate`), or the
+        /// client refused it while it holds one that may
+        /// (`PublicationUnsettled`). The identity it took, `position + 1`,
+        /// then holds those bytes or nothing, which the session cannot
+        /// tell: another capture must not take it. A definite failure
+        /// publishes nothing, and the next capture is a full snapshot.
+        unresolved: ?Error = null,
+    };
 
     fn validate_workspaces(self: *const Session, workspaces: *const Workspaces) Error!void {
         const page_size = std.math.cast(usize, self.page_size) orelse
@@ -454,16 +480,22 @@ pub const Session = struct {
     /// connection of the host lands this way whenever it comes while a
     /// capture publishes. When they cannot be captured (a write restarted
     /// the WAL first, or the publish failed), the next capture is a full
-    /// snapshot.
-    fn checkpoint_capturing(self: *Session, workspaces: *Workspaces, now_ms: i64, tail: *?u32) Error!void {
+    /// snapshot; a publish that may have landed is kept in
+    /// `tail.unresolved` too.
+    fn checkpoint_capturing(self: *Session, workspaces: *Workspaces, now_ms: i64, tail: *Tail) Error!void {
         self.checkpoint_pending = true;
         const progress = try self.passive_checkpoint_progress();
         if (!progress.complete()) return error.CheckpointIncomplete;
         var continues = self.moved_only_captured(progress);
         if (!continues) {
             continues = true;
-            tail.* = self.capture_transaction(workspaces, now_ms, .tail) catch |err| switch (err) {
+            tail.pages = self.capture_transaction(workspaces, now_ms, .tail) catch |err| switch (err) {
                 error.CaptureUnchanged => null,
+                error.PublicationIndeterminate, error.PublicationUnsettled => |unresolved| blk: {
+                    continues = false;
+                    tail.unresolved = unresolved;
+                    break :blk null;
+                },
                 else => blk: {
                     continues = false;
                     break :blk null;

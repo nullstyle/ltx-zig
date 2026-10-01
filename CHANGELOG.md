@@ -67,6 +67,17 @@ version is zero, the Zig source API is intentionally unstable.
   (its pages count toward the sync's result, and an unchanged sync then
   reports them). When it cannot, and after a `checkpoint_passive` that moved
   any, the next capture is a full snapshot.
+- A sync whose checkpoint captured such frames, and whose publish of them
+  may have landed (`PublicationIndeterminate`, or `PublicationUnsettled`
+  for a refusal while the client holds one that may), now fails with that
+  error, with `position` at the sync's first capture; the controller
+  poisons. It returned the first capture's success, the next capture
+  published a full snapshot at the same identity with other bytes, and a
+  replica that had applied the first bytes, or a compaction that took them
+  in, kept a history without the snapshot's commits.
+  `ControllerDiagnostics.position` keeps the capture's position after a
+  failure, poison and finish, so a host that rebuilds knows that the
+  identity after it is the one to reconcile.
 - A capture or a compaction whose write session met a write the store
   failed (an S3 part sent from inside the encoder: every part but the last)
   returns the store's error, `StorageFailure` for one, instead of the

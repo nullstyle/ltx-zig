@@ -84,8 +84,9 @@ relax those byte-level compatibility or safety requirements.
   `Resources.bind` places the descriptor and every controller workspace in one
   caller-owned fixed arena. Callers with separately provisioned storage may
   continue constructing `Resources` manually. `Controller.diagnostics()`
-  returns a fixed-size, pointer-free copy of lifecycle, per-operation
-  saturating counters, and the exact last accepted result or failure. It is an
+  returns a fixed-size, pointer-free copy of lifecycle, the capture's
+  position, per-operation saturating counters, and the exact last accepted
+  result or failure. It is an
   observation for the controller's single owner between synchronous calls,
   including after poison or finish; it is not a synchronization primitive.
 

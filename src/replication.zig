@@ -268,6 +268,12 @@ pub const LastOperation = union(enum) {
 /// sticky when an increment cannot be represented.
 pub const ControllerDiagnostics = struct {
     lifecycle: ControllerLifecycle,
+    /// The capture's position: the startup's, or the last capture it
+    /// published. Kept after a failure, poison and finish: a sync whose
+    /// checkpoint's capture of moved frames failed in a way that may have
+    /// landed (`Session.sync`) fails after its first capture published, and
+    /// the identity that may hold those frames is this position + 1.
+    position: ltx.Position,
     sync: OperationCounters = .{},
     restore: OperationCounters = .{},
     maintain: OperationCounters = .{},
@@ -906,6 +912,7 @@ pub const Controller = struct {
                 .finished => .finished,
                 .initializing, .running => unreachable,
             },
+            .position = self.session.position,
             .sync = self.diagnostic_state.sync,
             .restore = self.diagnostic_state.restore,
             .maintain = self.diagnostic_state.maintain,

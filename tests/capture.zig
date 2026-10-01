@@ -1477,7 +1477,8 @@ fn open_foreign(temporary: *std.testing.TmpDir) !?*anyopaque {
 /// connection as a publish's write session finishes: a commit that lands
 /// while a capture publishes, after it read the WAL. With
 /// `fail_after_commit`, the write session after that one fails its first
-/// write.
+/// write; with `lose_after_commit`, it lands and then reports
+/// `PublicationIndeterminate`, as a publish whose answer was lost.
 const PublishHookClient = struct {
     backing: ltx_object.Client,
     inner: ?ltx_object.WriteSession = null,
@@ -1487,6 +1488,8 @@ const PublishHookClient = struct {
     committed: u32 = 0,
     fail_after_commit: bool = false,
     failing: bool = false,
+    lose_after_commit: bool = false,
+    losing: bool = false,
 
     fn client(self: *PublishHookClient) ltx_object.Client {
         return .{
@@ -1571,15 +1574,19 @@ const PublishHookClient = struct {
 
     fn finish_write(context: *anyopaque) ltx_object.Error!void {
         const self: *PublishHookClient = @ptrCast(@alignCast(context));
+        const lose = self.losing;
+        self.losing = false;
         if (self.armed) {
             self.armed = false;
             exec_foreign(self.foreign, self.statement) catch return error.StorageFailure;
             self.committed += 1;
             self.failing = self.fail_after_commit;
+            self.losing = self.lose_after_commit;
         }
         const inner = if (self.inner) |*active| active else return error.InvalidState;
         defer self.inner = null;
         try inner.finish();
+        if (lose) return error.PublicationIndeterminate;
     }
 
     fn abort_write(context: *anyopaque) void {
@@ -1669,6 +1676,44 @@ test "a commit captured after the checkpoint whose publish fails makes the next 
     try std.testing.expectEqual(@as(u64, 3), session.position.txid.value);
     try std.testing.expect(full_pages >= pages);
     try restore_and_expect(&temporary, client, 3);
+    try std.testing.expectEqual(@as(i64, 1), try restored_count(temporary.dir, std.testing.io, "restored.db", "SELECT COUNT(*) FROM other"));
+}
+
+test "a commit captured after the checkpoint whose publish may have landed fails the sync at the first capture's position" {
+    // The commit's transition took the identity after the capture's. Its
+    // publish landed, but the answer was lost: when the sync swallowed
+    // that, the next capture published other bytes (a full snapshot) at
+    // that identity, over a transition a replica may already have applied.
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try ltx_object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    var hook = PublishHookClient{ .backing = store.client(), .lose_after_commit = true };
+    const client = hook.client();
+    var session = try ltx_capture.Session.init(temporary.dir, std.testing.io, "app.db", codec_limits, wal_limits, client);
+    defer session.finish();
+    var workspaces = TestWorkspaces{};
+    var capture_workspaces = workspaces.workspaces();
+    try session.exec("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("CREATE TABLE other (k INTEGER PRIMARY KEY, v TEXT)");
+    try session.exec("INSERT INTO kv VALUES (1, 'one')");
+    _ = try session.sync(&capture_workspaces, 1000);
+    const foreign = try open_foreign(&temporary);
+    defer _ = sqlite.sqlite3_close_v2(foreign);
+    hook.foreign = foreign;
+
+    try session.exec("INSERT INTO kv VALUES (2, 'two')");
+    hook.statement = "INSERT INTO other VALUES (3, 'three')";
+    hook.armed = true;
+    session.checkpoint_threshold_bytes = 1;
+    try std.testing.expectError(error.PublicationIndeterminate, session.sync(&capture_workspaces, 2000));
+    try std.testing.expectEqual(@as(u32, 1), hook.committed);
+    // The position is the capture's; the identity after it is the host's
+    // to reconcile, and here it holds the commit.
+    try std.testing.expectEqual(@as(u64, 2), session.position.txid.value);
+    try std.testing.expect(!session.segment_restarted);
+    try std.testing.expect(!session.checkpoint_pending);
+    try expect_level_zero_count(client, 3);
+    try restore_and_expect(&temporary, client, 2);
     try std.testing.expectEqual(@as(i64, 1), try restored_count(temporary.dir, std.testing.io, "restored.db", "SELECT COUNT(*) FROM other"));
 }
 

@@ -113,6 +113,14 @@ Automatic checkpoint failure never masks a capture that has already published
 and advanced its position. Instead, `checkpoint_pending` remains true and a
 later sync retries the PASSIVE checkpoint. Manual `checkpoint_passive` reports
 `CheckpointIncomplete` when SQLite could not checkpoint every logged frame.
+The one exception is the checkpoint's capture of frames committed after the
+capture read the WAL (see `ltx_capture` below): when its publish may have
+landed (`PublicationIndeterminate`), or the client refused it while it holds
+one that may (`PublicationUnsettled`), `sync` returns that error with
+`position` at its first capture. As after a capture's own indeterminate
+publish, reconcile the identity at `position + 1` before anything else
+publishes there; a controller poisons, and `ControllerDiagnostics.position`
+keeps the position.
 
 When the object adapter implements transactional sessions, `output_storage`
 may be empty because encoder bytes flow directly to private backend staging.
@@ -176,8 +184,10 @@ public for custom policy.
 
 `Controller.diagnostics()` is infallible and returns one copied, pointer-free,
 fixed-size `ControllerDiagnostics` value. Its lifecycle is `ready`, `poisoned`,
-or `finished`. Separate `sync`, `restore`, and `maintain` counters record
-accepted, rejected, succeeded, and failed calls. Every count saturates at
+or `finished`; `position` is the capture's position (the startup's, or the
+last capture it published), kept after a failure, poison and finish.
+Separate `sync`, `restore`, and `maintain` counters record accepted,
+rejected, succeeded, and failed calls. Every count saturates at
 `maxInt(u64)`; `counters_saturated` becomes sticky only when an increment is
 lost at that limit, so a maximum-valued count alone is not evidence that an
 event was dropped.
@@ -375,9 +385,10 @@ rather than replace the 512 MiB series above.
   same timestamp, so the restarted segment still continues. When it cannot
   (a write restarted the WAL before it read them, or their publish failed),
   and after a `checkpoint_passive` that moved any, the next capture is a full
-  snapshot. A session-initiated checkpoint records the salts of the segment
-  its control row starts; a foreign commit, full checkpoint and WAL restart
-  that all land between that control row and the salts read still pass as a
-  continuation.
+  snapshot. A publish of them that may have landed fails the sync instead,
+  since that snapshot would take the same identity. A session-initiated
+  checkpoint records the salts of the segment its control row starts; a
+  foreign commit, full checkpoint and WAL restart that all land between that
+  control row and the salts read still pass as a continuation.
 - Restore requires the plan's first file to start at TXID 1 from the empty
   position; chains that begin mid-history need an earlier snapshot.
