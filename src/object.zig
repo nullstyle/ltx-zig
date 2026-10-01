@@ -108,12 +108,16 @@ pub const WriteSessionBackend = struct {
 /// A single-owner transactional object writer. Keep the value at a stable
 /// address while its `ltx.Writer` is in use, and never copy it after the first
 /// operation. A backend write or finish error poisons the session and aborts
-/// private staging. Only successful `finish` establishes trusted publication;
-/// `PublicationIndeterminate` means the adapter crossed its commit point and
-/// the caller must reconcile the object before advancing durable state.
+/// private staging. The writer can report a failed backend write only as
+/// `OutputFailure`; `failure()` keeps the backend's own error, so a caller can
+/// tell a store that failed from any other output fault. Only successful
+/// `finish` establishes trusted publication; `PublicationIndeterminate` means
+/// the adapter crossed its commit point and the caller must reconcile the
+/// object before advancing durable state.
 pub const WriteSession = struct {
     backend: WriteSessionBackend,
     state: WriteSessionState = .open,
+    failure_value: ?Error = null,
 
     pub fn init(backend: WriteSessionBackend) WriteSession {
         return .{ .backend = backend };
@@ -128,6 +132,12 @@ pub const WriteSession = struct {
 
     pub fn current_state(self: *const WriteSession) WriteSessionState {
         return self.state;
+    }
+
+    /// The backend error that failed a write through `writer`, which the
+    /// writer reported as `OutputFailure`; null when no write failed.
+    pub fn failure(self: *const WriteSession) ?Error {
+        return self.failure_value;
     }
 
     pub fn finish(self: *WriteSession) Error!void {
@@ -148,7 +158,8 @@ pub const WriteSession = struct {
     fn write_all(context: *anyopaque, bytes: []const u8) error{OutputFailure}!void {
         const self: *WriteSession = @ptrCast(@alignCast(context));
         if (self.state != .open) return error.OutputFailure;
-        self.backend.write_fn(self.backend.context, bytes) catch {
+        self.backend.write_fn(self.backend.context, bytes) catch |err| {
+            self.failure_value = err;
             self.fail();
             return error.OutputFailure;
         };

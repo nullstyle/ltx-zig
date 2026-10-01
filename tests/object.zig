@@ -695,6 +695,7 @@ test "write session poisons and aborts after an encoder output failure" {
     try std.testing.expectError(error.OutputFailure, encoder.write_header(snapshot_header()));
     try std.testing.expectEqual(ltx.EncoderState.failed, encoder.current_state());
     try std.testing.expectEqual(object.WriteSessionState.failed, session.current_state());
+    try std.testing.expectEqual(@as(?object.Error, error.StorageFailure), session.failure());
     try std.testing.expectEqual(@as(u32, 1), backend.abort_count);
     try std.testing.expect(!backend.published);
     try std.testing.expectError(error.InvalidState, session.finish());

@@ -533,6 +533,112 @@ const MaintenanceFaultClient = struct {
     }
 };
 
+/// A streaming client whose compaction outputs (any level above 0) fail
+/// with `fault` on their first write while armed, as an S3 part sent from
+/// inside the encoder's write fails once its retries are spent. Captures
+/// (level 0) always pass through.
+const OutputWriteFaultClient = struct {
+    backing: object.Client,
+    fault: ?object.Error = null,
+    inner: ?object.WriteSession = null,
+    level: u8 = 0,
+
+    fn client(self: *OutputWriteFaultClient) object.Client {
+        return .{
+            .context = self,
+            .list_fn = list,
+            .read_range_fn = read_range,
+            .write_fn = write,
+            .begin_write_fn = begin_write,
+            .delete_fn = delete_objects,
+        };
+    }
+
+    fn list(
+        context: *anyopaque,
+        level: u8,
+        seek: ltx.TXID,
+        destination: []ltx.FileInfo,
+    ) object.Error![]const ltx.FileInfo {
+        const self: *OutputWriteFaultClient = @ptrCast(@alignCast(context));
+        return self.backing.list(level, seek, destination);
+    }
+
+    fn read_range(
+        context: *anyopaque,
+        info: ltx.FileInfo,
+        expected_generation: ?object.ReadGeneration,
+        offset_bytes: u64,
+        destination: []u8,
+    ) object.Error!object.ReadGeneration {
+        const self: *OutputWriteFaultClient = @ptrCast(@alignCast(context));
+        return self.backing.read_range_fn(
+            self.backing.context,
+            info,
+            expected_generation,
+            offset_bytes,
+            destination,
+        );
+    }
+
+    fn write(
+        context: *anyopaque,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+        bytes: []const u8,
+    ) object.Error!void {
+        const self: *OutputWriteFaultClient = @ptrCast(@alignCast(context));
+        return self.backing.write(level, identity, created_at_ms, bytes);
+    }
+
+    fn begin_write(
+        context: *anyopaque,
+        level: u8,
+        identity: ltx.FileIdentity,
+        created_at_ms: i64,
+    ) object.Error!object.WriteSession {
+        const self: *OutputWriteFaultClient = @ptrCast(@alignCast(context));
+        if (self.inner != null) return error.InvalidState;
+        self.inner = try self.backing.begin_write(level, identity, created_at_ms);
+        self.level = level;
+        return object.WriteSession.init(.{
+            .context = self,
+            .write_fn = write_chunk,
+            .finish_fn = finish_write,
+            .abort_fn = abort_write,
+        });
+    }
+
+    fn write_chunk(context: *anyopaque, bytes: []const u8) object.Error!void {
+        const self: *OutputWriteFaultClient = @ptrCast(@alignCast(context));
+        if (self.level != 0) if (self.fault) |fault| return fault;
+        const inner = if (self.inner) |*active| active else return error.InvalidState;
+        inner.writer().write_all(bytes) catch return error.StorageFailure;
+    }
+
+    fn finish_write(context: *anyopaque) object.Error!void {
+        const self: *OutputWriteFaultClient = @ptrCast(@alignCast(context));
+        const inner = if (self.inner) |*active| active else return error.InvalidState;
+        defer self.inner = null;
+        try inner.finish();
+    }
+
+    fn abort_write(context: *anyopaque) void {
+        const self: *OutputWriteFaultClient = @ptrCast(@alignCast(context));
+        if (self.inner) |*active| active.abort();
+        self.inner = null;
+    }
+
+    fn delete_objects(
+        context: *anyopaque,
+        files: []const ltx.FileInfo,
+    ) object.Error!void {
+        const self: *OutputWriteFaultClient = @ptrCast(@alignCast(context));
+        return self.backing.delete(files);
+    }
+};
+
 const WholeObjectClient = struct {
     backing: object.Client,
 
@@ -1809,6 +1915,41 @@ test "an opted-in controller stays ready only after a failure of the store itsel
     try run_read_fault(.keep_ready_on_storage, error.ObjectChanged, false);
     // The default poisons on every failure.
     try run_read_fault(.poison, error.StorageFailure, false);
+}
+
+test "an opted-in controller stays ready after the store failed a streamed compaction output's write" {
+    // A write of a streamed output fails inside the encoder, which can say
+    // only OutputFailure; the store's own error must reach the controller,
+    // or a failure of the store poisons it like a fault of the output.
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var store = try object.FileClient.init(temporary.dir, std.testing.io, "replica");
+    var fault = OutputWriteFaultClient{ .backing = store.client() };
+    const storage = try std.testing.allocator.create(TestResources);
+    defer std.testing.allocator.destroy(storage);
+    var resources = storage.bind();
+    use_transactional_output(&resources);
+    var controller = try replication.Controller.init(
+        kept_ready_options(&temporary, fault.client(), .keep_ready_on_storage),
+        &resources,
+    );
+    defer controller.finish();
+    try create_table(&temporary);
+    try publish_row(&controller, &temporary, 1);
+    try publish_row(&controller, &temporary, 2);
+    const failed_position = try controller.position();
+    fault.fault = error.StorageFailure;
+    try std.testing.expectError(error.StorageFailure, controller.maintain(1));
+    fault.fault = null;
+    try expect_kept_ready(&controller, failed_position, error.StorageFailure);
+    const retained = try expect_level(store.client(), 0, 2);
+    defer free_level(retained);
+    const upper = try expect_level(store.client(), 1, 0);
+    defer free_level(upper);
+    try publish_row(&controller, &temporary, 3);
+    try std.testing.expect((try controller.maintain(1)) == .compacted);
+    const empty = try expect_level(store.client(), 0, 0);
+    defer free_level(empty);
 }
 
 fn run_planted_upper(plant: enum { garbage, other_identity }, cause: replication.Error) !void {

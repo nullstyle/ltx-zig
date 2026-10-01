@@ -41,7 +41,9 @@ explicit limits, workspaces, and timestamps. Consult
 - Filesystem and S3 producers stream encoded output into private transactional
   staging. `finish` is the requested object publication boundary; encoding or
   transport failure does not advance capture position or delete compacted
-  inputs. A post-commit confirmation failure reports
+  inputs. A write the store failed (an S3 part sent from inside the encoder)
+  returns the store's own error, which `WriteSession.failure()` keeps, not
+  the encoder's `OutputFailure`. A post-commit confirmation failure reports
   `PublicationIndeterminate`; reconcile that exact identity before retrying or
   discarding its source. In particular, loss of the S3
   `CompleteMultipartUpload` acknowledgement can mean that the object is

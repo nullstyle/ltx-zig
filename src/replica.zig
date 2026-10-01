@@ -997,7 +997,12 @@ pub const CompactionJob = struct {
             timestamp_ms,
         );
         errdefer session.abort();
-        const verified = try self.compact(input_count, session.writer());
+        // A failed write of the session reaches the compactor as
+        // `OutputFailure`; the session keeps the store's own error.
+        const verified = self.compact(input_count, session.writer()) catch |err| {
+            if (err == error.OutputFailure) return session.failure() orelse err;
+            return err;
+        };
         try verify_identity(verified, identity);
         try session.finish();
         return verified;

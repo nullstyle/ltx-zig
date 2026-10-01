@@ -57,6 +57,12 @@ version is zero, the Zig source API is intentionally unstable.
 
 ### Fixed
 
+- A capture or a compaction whose write session met a write the store
+  failed (an S3 part sent from inside the encoder: every part but the last)
+  returns the store's error, `StorageFailure` for one, instead of the
+  encoder's `OutputFailure`. `WriteSession.failure()` keeps it. A host could
+  not tell such a failure from a fault of the output, and
+  `keep_ready_on_storage` poisoned the controller on it.
 - Capture no longer publishes a database snapshot on every sync while the WAL
   holds no committed frame (emptied by another connection's TRUNCATE
   checkpoint or last close, or left with a header only). The session first

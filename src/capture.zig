@@ -543,13 +543,15 @@ pub const Session = struct {
             workspaces.compression_workspace,
             workspaces.index_workspace,
         );
-        try encoder.write_header(snapshot_header(self, identity, timestamp_ms, page_count));
-        const written = try self.encode_database_pages(
+        encoder.write_header(snapshot_header(self, identity, timestamp_ms, page_count)) catch |err|
+            return output_cause(write_session, err);
+        const written = self.encode_database_pages(
             &encoder,
             page_count,
             workspaces.page_workspace,
-        );
-        const verified = try encoder.finish(ltx.Checksum.init(0));
+        ) catch |err| return output_cause(write_session, err);
+        const verified = encoder.finish(ltx.Checksum.init(0)) catch |err|
+            return output_cause(write_session, err);
         if (write_session) |*active| try active.finish() else try self.client.write(0, identity, timestamp_ms, sink.written());
         self.record_database_snapshot(verified, page_count);
         return written;
@@ -651,15 +653,16 @@ pub const Session = struct {
             workspaces.compression_workspace,
             workspaces.index_workspace,
         );
-        try encoder.write_header(header);
-        const written = try self.encode_pages(
+        encoder.write_header(header) catch |err| return output_cause(write_session, err);
+        const written = self.encode_pages(
             &encoder,
             wal_bytes,
             map,
             incremental,
             workspaces.page_workspace,
-        );
-        const verified = try encoder.finish(ltx.Checksum.init(0));
+        ) catch |err| return output_cause(write_session, err);
+        const verified = encoder.finish(ltx.Checksum.init(0)) catch |err|
+            return output_cause(write_session, err);
         if (write_session) |*active| {
             try active.finish();
         } else {
@@ -802,6 +805,15 @@ pub const Session = struct {
         return sqlite.sqlite3_errcode(self.db);
     }
 };
+
+/// The error an encoding into `write_session` failed with: the object
+/// store's own when one of the session's writes failed, which the encoder can
+/// only report as `OutputFailure`.
+fn output_cause(write_session: ?object.WriteSession, err: Error) Error {
+    if (err != error.OutputFailure) return err;
+    const active = write_session orelse return err;
+    return active.failure() orelse err;
+}
 
 fn find_page(pages: []const wal.PageMapEntry, page_number: u32) ?wal.PageMapEntry {
     for (pages) |entry| {

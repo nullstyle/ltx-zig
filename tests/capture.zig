@@ -421,8 +421,10 @@ test "capture write failure aborts without advancing and retries" {
     try session.exec("INSERT INTO kv VALUES (1, 'one')");
     const before = capture_resume_state(&session);
 
+    // The store's own error, not the encoder's OutputFailure: a host tells
+    // a store that failed from a fault of the output by it.
     try std.testing.expectError(
-        error.OutputFailure,
+        error.StorageFailure,
         session.sync(&capture_workspaces, 1000),
     );
     try std.testing.expectEqualDeep(before, capture_resume_state(&session));

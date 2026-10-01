@@ -35,7 +35,8 @@ relax those byte-level compatibility or safety requirements.
   and return a fixed-capacity `ReadGeneration`; the allocation-free
   `ObjectReader` carries that receipt across refills while adapting them to a
   bounded sequential codec reader. Optional transactional write sessions
-  expose a bounded `ltx.Writer`;
+  expose a bounded `ltx.Writer`, and keep the error of a backend write that
+  failed (`failure()`), which the writer reports as `OutputFailure`;
   `finish` is their only publication attempt and `abort` discards private
   staging. `PublicationIndeterminate` means the adapter crossed its commit
   point but could not confirm durable publication, so the caller must reconcile
