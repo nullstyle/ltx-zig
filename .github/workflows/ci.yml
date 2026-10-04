@@ -36,7 +36,7 @@ jobs:
       - name: Verify toolchain pins
         run: |
           test "$(mise exec -- go env GOVERSION)" = "go1.24.13"
-          test "$(mise exec -- zig version)" = "0.16.0"
+          test "$(mise exec -- zig version)" = "0.17.0"
       - name: Install SQLite integration dependency
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --yes libsqlite3-dev
@@ -135,8 +135,8 @@ jobs:
           version: "2026.8.10"
           install_args: zig
       - name: Verify Zig pin
-        run: test "$(mise exec zig@0.16.0 -- zig version)" = "0.16.0"
+        run: test "$(mise exec zig@0.17.0 -- zig version)" = "0.17.0"
       - name: Compile public module tests
         run: >-
-          mise exec zig@0.16.0 -- zig build compile-tests
+          mise exec zig@0.17.0 -- zig build compile-tests
           -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe

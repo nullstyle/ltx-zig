@@ -1,6 +1,6 @@
 [tools]
 go = "1.24.13"
-zig = "0.16.0"
+zig = "0.17.0"
 minio = "latest"
 
 [tasks.ci-local]
