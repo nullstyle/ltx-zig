@@ -85,9 +85,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           if [ "${ACT:-}" = "true" ]; then
-            mise exec -- zig build fuzz -Doptimize=ReleaseSafe --seed 0
+            mise exec -- zig build fuzz -Doptimize=ReleaseSafe --seed=0
           else
-            mise exec -- zig build fuzz --fuzz=10K -Doptimize=ReleaseSafe --seed 0
+            mise exec -- zig build fuzz --fuzz=10K -Doptimize=ReleaseSafe --seed=0
           fi
       - name: Build library
         run: mise exec -- zig build -Doptimize=ReleaseSafe
