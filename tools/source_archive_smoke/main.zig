@@ -133,7 +133,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn require_optimize(value: []const u8) !void {
-    const valid = [_][]const u8{ "Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall" };
+    const valid = [_][]const u8{ "debug", "safe", "fast", "small" };
     for (valid) |candidate| {
         if (std.mem.eql(u8, value, candidate)) return;
     }
@@ -196,10 +196,8 @@ fn fetch_archive(
     const result = try run_child(init, &.{
         zig.slice(),
         "fetch",
-        "--global-cache-dir",
-        fetch_cache.slice(),
         repository.slice(),
-    }, working_directory.slice());
+    }, working_directory.slice(), fetch_cache.slice());
     defer init.gpa.free(result.stdout);
     defer init.gpa.free(result.stderr);
     try require_success("zig fetch local package", &result);
@@ -478,23 +476,27 @@ fn run_zig_build(
         step,
         "--cache-dir",
         local_cache.slice(),
-        "--global-cache-dir",
-        global_cache.slice(),
         optimize_arg,
-    }, cwd.slice());
+    }, cwd.slice(), global_cache.slice());
     defer init.gpa.free(result.stdout);
     defer init.gpa.free(result.stderr);
     try require_success(step, &result);
 }
 
+/// Zig 0.17 takes the global cache directory only from the environment.
 fn run_child(
     init: std.process.Init,
     argv: []const []const u8,
     cwd: ?[]const u8,
+    global_cache: []const u8,
 ) !std.process.RunResult {
+    var environ_map = try init.environ_map.clone(init.gpa);
+    defer environ_map.deinit();
+    try environ_map.put("ZIG_GLOBAL_CACHE_DIR", global_cache);
     return std.process.run(init.gpa, init.io, .{
         .argv = argv,
         .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+        .environ_map = &environ_map,
         .stdout_limit = .limited(child_output_limit_bytes),
         .stderr_limit = .limited(child_output_limit_bytes),
         .timeout = child_timeout.toDeadline(init.io),
@@ -529,10 +531,10 @@ test "package hashes are bounded safe path components" {
 }
 
 test "only standard optimization modes reach nested builds" {
-    try require_optimize("Debug");
-    try require_optimize("ReleaseSafe");
-    try require_optimize("ReleaseFast");
-    try require_optimize("ReleaseSmall");
+    try require_optimize("debug");
+    try require_optimize("safe");
+    try require_optimize("fast");
+    try require_optimize("small");
     try std.testing.expectError(error.InvalidOptimizeMode, require_optimize("unsafe"));
 }
 
