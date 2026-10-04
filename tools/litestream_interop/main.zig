@@ -285,10 +285,11 @@ fn expect_captured_rows(io: std.Io, dir: std.Io.Dir, path: *const BoundedPath) !
     _ = io;
     _ = dir;
     var uri_buffer: [std.fs.max_path_bytes + 64]u8 = undefined;
-    const uri = try std.fmt.bufPrintZ(
+    const uri = try std.mem.printSentinel(
         &uri_buffer,
         "file:{s}?mode=ro&immutable=1",
         .{path.slice()},
+        0,
     );
     var database: ?*SQLite = null;
     if (sqlite3_open_v2(uri.ptr, &database, sqlite_open_readonly | sqlite_open_uri, null) != sqlite_ok) {
@@ -582,7 +583,7 @@ const expected_rows = [_]ExpectedRow{
 fn expect_final_database(path: *const BoundedPath) !void {
     const query = "?mode=ro&immutable=1";
     var uri_buffer: ["file:".len + std.fs.max_path_bytes + query.len + 1]u8 = undefined;
-    const uri = try std.fmt.bufPrintZ(&uri_buffer, "file:{s}{s}", .{ path.slice(), query });
+    const uri = try std.mem.printSentinel(&uri_buffer, "file:{s}{s}", .{ path.slice(), query }, 0);
     var database_optional: ?*SQLite = null;
     const open_result = sqlite3_open_v2(
         uri.ptr,
