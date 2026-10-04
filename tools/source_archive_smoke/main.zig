@@ -12,7 +12,7 @@ const hash_limit_bytes: usize = 192;
 const copy_buffer_bytes: usize = 4096;
 const child_timeout: std.Io.Timeout = .{ .duration = .{
     .clock = .awake,
-    .raw = .fromSeconds(120),
+    .raw = .fromSeconds(600),
 } };
 
 const BoundedPath = struct {
